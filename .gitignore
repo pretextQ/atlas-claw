@@ -32,5 +32,4 @@ paramiko.log
 
 # Screenshots (keep repo clean)
 *.json.bak
-docs/superpowers/
 test-results/
