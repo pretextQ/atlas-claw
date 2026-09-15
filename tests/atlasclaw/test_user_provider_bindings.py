@@ -1,0 +1,313 @@
+# -*- coding: utf-8 -*-
+# Copyright 2026  Qianyun, Inc., www.cloudchef.io, All rights reserved.
+
+from __future__ import annotations
+
+import pytest
+
+from app.atlasclaw.api.service_provider_schemas import (
+    ProviderAuthModeDefinition,
+    ProviderSchemaDefinition,
+    ProviderSchemaField,
+    clear_provider_schema_definitions,
+    register_provider_schema_definition,
+)
+from app.atlasclaw.core.user_provider_bindings import (
+    ResolvedProviderInstanceRegistry,
+    build_user_provider_instances,
+    build_resolved_provider_instances,
+    resolve_provider_instance_config,
+)
+from tests.atlasclaw.provider_schema_fixtures import managed_provider_definition
+
+
+@pytest.fixture(autouse=True)
+def provider_manifests() -> None:
+    clear_provider_schema_definitions()
+    register_provider_schema_definition(
+        managed_provider_definition(
+            provider_type="smartcmp",
+            display_name="SmartCMP",
+            default_base_url="https://cmp.example.com",
+        )
+    )
+    yield
+    clear_provider_schema_definitions()
+
+
+@pytest.fixture
+def generic_provider_schema() -> None:
+    register_provider_schema_definition(
+        ProviderSchemaDefinition(
+            provider_type="generic",
+            display_name="Generic",
+            default_auth_type=("sso", "user_token"),
+            auth_modes={
+                "sso": ProviderAuthModeDefinition(required_fields=()),
+                "cookie": ProviderAuthModeDefinition(required_fields=("cookie",)),
+                "user_token": ProviderAuthModeDefinition(required_fields=("user_token",)),
+            },
+            fields=(
+                ProviderSchemaField(name="base_url", required=True),
+                ProviderSchemaField(name="auth_type", type="hidden", default=("sso", "user_token")),
+                ProviderSchemaField(
+                    name="cookie",
+                    type="password",
+                    sensitive=True,
+                    auth_types=("cookie",),
+                ),
+                ProviderSchemaField(
+                    name="user_token",
+                    type="password",
+                    sensitive=True,
+                    auth_types=("user_token",),
+                ),
+            ),
+        )
+    )
+
+
+def test_resolve_provider_instance_config_prefers_first_usable_auth_mode() -> None:
+    resolved = resolve_provider_instance_config(
+        "smartcmp",
+        "default",
+        template_config={
+            "base_url": "https://cmp.example.com",
+            "auth_type": ["cookie", "user_token"],
+            "cookie": "AtlasClaw-Host-Authenticate=session-cookie",
+        },
+        user_config={"user_token": "user-token-123"},
+    )
+
+    assert resolved["auth_type"] == "cookie"
+    assert resolved["cookie"] == "AtlasClaw-Host-Authenticate=session-cookie"
+    assert "user_token" not in resolved
+
+
+def test_resolve_provider_instance_config_falls_back_to_user_token_when_sso_missing(
+    generic_provider_schema,
+) -> None:
+    resolved = resolve_provider_instance_config(
+        "generic",
+        "default",
+        template_config={
+            "base_url": "https://cmp.example.com",
+            "auth_type": ["sso", "user_token"],
+        },
+        user_config={"user_token": "user-token-123"},
+        runtime_context={
+            "provider_sso_available": False,
+            "provider_sso_token": "",
+        },
+    )
+
+    assert resolved["auth_type"] == "user_token"
+    assert resolved["user_token"] == "user-token-123"
+
+
+def test_resolve_provider_instance_config_uses_shared_provider_token() -> None:
+    resolved = resolve_provider_instance_config(
+        "smartcmp",
+        "default",
+        template_config={
+            "base_url": "https://cmp.example.com",
+            "auth_type": ["provider_token", "user_token"],
+            "provider_token": "shared-provider-token",
+        },
+        user_config={
+            "provider_token": "ignored-user-provider-token",
+            "user_token": "user-token-123",
+        },
+        runtime_context={
+            "provider_sso_available": False,
+            "provider_sso_token": "",
+        },
+    )
+
+    assert resolved["auth_type"] == "provider_token"
+    assert resolved["provider_token"] == "shared-provider-token"
+    assert "user_token" not in resolved
+
+
+def test_resolve_provider_instance_config_uses_request_scoped_cookie() -> None:
+    resolved = resolve_provider_instance_config(
+        "smartcmp",
+        "default",
+        template_config={
+            "base_url": "https://cmp.example.com",
+            "auth_type": ["cookie", "provider_token"],
+            "provider_token": "shared-provider-token",
+        },
+        runtime_context={
+            "provider_cookie_available": True,
+            "provider_cookie_token": "request-cookie-token",
+        },
+    )
+
+    assert resolved["auth_type"] == "cookie"
+    assert resolved["cookie"] == "request-cookie-token"
+    assert "provider_token" not in resolved
+
+
+def test_resolve_provider_instance_config_uses_sso_and_strips_persisted_auth_fields(
+    generic_provider_schema,
+) -> None:
+    resolved = resolve_provider_instance_config(
+        "generic",
+        "default",
+        template_config={
+            "base_url": "https://cmp.example.com",
+            "auth_type": ["sso", "cookie", "user_token"],
+            "cookie": "AtlasClaw-Host-Authenticate=session-cookie",
+        },
+        user_config={"user_token": "user-token-123"},
+        runtime_context={
+            "provider_sso_available": True,
+            "provider_sso_token": "oidc-access-token",
+        },
+    )
+
+    assert resolved["auth_type"] == "sso"
+    assert resolved["base_url"] == "https://cmp.example.com"
+    assert "cookie" not in resolved
+    assert "user_token" not in resolved
+
+
+def test_resolve_provider_instance_config_raises_when_chain_has_no_usable_auth(
+    generic_provider_schema,
+) -> None:
+    with pytest.raises(ValueError, match="no usable auth mode"):
+        resolve_provider_instance_config(
+            "generic",
+            "default",
+            template_config={
+                "base_url": "https://cmp.example.com",
+                "auth_type": ["sso", "cookie", "user_token"],
+            },
+            runtime_context={
+                "provider_sso_available": False,
+                "provider_sso_token": "",
+            },
+        )
+
+
+def test_build_resolved_provider_instances_resolves_global_instances_with_runtime_context() -> None:
+    resolved = build_resolved_provider_instances(
+        {
+            "smartcmp": {
+                "default": {
+                    "base_url": "https://cmp.example.com",
+                    "auth_type": ["cookie", "user_token"],
+                    "user_token": "user-token-123",
+                }
+            }
+        }
+    )
+
+    assert resolved["smartcmp"]["default"]["auth_type"] == "user_token"
+    assert resolved["smartcmp"]["default"]["user_token"] == "user-token-123"
+    assert "cookie" not in resolved["smartcmp"]["default"]
+
+
+def test_build_resolved_provider_instances_preserves_config_order() -> None:
+    resolved = build_resolved_provider_instances(
+        {
+            "markdown-vault": {
+                "knowledgebase": {
+                    "auth_type": "app_credentials",
+                    "vault_path": "/vault/smartcmp",
+                },
+                "atlasclaw-docs": {
+                    "auth_type": "app_credentials",
+                    "vault_path": "/vault/atlasclaw",
+                },
+            }
+        }
+    )
+    registry = ResolvedProviderInstanceRegistry(resolved)
+
+    assert list(resolved["markdown-vault"].keys()) == ["knowledgebase", "atlasclaw-docs"]
+    assert list(registry.get_all_instance_configs()["markdown-vault"].keys()) == [
+        "knowledgebase",
+        "atlasclaw-docs",
+    ]
+
+
+def test_build_user_provider_instances_maps_legacy_default_to_single_configured_instance(tmp_path) -> None:
+    user_dir = tmp_path / "users" / "admin"
+    user_dir.mkdir(parents=True)
+    (user_dir / "user_setting.json").write_text(
+        """
+{
+  "channels": {},
+  "providers": {
+    "smartcmp": {
+      "default": {
+        "configured": true,
+        "config": {
+          "auth_type": ["cookie", "user_token"],
+          "user_token": "legacy-user-token"
+        }
+      }
+    }
+  },
+  "preferences": {}
+}
+""".strip(),
+        encoding="utf-8",
+    )
+
+    resolved = build_user_provider_instances(
+        "admin",
+        workspace_path=str(tmp_path),
+        provider_templates={
+            "smartcmp": {
+                "cmp": {
+                    "base_url": "https://cmp.example.com",
+                    "auth_type": ["cookie", "user_token"],
+                }
+            }
+        },
+    )
+
+    assert resolved["smartcmp"]["cmp"]["instance_name"] == "cmp"
+    assert resolved["smartcmp"]["cmp"]["auth_type"] == "user_token"
+    assert resolved["smartcmp"]["cmp"]["user_token"] == "legacy-user-token"
+
+
+def test_build_user_provider_instances_does_not_map_legacy_default_when_multiple_instances(tmp_path) -> None:
+    user_dir = tmp_path / "users" / "admin"
+    user_dir.mkdir(parents=True)
+    (user_dir / "user_setting.json").write_text(
+        """
+{
+  "channels": {},
+  "providers": {
+    "smartcmp": {
+      "default": {
+        "configured": true,
+        "config": {
+          "auth_type": ["user_token"],
+          "user_token": "legacy-user-token"
+        }
+      }
+    }
+  },
+  "preferences": {}
+}
+""".strip(),
+        encoding="utf-8",
+    )
+
+    resolved = build_user_provider_instances(
+        "admin",
+        workspace_path=str(tmp_path),
+        provider_templates={
+            "smartcmp": {
+                "cmp": {"base_url": "https://cmp.example.com", "auth_type": ["user_token"]},
+                "backup": {"base_url": "https://backup.example.com", "auth_type": ["user_token"]},
+            }
+        },
+    )
+
+    assert resolved == {}

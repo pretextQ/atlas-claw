@@ -1,0 +1,197 @@
+{
+  "workspace": {
+    "path": "./.atlasclaw"
+  },
+  "database": {
+    "type": "sqlite",
+    "sqlite": {
+      "path": "./data/atlasclaw.db"
+    },
+    "mysql": {
+      "host": "${MYSQL_HOST}",
+      "port": 3306,
+      "database": "${MYSQL_DATABASE}",
+      "user": "${MYSQL_USER}",
+      "password": "${MYSQL_PASSWORD}",
+      "charset": "utf8mb4"
+    },
+    "pool_size": 5,
+    "max_overflow": 10,
+    "echo": false
+  },
+
+  "providers_root": "../atlasclaw-providers/providers",
+  "skills_root": "../atlasclaw-providers/skills",
+  "search_runtime": {
+    "default_provider": "bing_html_fallback",
+    "provider_timeout_seconds": 8.0,
+    "provider_hedge_delay_seconds": 1.2,
+    "overall_timeout_seconds": 10.0,
+    "prefer_grounding": true,
+    "providers": [
+      {
+        "provider_key": "bing_html_fallback",
+        "provider_type": "search",
+        "timeout_seconds": 8
+      },
+      {
+        "provider_key": "google_html_fallback",
+        "provider_type": "search",
+        "timeout_seconds": 8
+      }
+    ],
+    "proxy": {
+      "trust_env": true
+    }
+  },
+  "model": {
+    "primary": "model-2",
+    "fallbacks": [],
+    "temperature": "${LLM_TEMPERATURE}",
+    "selection_strategy": "health",
+    "tokens": [
+      {
+        "id": "model-1",
+        "provider": "${TOKEN_1_PROVIDER}",
+        "model": "${TOKEN_1_MODEL}",
+        "base_url": "${TOKEN_1_BASE_URL}",
+        "api_key": "${TOKEN_1_API_KEY}",
+        "api_type": "openai",
+        "priority": 100,
+        "weight": 100
+      },
+      {
+        "id": "model-2",
+        "provider": "${TOKEN_2_PROVIDER}",
+        "model": "${TOKEN_2_MODEL}",
+        "base_url": "${TOKEN_2_BASE_URL}",
+        "api_key": "${TOKEN_2_API_KEY}",
+        "api_type": "openai",
+        "priority": 90,
+        "weight": 80
+      },
+      {
+        "id": "model-3",
+        "provider": "${TOKEN_3_PROVIDER}",
+        "model": "${TOKEN_3_MODEL}",
+        "base_url": "${TOKEN_3_BASE_URL}",
+        "api_key": "${TOKEN_3_API_KEY}",
+        "api_type": "openai",
+        "priority": 80,
+        "weight": 60
+      }
+    ]
+  },
+  "service_providers": {
+    "smartcmp": {
+      "cmp": {
+        "base_url": "${CMP_URL}",
+        "auth_type": ["cookie", "user_token"],
+        "username": "${CMP_USERNAME}",
+        "password": "${CMP_PASSWORD}",
+        "robot_auth": {
+          "preapproval_bot": {
+            "auth_type": "provider_token",
+            "provider_token": "${CMP_ROBOT_APPROVER_TOKEN}",
+            "allowed_skills": [
+              "cmp.preapproval-agent",
+              "cmp.request-decomposition-agent"
+            ]
+          }
+        }
+      }
+    },
+    "markdown-vault": {
+      "knowledgebase": {
+        "vault_path": "${MARKDOWN_VAULT_REPO_PATH}",
+        "usage_hint": "Use for SmartCMP knowledge-base questions about product capabilities, configuration, integrations, deployment, operations, and implementation guidance. If a feature is not supported directly, try to search the related extensibility."
+      },
+      "atlasclaw-docs": {
+        "vault_path": "${PWD}/tests/markdown-vault-atlasclaw-docs",
+        "usage_hint": "Use for AtlasClaw function introduction, user workflows, conversations, skills, tools, and product usage documentation."
+      }
+    },
+    "github": {
+      "github": {
+        "base_url": "https://api.github.com",
+        "hostname": "github.com",
+        "auth_type": "user_token"
+      }
+    }
+  },
+  "auth": {
+    "enabled": true,
+    "provider": "local",
+    "cache_ttl_seconds": 300,
+    "jwt": {
+      "header_name": "AtlasClaw-Authenticate",
+      "cookie_name": "AtlasClaw-Authenticate",
+      "issuer": "atlasclaw",
+      "secret_key": "${ATLASCLAW_JWT_SECRET}",
+      "expires_minutes": 480
+    },
+    "host_cookie": {
+      "header_name": "CloudChef-Authenticate",
+      "cookie_name": "CloudChef-Authenticate",
+      "subject_cookie_name": "userLoginId",
+      "display_name_cookie_name": "username",
+      "user_id_cookie_name": "userId",
+      "tenant_id_cookie_name": "tenant_id"
+    },
+    "oidc": {
+      "issuer": "${OIDC_ISSUER}",
+      "client_id": "${OIDC_CLIENT_ID}",
+      "client_secret": "${OIDC_CLIENT_SECRET}",
+      "jwks_uri": "${OIDC_ISSUER}/protocol/openid-connect/certs",
+      "scopes": ["openid", "profile", "email"],
+      "ocbc_enabled": true,
+
+      "authorization_endpoint": "${OIDC_ISSUER}/protocol/openid-connect/auth",
+      "token_endpoint": "${OIDC_ISSUER}/protocol/openid-connect/token",
+      "userinfo_endpoint": "${OIDC_ISSUER}/protocol/openid-connect/userinfo",
+      "end_session_endpoint": "${OIDC_ISSUER}/protocol/openid-connect/logout",
+      "redirect_uri": "${OIDC_REDIRECT_URI}",
+      "pkce_enabled": true,
+      "pkce_method": "S256"
+    },
+    "dingtalk": {
+      "app_key": "${DINGTALK_APP_KEY}",
+      "app_secret": "${DINGTALK_APP_SECRET}",
+      "corp_id": "${DINGTALK_CORP_ID}",
+      "redirect_uri": "${DINGTALK_OIDC_REDIRECT_URI}",
+      "scopes": ["openid", "corpid"],
+      "pkce_enabled": true,
+      "pkce_method": "S256",
+      "subject_field": "unionId"
+    }
+  },
+  "agent_defaults": {
+    "max_concurrent": 10
+  },
+  "webhook": {
+    "enabled": false,
+    "header_name": "X-UniClaw-SK",
+    "skill_sources": [
+      {
+        "provider": "smartcmp",
+        "root": "../UniClaw-Providers/SmartCMP-Provider/skills"
+      },
+      {
+        "provider": "jira",
+        "root": "app/atlasclaw/providers/jira/skills"
+      }
+    ],
+    "systems": [
+      {
+        "system_id": "smartcmp-preapproval",
+        "enabled": true,
+        "sk_env": "${ATLASCLAW_WEBHOOK_SK_SMARTCMP_PREAPPROVAL}",
+        "default_agent_id": "main",
+        "allowed_skills": [
+          "cmp.preapproval-agent",
+          "cmp.request-decomposition-agent"
+        ]
+      }
+    ]
+  }
+}

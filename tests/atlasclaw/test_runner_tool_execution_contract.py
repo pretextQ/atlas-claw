@@ -1,0 +1,4689 @@
+# -*- coding: utf-8 -*-
+# Copyright 2026  Qianyun, Inc., www.cloudchef.io, All rights reserved.
+
+from __future__ import annotations
+
+import asyncio
+from contextlib import asynccontextmanager
+import json
+from types import SimpleNamespace
+import time
+
+import pytest
+from pydantic_ai.messages import ModelRequest, ToolReturnPart
+
+from app.atlasclaw.agent.runner_tool.runner_execution_flow_error import RunnerExecutionFlowErrorMixin
+from app.atlasclaw.agent.runner_tool.runner_execution_flow import RunnerExecutionFlowPhaseMixin
+from app.atlasclaw.agent.runner_tool.runner_execution_flow_post import RunnerExecutionFlowPostMixin
+from app.atlasclaw.agent.runner_tool.runner_execution_flow_stream import RunnerExecutionFlowStreamMixin
+from app.atlasclaw.agent.runner_tool.runner_execution_payload import (
+    RunnerExecutionPayloadMixin,
+    build_no_runtime_capability_answer,
+    build_finalize_payload,
+    build_lookup_dump_recovery_payload,
+    provider_auth_diagnostic_user_message,
+    select_no_runtime_provider_auth_diagnostic,
+    select_provider_auth_diagnostic,
+)
+from app.atlasclaw.agent.runner_tool.runner_execution_prepare import _embed_scope_workflow_history
+from app.atlasclaw.agent.runner_tool.runner_execution_retry import RunnerExecutionRetryMixin
+from app.atlasclaw.agent.runner_tool.runner_tool_messages import (
+    extract_synthetic_tool_messages_from_next_node,
+    overlay_synthetic_tool_messages,
+)
+from app.atlasclaw.agent.runner_tool.runner_tool_gate_policy import RunnerToolGatePolicyMixin
+from app.atlasclaw.agent.runner_tool_evidence import RunnerToolEvidenceMixin
+from app.atlasclaw.agent.tool_gate_models import ToolGateDecision, ToolIntentAction, ToolIntentPlan, ToolPolicyMode
+
+
+class _History:
+    @staticmethod
+    def normalize_messages(messages):
+        return list(messages)
+
+
+class _RuntimeEvents:
+    def __init__(self) -> None:
+        self.context_ready_calls = []
+
+    async def trigger_llm_completed(self, **kwargs):
+        return None
+
+    async def trigger_run_context_ready(self, **kwargs):
+        self.context_ready_calls.append(kwargs)
+        return None
+
+    async def trigger_llm_failed(self, **kwargs):
+        return None
+
+    async def trigger_run_failed(self, **kwargs):
+        return None
+
+
+class _SessionManager:
+    def __init__(self) -> None:
+        self.persisted_messages = None
+
+    async def persist_transcript(self, session_key, messages):
+        self.persisted_messages = list(messages)
+        return None
+
+
+def test_provider_auth_diagnostic_sanitizes_user_token_failure() -> None:
+    diagnostic = select_provider_auth_diagnostic(
+        extra={
+            "provider_auth_diagnostics": {
+                "providerx": {
+                    "default": {
+                        "provider_type": "providerx",
+                        "instance_name": "default",
+                        "missing_user_token": True,
+                        "contact_admin": False,
+                    }
+                }
+            },
+            "tools_snapshot": [
+                {"name": "providerx_list_services", "provider_type": "providerx"},
+            ],
+        },
+        attempted_tools=[{"name": "providerx_list_services"}],
+        failure_reasons=[
+            "providerx_list_services error: [ERROR] Provider configuration not available. "
+            "Configure one of the following in atlasclaw.json or pass a session token in the HTTP request."
+        ],
+        tool_results=[],
+    )
+
+    assert diagnostic and diagnostic["missing_user_token"] is True
+    message = provider_auth_diagnostic_user_message(diagnostic)
+    assert "personal provider access credential is not configured" in message
+    assert "contact an administrator" not in message
+
+
+def test_provider_auth_diagnostic_sanitizes_rejected_user_token_failure() -> None:
+    diagnostic = select_provider_auth_diagnostic(
+        extra={
+            "provider_auth_diagnostics": {
+                "providerx": {
+                    "default": {
+                        "provider_type": "providerx",
+                        "instance_name": "default",
+                        "missing_user_token": False,
+                        "user_token_configured": True,
+                        "contact_admin": False,
+                    }
+                }
+            },
+            "tools_snapshot": [
+                {"name": "providerx_list_services", "provider_type": "providerx"},
+            ],
+        },
+        attempted_tools=[{"name": "providerx_list_services"}],
+        failure_reasons=["providerx_list_services error: HTTP 401: {}"],
+        tool_results=[
+            {
+                "tool_name": "providerx_list_services",
+                "content": "HTTP 401: {}",
+            }
+        ],
+    )
+
+    assert diagnostic and diagnostic["user_token_configured"] is True
+    message = provider_auth_diagnostic_user_message(diagnostic)
+    assert "personal provider access credential was rejected" in message
+    assert "personal account settings" in message
+    assert "contact an administrator" not in message
+
+
+def test_provider_auth_diagnostic_does_not_treat_schema_required_as_auth_failure() -> None:
+    schema_output = json.dumps(
+        {
+            "type": "object",
+            "required": ["name"],
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "config": {
+                        "visibility": {
+                            "allowInRequest": True,
+                            "allowInApproval": True,
+                        }
+                    },
+                }
+            },
+        }
+    )
+
+    diagnostic = select_provider_auth_diagnostic(
+        extra={
+            "provider_auth_diagnostics": {
+                "smartcmp": {
+                    "default": {
+                        "provider_type": "smartcmp",
+                        "instance_name": "default",
+                        "missing_user_token": True,
+                        "contact_admin": False,
+                    }
+                }
+            },
+            "tools_snapshot": [
+                {"name": "smartcmp_design_form_schema", "provider_type": "smartcmp"},
+            ],
+        },
+        attempted_tools=[{"name": "smartcmp_design_form_schema"}],
+        failure_reasons=[],
+        tool_results=[
+            {
+                "tool_name": "smartcmp_design_form_schema",
+                "content": f"Schema JSON:\n```json\n{schema_output}\n```",
+            }
+        ],
+    )
+
+    assert diagnostic is None
+
+
+def test_provider_auth_diagnostic_ignores_unmatched_provider() -> None:
+    diagnostic = select_provider_auth_diagnostic(
+        extra={
+            "provider_auth_diagnostics": {
+                "providerx": {
+                    "default": {
+                        "provider_type": "providerx",
+                        "instance_name": "default",
+                        "missing_user_token": True,
+                        "contact_admin": False,
+                    }
+                }
+            },
+            "tools_snapshot": [
+                {"name": "providerx_list_services", "provider_type": "stale-provider"},
+            ],
+        },
+        attempted_tools=[{"name": "providerx_list_services"}],
+        failure_reasons=["Provider authentication is missing."],
+        tool_results=[],
+    )
+
+    assert diagnostic is None
+
+
+def test_provider_auth_diagnostic_user_message_for_admin_required_failure() -> None:
+    diagnostic = {
+        "provider_type": "providerx",
+        "instance_name": "default",
+        "missing_user_token": False,
+        "contact_admin": True,
+    }
+
+    message = provider_auth_diagnostic_user_message(diagnostic)
+    assert "Contact an administrator" in message
+    assert "personal provider access credential" not in message
+
+
+def test_no_runtime_capability_uses_unique_missing_user_token_diagnostic() -> None:
+    diagnostic = select_no_runtime_provider_auth_diagnostic(
+        extra={
+            "provider_auth_diagnostics": {
+                "providerx": {
+                    "default": {
+                        "provider_type": "providerx",
+                        "instance_name": "default",
+                        "missing_user_token": True,
+                        "contact_admin": False,
+                    }
+                }
+            }
+        },
+        intent_plan=ToolIntentPlan(
+            action=ToolIntentAction.USE_TOOLS,
+            unavailable_runtime_capability=True,
+            reason="The requested provider capability is unavailable.",
+        ),
+    )
+
+    assert diagnostic and diagnostic["missing_user_token"] is True
+    answer = build_no_runtime_capability_answer(diagnostic)
+    assert "personal provider access credential is not configured" in answer
+    assert "没有可用的 provider" not in answer
+
+
+def test_no_runtime_capability_does_not_guess_between_unscoped_provider_diagnostics() -> None:
+    diagnostic = select_no_runtime_provider_auth_diagnostic(
+        extra={
+            "provider_auth_diagnostics": {
+                "providerx": {
+                    "default": {
+                        "provider_type": "providerx",
+                        "instance_name": "default",
+                        "missing_user_token": True,
+                    }
+                },
+                "providery": {
+                    "default": {
+                        "provider_type": "providery",
+                        "instance_name": "default",
+                        "missing_user_token": True,
+                    }
+                },
+            }
+        },
+        intent_plan=None,
+    )
+
+    assert diagnostic is None
+    answer = build_no_runtime_capability_answer(diagnostic)
+    assert "没有可用的 provider、skill 或工具" in answer
+
+
+def test_no_runtime_capability_can_scope_provider_auth_diagnostic_by_instance() -> None:
+    diagnostic = select_no_runtime_provider_auth_diagnostic(
+        extra={
+            "provider_auth_diagnostics": {
+                "providerx": {
+                    "primary": {
+                        "provider_type": "providerx",
+                        "instance_name": "primary",
+                        "missing_user_token": True,
+                    },
+                    "secondary": {
+                        "provider_type": "providerx",
+                        "instance_name": "secondary",
+                        "missing_user_token": True,
+                    },
+                }
+            }
+        },
+        intent_plan=ToolIntentPlan(
+            action=ToolIntentAction.USE_TOOLS,
+            target_provider_instances=["providerx.secondary"],
+            unavailable_runtime_capability=True,
+            reason="The selected provider instance requires user authentication.",
+        ),
+    )
+
+    assert diagnostic and diagnostic["instance_name"] == "secondary"
+
+
+class _PostRunner(
+    RunnerExecutionPayloadMixin,
+    RunnerToolEvidenceMixin,
+    RunnerExecutionFlowPostMixin,
+):
+    TOOL_POLICY_MAX_RETRIES = 1
+
+    def __init__(self) -> None:
+        self.history = _History()
+        self.runtime_events = _RuntimeEvents()
+        self.unsupported_answer = (
+            "I can't execute that operation with the available runtime tool. "
+            "No action was executed. Supported options are `enable` and `disable`."
+        )
+        self.unsupported_calls = []
+        self.direct_answer_recovery_answer = ""
+        self.direct_answer_recovery_calls = []
+        self.lookup_dump_recovery_answer = ""
+        self.lookup_dump_recovery_calls = []
+        self.retry_after_missing_tool_execution_calls = []
+        self.finalize_title_calls = []
+
+    @staticmethod
+    def _collect_buffered_assistant_text(buffered_events):
+        return ""
+
+    @staticmethod
+    def _missing_required_tool_names(**kwargs):
+        return []
+
+    @staticmethod
+    def _build_tool_evidence_required_message(**kwargs):
+        missing = kwargs.get("missing_required_tools", []) or []
+        return "Missing successful tool evidence: " + ", ".join(missing)
+
+    @staticmethod
+    def _tool_gate_has_strict_need(decision):
+        return bool(
+            getattr(decision, "needs_tool", False)
+            or getattr(decision, "needs_external_system", False)
+            or getattr(decision, "needs_live_data", False)
+            or getattr(decision, "needs_grounded_verification", False)
+        )
+
+    async def _retry_after_missing_tool_execution(self, **kwargs):
+        self.retry_after_missing_tool_execution_calls.append(kwargs)
+        if False:
+            yield None
+        return
+
+    async def run_single(self, user_message, deps, *, system_prompt=None, agent=None, allowed_tool_names=None):
+        self.unsupported_calls.append(
+            {
+                "user_message": user_message,
+                "system_prompt": system_prompt,
+                "agent": agent,
+                "allowed_tool_names": allowed_tool_names,
+            }
+        )
+        return self.unsupported_answer
+
+    async def _generate_direct_answer_recovery_answer(self, **kwargs):
+        self.direct_answer_recovery_calls.append(kwargs)
+        return self.direct_answer_recovery_answer
+
+    async def _generate_lookup_dump_recovery_answer(self, **kwargs):
+        self.lookup_dump_recovery_calls.append(kwargs)
+        return self.lookup_dump_recovery_answer
+
+    async def _maybe_finalize_title(self, **kwargs):
+        self.finalize_title_calls.append(kwargs)
+        return None
+
+
+class _SlowRuntimeEvents(_RuntimeEvents):
+    async def trigger_llm_completed(self, **kwargs):
+        await asyncio.sleep(0.2)
+        return None
+
+    async def trigger_run_context_ready(self, **kwargs):
+        await asyncio.sleep(0.2)
+        self.context_ready_calls.append(kwargs)
+        return None
+
+
+class _SlowSessionManager(_SessionManager):
+    async def persist_transcript(self, session_key, messages):
+        await asyncio.sleep(0.2)
+        self.persisted_messages = list(messages)
+        return None
+
+
+class _SlowPostRunner(_PostRunner):
+    def __init__(self) -> None:
+        super().__init__()
+        self.runtime_events = _SlowRuntimeEvents()
+
+    async def _maybe_finalize_title(self, **kwargs):
+        await asyncio.sleep(0.2)
+        return None
+
+
+def test_strips_generated_workspace_download_paths_from_markdown_links() -> None:
+    answer = (
+        "Files: [download](./report.xlsx), "
+        "[PDF](workspace://exports/report.pdf), "
+        "[sandbox](sandbox:/tmp/work/report.xlsx), "
+        "[api](/api/atlasclaw/skills/xlsx/download?file=report.xlsx), "
+        "[external](https://example.com/report.xlsx)."
+    )
+
+    normalized = _PostRunner._strip_workspace_download_link_paths(
+        answer,
+        {"report.xlsx", "exports/report.pdf"},
+    )
+
+    assert normalized == (
+        "Files: report.xlsx, report.pdf, report.xlsx, report.xlsx, "
+        "[external](https://example.com/report.xlsx)."
+    )
+
+
+def test_provider_auth_diagnostic_user_message_guides_user_token_setup() -> None:
+    missing = provider_auth_diagnostic_user_message({"missing_user_token": True})
+    assert "personal account settings" in missing
+    assert "`user_token`" not in missing
+    assert "not configured" in missing
+
+    rejected = provider_auth_diagnostic_user_message({"user_token_configured": True})
+    assert "Update it in personal account settings" in rejected
+    assert "`user_token`" not in rejected
+    assert "invalid" in rejected
+
+
+class _AgentRun:
+    def __init__(self, messages, result=None):
+        self._messages = list(messages)
+        self.result = result
+
+    def all_messages(self):
+        return list(self._messages)
+
+
+class _FlowHistory:
+    def to_model_message_history(self, messages):
+        return list(messages)
+
+    def normalize_messages(self, messages):
+        return list(messages)
+
+    def prune_summary_messages(self, messages):
+        return list(messages)
+
+
+class _LoopRunner(RunnerExecutionFlowPhaseMixin):
+    def __init__(self) -> None:
+        self.history = _FlowHistory()
+        self.compaction = SimpleNamespace(
+            should_compact=lambda *args, **kwargs: False,
+        )
+        self.context_pruning_settings = SimpleNamespace(enabled=False)
+        self.hooks = None
+        self.runtime_events = SimpleNamespace(trigger_llm_input=_noop_async)
+        self.captured_message_history = None
+
+    @asynccontextmanager
+    async def _run_iter_with_optional_override(self, **kwargs):
+        self.captured_message_history = list(kwargs.get("message_history") or [])
+        yield _AgentRun([])
+
+    async def _process_agent_run_outcome(self, **kwargs):
+        if False:
+            yield None
+        return
+
+    async def _handle_loop_phase_exception(self, **kwargs):
+        if False:
+            yield None
+        return
+
+    async def _iter_agent_nodes(self, agent_run):
+        if False:
+            yield None
+        return
+
+
+class _ErrorRunner(RunnerToolEvidenceMixin, RunnerExecutionRetryMixin, RunnerExecutionFlowErrorMixin):
+    def __init__(self) -> None:
+        self.runtime_events = _RuntimeEvents()
+        self.token_policy = None
+        self.token_interceptor = None
+
+    async def _retry_after_hard_token_failure(self, **kwargs):
+        if False:
+            yield None
+        return
+
+
+class _StreamRunner(RunnerExecutionFlowStreamMixin):
+    pass
+
+
+class _StreamRunnerWithEvidence(RunnerToolGatePolicyMixin, RunnerToolEvidenceMixin, RunnerExecutionFlowStreamMixin):
+    pass
+
+
+class _RefreshingHistory:
+    def normalize_messages(self, messages):
+        return list(messages)
+
+    def prune_summary_messages(self, messages):
+        return list(messages)
+
+
+class _ToolAwareHistory(_RefreshingHistory):
+    def normalize_messages(self, messages):
+        normalized = []
+        for message in messages:
+            if isinstance(message, dict):
+                normalized.append(dict(message))
+                continue
+            parts = getattr(message, "parts", None)
+            if not isinstance(parts, list):
+                continue
+            for part in parts:
+                tool_name = str(getattr(part, "tool_name", "") or "").strip()
+                if not tool_name:
+                    continue
+                item = {
+                    "role": "tool",
+                    "tool_name": tool_name,
+                    "content": getattr(part, "content", ""),
+                }
+                tool_call_id = str(getattr(part, "tool_call_id", "") or "").strip()
+                if tool_call_id:
+                    item["tool_call_id"] = tool_call_id
+                normalized.append(item)
+        return normalized
+
+
+class _SequencedAgentRun:
+    def __init__(self, snapshots):
+        self._snapshots = [list(item) for item in snapshots]
+        self._index = 0
+
+    def all_messages(self):
+        if self._index >= len(self._snapshots):
+            return list(self._snapshots[-1])
+        current = list(self._snapshots[self._index])
+        self._index += 1
+        return current
+
+
+class _RefreshingStreamRunner(RunnerExecutionFlowStreamMixin):
+    def __init__(self) -> None:
+        self.history = _RefreshingHistory()
+
+    @staticmethod
+    def _deduplicate_message_history(messages):
+        return list(messages)
+
+    @staticmethod
+    def _merge_runtime_messages_with_session_prefix(
+        *,
+        session_message_history,
+        runtime_messages,
+        runtime_base_history_len,
+    ):
+        return list(runtime_messages)
+
+
+class _PayloadRunner(RunnerExecutionPayloadMixin):
+    pass
+
+
+@pytest.mark.asyncio
+async def test_tool_required_turn_does_not_accept_fast_path_text_without_real_tool_execution() -> None:
+    runner = _PostRunner()
+    state = {
+        "start_time": 0.0,
+        "session_key": "s-1",
+        "session_manager": _SessionManager(),
+        "session": SimpleNamespace(title=""),
+        "run_id": "run-1",
+        "user_message": "查下CMP待审批",
+        "system_prompt": "system",
+        "deps": SimpleNamespace(extra={}),
+        "tool_gate_decision": ToolGateDecision(
+            needs_tool=True,
+            needs_external_system=True,
+            reason="provider request",
+            policy=ToolPolicyMode.PREFER_TOOL,
+        ),
+        "tool_match_result": SimpleNamespace(missing_capabilities=[], tool_candidates=[]),
+        "available_tools": [],
+        "tool_execution_required": True,
+        "max_tool_calls": 5,
+        "timeout_seconds": 60.0,
+        "_token_failover_attempt": 0,
+        "_emit_lifecycle_bounds": False,
+        "selected_token_id": None,
+        "release_slot": None,
+        "tool_execution_retry_count": 0,
+        "persist_override_messages": None,
+        "persist_override_base_len": 0,
+        "run_output_start_index": 1,
+        "buffered_assistant_events": [],
+        "tool_call_summaries": [],
+        "assistant_output_streamed": False,
+        "model_stream_timed_out": False,
+        "model_timeout_error_message": "",
+        "current_model_attempt": 1,
+        "thinking_emitter": SimpleNamespace(assistant_emitted=False),
+        "context_history_for_hooks": [],
+        "session_title": "",
+        "tool_intent_plan": ToolIntentPlan(
+            action=ToolIntentAction.USE_TOOLS,
+            target_provider_types=["smartcmp"],
+            reason="provider action",
+        ),
+    }
+
+    events = []
+    async for event in runner._process_agent_run_outcome(
+        agent_run=_AgentRun([{"role": "user", "content": "查下CMP待审批"}]),
+        state=state,
+        _log_step=lambda *args, **kwargs: None,
+    ):
+        events.append(event)
+
+    answered_states = [
+        event
+        for event in events
+        if event.type == "runtime" and str(event.metadata.get("state", "")).strip() == "answered"
+    ]
+    assistant_chunks = [event for event in events if event.type == "assistant"]
+    assert answered_states == []
+    assert assistant_chunks == []
+
+
+@pytest.mark.asyncio
+async def test_tool_required_missing_tool_after_retry_asks_llm_for_unsupported_tool_message() -> None:
+    runner = _PostRunner()
+    session_manager = _SessionManager()
+    state = {
+        "start_time": 0.0,
+        "session_key": "s-unsupported-tool",
+        "session_manager": session_manager,
+        "session": SimpleNamespace(title=""),
+        "run_id": "run-unsupported-tool",
+        "user_message": "archive item 1",
+        "system_prompt": "system",
+        "deps": SimpleNamespace(extra={}),
+        "tool_gate_decision": ToolGateDecision(
+            needs_tool=True,
+            needs_external_system=True,
+            reason="external item operation",
+            policy=ToolPolicyMode.MUST_USE_TOOL,
+        ),
+        "tool_match_result": SimpleNamespace(
+            missing_capabilities=[],
+            tool_candidates=[
+                SimpleNamespace(
+                    name="item_operation",
+                    capability_class="workflow:item",
+                )
+            ],
+        ),
+        "available_tools": [
+            {
+                "name": "item_operation",
+                "capability_class": "workflow:item",
+                "parameters_schema": {
+                    "type": "object",
+                    "required": ["item_ids", "operation"],
+                    "properties": {
+                        "item_ids": {"type": "array", "items": {"type": "string"}},
+                        "operation": {"type": "string", "enum": ["enable", "disable"]},
+                    },
+                },
+            }
+        ],
+        "tool_execution_required": True,
+        "max_tool_calls": 5,
+        "timeout_seconds": 60.0,
+        "_token_failover_attempt": 0,
+        "_emit_lifecycle_bounds": False,
+        "selected_token_id": None,
+        "release_slot": None,
+        "tool_execution_retry_count": 1,
+        "persist_override_messages": None,
+        "persist_override_base_len": 0,
+        "run_output_start_index": 1,
+        "persist_run_output_start_index": 1,
+        "buffered_assistant_events": [],
+        "tool_call_summaries": [],
+        "assistant_output_streamed": False,
+        "model_stream_timed_out": False,
+        "model_timeout_error_message": "",
+        "current_model_attempt": 2,
+        "thinking_emitter": SimpleNamespace(assistant_emitted=False),
+        "context_history_for_hooks": [],
+        "session_title": "",
+        "tool_intent_plan": ToolIntentPlan(
+            action=ToolIntentAction.USE_TOOLS,
+            target_tool_names=["item_operation"],
+            reason="external item operation",
+        ),
+    }
+
+    def _missing_required_tool_names(**kwargs):
+        return ["item_operation"]
+
+    runner._missing_required_tool_names = _missing_required_tool_names  # type: ignore[method-assign]
+
+    events = []
+    async for event in runner._process_agent_run_outcome(
+        agent_run=_AgentRun(
+            [
+                {"role": "user", "content": "archive item 1"},
+                {"role": "assistant", "content": "I need to operate that item."},
+            ]
+        ),
+        state=state,
+        _log_step=lambda *args, **kwargs: None,
+    ):
+        events.append(event)
+
+    assistant_text = "".join(event.content for event in events if event.type == "assistant")
+    failed_states = [
+        event
+        for event in events
+        if event.type == "runtime" and str(event.metadata.get("state", "")).strip() == "failed"
+    ]
+    answered_states = [
+        event
+        for event in events
+        if event.type == "runtime" and str(event.metadata.get("state", "")).strip() == "answered"
+    ]
+
+    assert failed_states == []
+    assert answered_states
+    assert "No action was executed" in assistant_text
+    assert "Supported options are `enable` and `disable`" in assistant_text
+    assert "A grounded tool-backed answer" not in assistant_text
+    assert runner.retry_after_missing_tool_execution_calls == []
+    assert len(runner.unsupported_calls) == 1
+    assert runner.unsupported_calls[0]["allowed_tool_names"] == []
+    assert "item_operation" in runner.unsupported_calls[0]["user_message"]
+    assert (
+        '"availability_status": "matching_tool_available_but_not_executed"'
+        in runner.unsupported_calls[0]["user_message"]
+    )
+    assert (
+        "matching_tool_available_but_not_executed means a matching tool was available"
+        in runner.unsupported_calls[0]["system_prompt"]
+    )
+    assert "never describe it as unsupported or unavailable" in (
+        runner.unsupported_calls[0]["system_prompt"]
+    )
+    assert '"enable"' in runner.unsupported_calls[0]["user_message"]
+    assert '"disable"' in runner.unsupported_calls[0]["user_message"]
+    await runner._await_background_post_success_tasks()
+    assert session_manager.persisted_messages is not None
+
+
+@pytest.mark.asyncio
+async def test_tool_required_turn_without_final_assistant_uses_tool_only_fallback() -> None:
+    runner = _PostRunner()
+    session_manager = _SessionManager()
+    state = {
+        "start_time": 0.0,
+        "session_key": "s-2",
+        "session_manager": session_manager,
+        "session": SimpleNamespace(title=""),
+        "run_id": "run-2",
+        "user_message": "查下CMP待审批",
+        "system_prompt": "system",
+        "deps": SimpleNamespace(extra={}),
+        "tool_gate_decision": ToolGateDecision(
+            needs_tool=True,
+            needs_external_system=True,
+            reason="provider request",
+            policy=ToolPolicyMode.PREFER_TOOL,
+        ),
+        "tool_match_result": SimpleNamespace(missing_capabilities=[], tool_candidates=[]),
+        "available_tools": [],
+        "tool_execution_required": True,
+        "max_tool_calls": 5,
+        "timeout_seconds": 60.0,
+        "_token_failover_attempt": 0,
+        "_emit_lifecycle_bounds": False,
+        "selected_token_id": None,
+        "release_slot": None,
+        "tool_execution_retry_count": 0,
+        "persist_override_messages": None,
+        "persist_override_base_len": 0,
+        "run_output_start_index": 1,
+        "buffered_assistant_events": [],
+        "tool_call_summaries": [{"name": "smartcmp_list_pending", "args": {}}],
+        "assistant_output_streamed": False,
+        "model_stream_timed_out": False,
+        "model_timeout_error_message": "",
+        "current_model_attempt": 1,
+        "thinking_emitter": SimpleNamespace(assistant_emitted=False),
+        "context_history_for_hooks": [],
+        "session_title": "",
+        "tool_intent_plan": ToolIntentPlan(
+            action=ToolIntentAction.USE_TOOLS,
+            target_provider_types=["smartcmp"],
+            target_tool_names=["smartcmp_list_pending"],
+            reason="provider action",
+        ),
+    }
+
+    events = []
+    async for event in runner._process_agent_run_outcome(
+        agent_run=_AgentRun(
+            [
+                {"role": "user", "content": "查下CMP待审批"},
+                {
+                    "role": "assistant",
+                    "content": "我来帮您查询。",
+                    "tool_calls": [{"id": "tc-1", "name": "smartcmp_list_pending", "args": {}}],
+                },
+                {
+                    "role": "tool",
+                    "tool_name": "smartcmp_list_pending",
+                    "content": {"output": "count=3"},
+                },
+            ]
+        ),
+        state=state,
+        _log_step=lambda *args, **kwargs: None,
+        ):
+        events.append(event)
+
+    assistant_chunks = [event.content for event in events if event.type == "assistant"]
+    answered_states = [
+        event
+        for event in events
+        if event.type == "runtime" and str(event.metadata.get("state", "")).strip() == "answered"
+    ]
+    failed_states = [
+        event
+        for event in events
+        if event.type == "runtime" and str(event.metadata.get("state", "")).strip() == "failed"
+    ]
+
+    assert answered_states
+    assert failed_states == []
+    assert any("count=3" in chunk for chunk in assistant_chunks)
+    await runner._await_background_post_success_tasks()
+    assert session_manager.persisted_messages is not None
+    persisted_assistants = [
+        message
+        for message in session_manager.persisted_messages
+        if str(message.get("role", "")).strip() == "assistant"
+    ]
+    assert any("count=3" in str(message.get("content", "")) for message in persisted_assistants)
+
+
+@pytest.mark.asyncio
+async def test_tool_required_turn_ignores_agent_result_text_and_uses_tool_only_fallback() -> None:
+    runner = _PostRunner()
+    session_manager = _SessionManager()
+    stale_result = SimpleNamespace(response=SimpleNamespace(content="上一轮天气答案"))
+    state = {
+        "start_time": 0.0,
+        "session_key": "s-2b",
+        "session_manager": session_manager,
+        "session": SimpleNamespace(title=""),
+        "run_id": "run-2b",
+        "user_message": "上海周边有哪些自行车骑行公园",
+        "system_prompt": "system",
+        "deps": SimpleNamespace(extra={}),
+        "tool_gate_decision": ToolGateDecision(
+            needs_tool=True,
+            needs_live_data=True,
+            reason="public web search",
+            policy=ToolPolicyMode.PREFER_TOOL,
+        ),
+        "tool_match_result": SimpleNamespace(missing_capabilities=[], tool_candidates=[]),
+        "available_tools": [],
+        "tool_execution_required": True,
+        "max_tool_calls": 5,
+        "timeout_seconds": 60.0,
+        "_token_failover_attempt": 0,
+        "_emit_lifecycle_bounds": False,
+        "selected_token_id": None,
+        "release_slot": None,
+        "tool_execution_retry_count": 0,
+        "persist_override_messages": None,
+        "persist_override_base_len": 0,
+        "run_output_start_index": 1,
+        "persist_run_output_start_index": 1,
+        "buffered_assistant_events": [],
+        "tool_call_summaries": [{"name": "web_search", "args": {"query": "上海周边 自行车骑行公园"}}],
+        "assistant_output_streamed": False,
+        "model_stream_timed_out": False,
+        "model_timeout_error_message": "",
+        "current_model_attempt": 1,
+        "thinking_emitter": SimpleNamespace(assistant_emitted=False),
+        "context_history_for_hooks": [],
+        "session_title": "",
+        "tool_intent_plan": ToolIntentPlan(
+            action=ToolIntentAction.USE_TOOLS,
+            target_group_ids=["group:web"],
+            target_capability_classes=["web_search"],
+            target_tool_names=["web_search"],
+            reason="public search",
+        ),
+    }
+
+    events = []
+    async for event in runner._process_agent_run_outcome(
+        agent_run=_AgentRun(
+            [
+                {"role": "assistant", "content": "上一轮天气答案"},
+                {"role": "user", "content": "上海周边有哪些自行车骑行公园"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{"id": "tc-1", "name": "web_search", "args": {"query": "上海周边 自行车骑行公园"}}],
+                },
+                {
+                    "role": "tool",
+                    "tool_name": "web_search",
+                    "content": {
+                        "output": "- 崇明岛环岛绿道\n- 滴水湖环湖骑行道\n- 淀山湖环湖骑行线"
+                    },
+                },
+            ],
+            result=stale_result,
+        ),
+        state=state,
+        _log_step=lambda *args, **kwargs: None,
+    ):
+        events.append(event)
+
+    assistant_chunks = [event.content for event in events if event.type == "assistant"]
+    assert assistant_chunks
+    assert all("上一轮天气答案" not in chunk for chunk in assistant_chunks)
+    assert any("崇明岛" in chunk for chunk in assistant_chunks)
+
+
+@pytest.mark.asyncio
+async def test_tool_only_finalize_prefers_structured_tool_answer_over_model_plaintext() -> None:
+    runner = _PostRunner()
+    session_manager = _SessionManager()
+    state = {
+        "start_time": 0.0,
+        "session_key": "s-2c",
+        "session_manager": session_manager,
+        "session": SimpleNamespace(title=""),
+        "run_id": "run-2c",
+        "user_message": "CMP里面有多少待审批的",
+        "system_prompt": "system",
+        "deps": SimpleNamespace(extra={}),
+        "tool_gate_decision": ToolGateDecision(
+            needs_tool=True,
+            needs_external_system=True,
+            reason="provider request",
+            policy=ToolPolicyMode.PREFER_TOOL,
+        ),
+        "tool_match_result": SimpleNamespace(missing_capabilities=[], tool_candidates=[]),
+        "available_tools": [
+            {
+                "name": "smartcmp_list_pending",
+                "capability_class": "provider:smartcmp",
+                "result_mode": "tool_only_ok",
+            }
+        ],
+        "tool_execution_required": True,
+        "max_tool_calls": 5,
+        "timeout_seconds": 60.0,
+        "_token_failover_attempt": 0,
+        "_emit_lifecycle_bounds": False,
+        "selected_token_id": None,
+        "release_slot": None,
+        "tool_execution_retry_count": 0,
+        "persist_override_messages": None,
+        "persist_override_base_len": 0,
+        "run_output_start_index": 1,
+        "persist_run_output_start_index": 1,
+        "buffered_assistant_events": [],
+        "tool_call_summaries": [{"name": "smartcmp_list_pending", "args": {}}],
+        "assistant_output_streamed": False,
+        "model_stream_timed_out": False,
+        "model_timeout_error_message": "",
+        "current_model_attempt": 1,
+        "thinking_emitter": SimpleNamespace(assistant_emitted=False),
+        "context_history_for_hooks": [],
+        "session_title": "",
+        "tool_intent_plan": ToolIntentPlan(
+            action=ToolIntentAction.USE_TOOLS,
+            target_provider_types=["smartcmp"],
+            target_tool_names=["smartcmp_list_pending"],
+            reason="provider action",
+        ),
+        "executed_tool_names": ["smartcmp_list_pending"],
+        "force_tool_only_finalize": True,
+    }
+
+    meta_output = "\n".join(
+        [
+            "Answer",
+            "=====",
+            "+- [1] 高 ---------------------------------------------",
+            "| 名称: Test ticket for build verification",
+            "##APPROVAL_META_START##",
+            '[{"index":1,"id":"A-1","requestId":"TIC20260316000001","name":"Test ticket for build verification","catalogName":"Incident Ticket","approvalStep":"一级审批","currentApprover":"待分配","waitHours":645.1}]',
+            "##APPROVAL_META_END##",
+        ]
+    )
+
+    events = []
+    async for event in runner._process_agent_run_outcome(
+        agent_run=_AgentRun(
+            [
+                {"role": "user", "content": "CMP里面有多少待审批的"},
+                {
+                    "role": "assistant",
+                    "content": "Answer\n=====\n+- [1] 高 ---------------------------------------------",
+                    "tool_calls": [{"id": "cmp-1", "name": "smartcmp_list_pending", "args": {}}],
+                },
+                {
+                    "role": "tool",
+                    "tool_name": "smartcmp_list_pending",
+                    "content": {"output": meta_output},
+                },
+            ]
+        ),
+        state=state,
+        _log_step=lambda *args, **kwargs: None,
+    ):
+        events.append(event)
+
+    assistant_chunks = [event.content for event in events if event.type == "assistant"]
+    assert assistant_chunks
+    final_chunk = "".join(assistant_chunks)
+    assert "Answer" not in final_chunk
+    assert "=====" not in final_chunk
+    assert "### 1. Test ticket for build verification" in final_chunk
+
+
+@pytest.mark.asyncio
+async def test_explicit_final_user_output_keeps_complete_generated_content() -> None:
+    runner = _PostRunner()
+    session_manager = _SessionManager()
+    tool_name = "example_generate_configuration"
+    expected = "\n".join(
+        [
+            "Generated configuration:",
+            "```json",
+            "{",
+            '  "results": [],',
+            '  "tool_name": "generated_helper",',
+            '  "returncode": 0,',
+            '  "artifact_path": "generated/report.json"',
+            "}",
+            "```",
+        ]
+    )
+    assert runner._looks_like_raw_tool_payload_dump(expected) is True
+    state = {
+        "start_time": 0.0,
+        "session_key": "s-complete-output",
+        "session_manager": session_manager,
+        "session": SimpleNamespace(title=""),
+        "run_id": "run-complete-output",
+        "user_message": "按要求生成完整配置",
+        "system_prompt": "system",
+        "deps": SimpleNamespace(extra={}),
+        "tool_gate_decision": ToolGateDecision(
+            needs_tool=True,
+            needs_external_system=True,
+            reason="provider request",
+            policy=ToolPolicyMode.PREFER_TOOL,
+        ),
+        "tool_match_result": SimpleNamespace(
+            missing_capabilities=[],
+            tool_candidates=[],
+        ),
+        "available_tools": [
+            {
+                "name": tool_name,
+                "capability_class": "content:configuration",
+                "result_mode": "tool_only_ok",
+            }
+        ],
+        "tool_execution_required": True,
+        "max_tool_calls": 5,
+        "timeout_seconds": 60.0,
+        "_token_failover_attempt": 0,
+        "_emit_lifecycle_bounds": False,
+        "selected_token_id": None,
+        "release_slot": None,
+        "tool_execution_retry_count": 0,
+        "persist_override_messages": None,
+        "persist_override_base_len": 0,
+        "run_output_start_index": 1,
+        "persist_run_output_start_index": 1,
+        "buffered_assistant_events": [],
+        "tool_call_summaries": [{"name": tool_name, "args": {}}],
+        "assistant_output_streamed": False,
+        "model_stream_timed_out": False,
+        "model_timeout_error_message": "",
+        "current_model_attempt": 1,
+        "thinking_emitter": SimpleNamespace(assistant_emitted=False),
+        "context_history_for_hooks": [],
+        "session_title": "",
+        "tool_intent_plan": ToolIntentPlan(
+            action=ToolIntentAction.USE_TOOLS,
+            target_tool_names=[tool_name],
+            reason="generate complete configuration",
+        ),
+        "executed_tool_names": [tool_name],
+        "final_user_output_override": expected,
+        "tool_only_answer_override": expected,
+        "force_tool_only_finalize": True,
+    }
+
+    events = []
+    async for event in runner._process_agent_run_outcome(
+        agent_run=_AgentRun(
+            [
+                {"role": "user", "content": "按要求生成完整配置"},
+                {
+                    "role": "assistant",
+                    "content": "模型草稿不应覆盖最终 Tool 输出",
+                    "tool_calls": [
+                        {
+                            "id": "design-1",
+                            "name": tool_name,
+                            "args": {},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_name": tool_name,
+                    "content": {
+                        "success": True,
+                        "output": "internal summary",
+                        "final_user_output": expected,
+                    },
+                },
+            ]
+        ),
+        state=state,
+        _log_step=lambda *args, **kwargs: None,
+    ):
+        events.append(event)
+
+    final_chunk = "".join(
+        event.content for event in events if event.type == "assistant"
+    )
+    assert final_chunk == expected
+
+
+@pytest.mark.asyncio
+async def test_run_loop_phase_preserves_explicit_empty_runtime_history() -> None:
+    runner = _LoopRunner()
+    state = {
+        "deps": SimpleNamespace(user_message="", is_aborted=lambda: False),
+        "user_message": "上海周边有哪些自行车骑行公园",
+        "runtime_message_history": [],
+        "message_history": [
+            {"role": "user", "content": "明天上海天气如何"},
+            {"role": "assistant", "content": "明天有小雨。"},
+        ],
+        "runtime_agent": object(),
+        "system_prompt": "system",
+        "run_output_start_index": 0,
+        "thinking_emitter": SimpleNamespace(close_if_active=_empty_async_iter),
+    }
+
+    events = []
+    async for event in runner._run_loop_phase(state=state, _log_step=lambda *args, **kwargs: None):
+        events.append(event)
+
+    runtime_messages = [
+        event.content
+        for event in events
+        if event.type == "runtime"
+    ]
+    assert runtime_messages[:2] == [
+        "Preparing model request context.",
+        "Starting model session.",
+    ]
+    assert runner.captured_message_history == []
+    assert state["run_output_start_index"] == 0
+
+
+def test_repeated_tool_loop_limit_detects_same_tool_before_dispatch() -> None:
+    exceeded = _StreamRunner._collect_repeated_tool_names(
+        planned_tool_calls=[{"name": "web_search"}],
+        executed_tool_names=["web_search", "web_search"],
+        repeat_limit=2,
+    )
+
+    assert exceeded == ["web_search"]
+
+
+def test_repeated_tool_loop_limit_does_not_block_standard_skill_runtime_tools() -> None:
+    exceeded = _StreamRunner._collect_repeated_tool_names(
+        planned_tool_calls=[{"name": "skill_exec"}],
+        executed_tool_names=["skill_exec", "skill_exec"],
+        repeat_limit=2,
+    )
+
+    assert exceeded == []
+
+
+def test_repeated_tool_loop_stashes_tool_only_answer_before_stop() -> None:
+    runner = _StreamRunnerWithEvidence()
+    state: dict[str, object] = {}
+
+    runner._stash_tool_only_answer_for_loop_stop(
+        state=state,
+        messages=[
+            {"role": "user", "content": "SmartCMP 是否支持泛微 OA 审批？"},
+            {
+                "role": "tool",
+                "tool_name": "markdown_vault_search",
+                "content": json.dumps(
+                    {
+                        "success": True,
+                        "results": [
+                            {
+                                "title": "OA 系统对接",
+                                "path": "20-功能域/第三方系统对接与集成/OA 系统对接.md",
+                                "text": "支持泛微 OA 对接审批，需按接口文档配置认证和回调。",
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+        ],
+        start_index=1,
+    )
+
+    assert state["force_tool_only_finalize"] is True
+    assert "OA 系统对接" in str(state["tool_only_answer_override"])
+    assert '"results"' not in str(state["tool_only_answer_override"])
+
+
+def test_final_user_output_uses_only_latest_dispatch_result() -> None:
+    runner = _StreamRunnerWithEvidence()
+    state: dict[str, object] = {}
+    schema_json = json.dumps(
+        {
+            "type": "object",
+            "properties": {
+                f"field_{index}": {
+                    "type": "string",
+                    "description": f"Complete field {index}",
+                }
+                for index in range(100)
+            },
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    expected = f"Schema JSON:\n```json\n{schema_json}\n```"
+
+    runner._stash_final_user_output_for_finalize(
+        state=state,
+        messages=[
+            {
+                "role": "tool",
+                "tool_name": "example_generate_configuration",
+                "content": {
+                    "success": True,
+                    "final_user_output": "Stale generated configuration.",
+                },
+            },
+            {
+                "role": "tool",
+                "tool_name": "example_generate_configuration",
+                "content": json.dumps(
+                    {
+                        "success": True,
+                        "output": "internal summary",
+                        "final_user_output": expected,
+                    }
+                ),
+            },
+        ],
+        start_index=0,
+        target_tool_names=["example_generate_configuration"],
+        previous_result_count=1,
+    )
+
+    assert state["force_tool_only_finalize"] is True
+    assert state["final_user_output_override"] == expected
+    assert state["tool_only_answer_override"] == expected
+    assert "Stale generated configuration" not in str(
+        state["tool_only_answer_override"]
+    )
+    assert "field_99" in str(state["tool_only_answer_override"])
+    assert "\n..." not in str(state["tool_only_answer_override"])
+
+
+@pytest.mark.parametrize(
+    "raw_marker",
+    [
+        '"results": [',
+        '"tool_name": "generated_helper"',
+        '"returncode": 0',
+        '"artifact_path": "generated/report.json"',
+    ],
+)
+def test_explicit_final_user_output_keeps_generated_raw_payload_markers(
+    raw_marker: str,
+) -> None:
+    runner = _StreamRunnerWithEvidence()
+    state: dict[str, object] = {}
+    expected = f"Generated content:\n```json\n{{{raw_marker}}}\n```"
+
+    runner._stash_final_user_output_for_finalize(
+        state=state,
+        messages=[
+            {
+                "role": "tool",
+                "tool_name": "example_generate_configuration",
+                "content": {
+                    "success": True,
+                    "final_user_output": expected,
+                },
+            }
+        ],
+        start_index=0,
+        target_tool_names=["example_generate_configuration"],
+        previous_result_count=0,
+    )
+
+    assert state["force_tool_only_finalize"] is True
+    assert state["final_user_output_override"] == expected
+    assert state["tool_only_answer_override"] == expected
+
+
+def test_tool_only_output_does_not_opt_into_complete_final_output() -> None:
+    runner = _StreamRunnerWithEvidence()
+    state: dict[str, object] = {}
+
+    runner._stash_final_user_output_for_finalize(
+        state=state,
+        messages=[
+            {
+                "role": "tool",
+                "tool_name": "example_query_records",
+                "content": json.dumps(
+                    {
+                        "success": True,
+                        "results": [{"id": "provider-record"}],
+                    }
+                ),
+            }
+        ],
+        start_index=0,
+        target_tool_names=["example_query_records"],
+        previous_result_count=0,
+    )
+
+    assert state == {}
+
+
+@pytest.mark.parametrize(
+    "current_payload",
+    [
+        {"success": False, "final_user_output": "Do not use failed output."},
+        {"success": True, "final_user_output": ""},
+        {"success": True, "output": "Ordinary result only."},
+    ],
+)
+def test_latest_failed_or_empty_result_clears_stale_final_user_output(
+    current_payload: dict[str, object],
+) -> None:
+    runner = _StreamRunnerWithEvidence()
+    state: dict[str, object] = {
+        "final_user_output_override": "Stale generated output.",
+        "tool_only_answer_override": "Stale generated output.",
+    }
+
+    runner._stash_final_user_output_for_finalize(
+        state=state,
+        messages=[
+            {
+                "role": "tool",
+                "tool_name": "example_generate_configuration",
+                "content": {
+                    "success": True,
+                    "final_user_output": "Stale generated output.",
+                },
+            },
+            {
+                "role": "tool",
+                "tool_name": "example_generate_configuration",
+                "content": current_payload,
+            },
+        ],
+        start_index=0,
+        target_tool_names=["example_generate_configuration"],
+        previous_result_count=1,
+    )
+
+    assert "final_user_output_override" not in state
+    assert "tool_only_answer_override" not in state
+
+
+def test_final_user_output_rejects_multi_tool_and_artifact_dispatches() -> None:
+    runner = _StreamRunnerWithEvidence()
+    state: dict[str, object] = {}
+    messages = [
+        {
+            "role": "tool",
+            "tool_name": "example_generate_configuration",
+            "content": {
+                "success": True,
+                "final_user_output": "Generated configuration.",
+            },
+        },
+        {
+            "role": "tool",
+            "tool_name": "example_validate_configuration",
+            "content": {
+                "success": True,
+                "final_user_output": "Validated configuration.",
+            },
+        },
+    ]
+
+    runner._stash_final_user_output_for_finalize(
+        state=state,
+        messages=messages,
+        start_index=0,
+        target_tool_names=[
+            "example_generate_configuration",
+            "example_validate_configuration",
+        ],
+        previous_result_count=0,
+    )
+    assert state == {}
+
+    runner._stash_final_user_output_for_finalize(
+        state=state,
+        messages=messages[:1],
+        start_index=0,
+        target_tool_names=["example_generate_configuration"],
+        previous_result_count=0,
+        artifact_goal={"kind": "json", "label": "configuration"},
+    )
+    assert state == {}
+
+
+def test_duplicate_same_tool_calls_cannot_finalize_from_last_success() -> None:
+    runner = _StreamRunnerWithEvidence()
+    tool_name = "example_generate_configuration"
+    available_tools = [
+        {
+            "name": tool_name,
+            "capability_class": "content:configuration",
+            "result_mode": "tool_only_ok",
+        }
+    ]
+    messages = [
+        {
+            "role": "tool",
+            "tool_name": tool_name,
+            "content": {
+                "success": False,
+                "error": "First invocation failed.",
+            },
+        },
+        {
+            "role": "tool",
+            "tool_name": tool_name,
+            "content": {
+                "success": True,
+                "final_user_output": "Second invocation succeeded.",
+            },
+        },
+    ]
+
+    for planned_tool_names in ([tool_name, tool_name], [tool_name]):
+        state: dict[str, object] = {}
+        runner._stash_final_user_output_for_finalize(
+            state=state,
+            messages=messages,
+            start_index=0,
+            target_tool_names=planned_tool_names,
+            previous_result_count=0,
+        )
+        assert state == {}
+        assert runner._should_finalize_from_tool_results(
+            messages=messages,
+            start_index=0,
+            planned_tool_names=planned_tool_names,
+            available_tools=available_tools,
+            previous_result_count=0,
+        ) is False
+
+
+def test_terminal_no_progress_cannot_reuse_previous_final_user_output() -> None:
+    runner = _StreamRunnerWithEvidence()
+    state: dict[str, object] = {
+        "final_user_output_override": "Stale generated output.",
+        "tool_only_answer_override": "Stale generated output.",
+    }
+
+    runner._stash_final_user_output_for_finalize(
+        state=state,
+        messages=[
+            {
+                "role": "tool",
+                "tool_name": "example_generate_configuration",
+                "content": {"success": True, "final_user_output": "Stale generated output."},
+            }
+        ],
+        start_index=0,
+        target_tool_names=["example_generate_configuration"],
+        previous_result_count=1,
+    )
+
+    assert "final_user_output_override" not in state
+    assert "tool_only_answer_override" not in state
+
+
+def test_tool_only_finalize_uses_current_dispatch_instead_of_prior_success() -> None:
+    runner = _StreamRunnerWithEvidence()
+    tool_name = "example_generate_configuration"
+    available_tools = [
+        {
+            "name": tool_name,
+            "capability_class": "content:configuration",
+            "result_mode": "tool_only_ok",
+        }
+    ]
+    messages = [
+        {
+            "role": "tool",
+            "tool_name": tool_name,
+            "content": {
+                "success": True,
+                "final_user_output": "Stale generated output.",
+            },
+        },
+        {
+            "role": "tool",
+            "tool_name": tool_name,
+            "content": {
+                "success": False,
+                "error": "Current generation failed.",
+            },
+        },
+    ]
+
+    assert runner._should_finalize_from_tool_results(
+        messages=messages,
+        start_index=0,
+        planned_tool_names=[tool_name],
+        available_tools=available_tools,
+        previous_result_count=1,
+    ) is False
+
+    messages[-1]["content"] = {
+        "success": True,
+        "final_user_output": "Current generated output.",
+    }
+    assert runner._should_finalize_from_tool_results(
+        messages=messages,
+        start_index=0,
+        planned_tool_names=[tool_name],
+        available_tools=available_tools,
+        previous_result_count=1,
+    ) is True
+
+
+def test_merge_runtime_messages_with_session_prefix_restores_full_turn_view() -> None:
+    merged = _PayloadRunner._merge_runtime_messages_with_session_prefix(
+        session_message_history=[
+            {"role": "user", "content": "查下CMP待审批"},
+            {"role": "assistant", "content": "好的，我来查。"},
+        ],
+        runtime_messages=[
+            {"role": "user", "content": "上海周边有哪些自行车骑行公园"},
+            {"role": "assistant", "content": "我来帮你找。"},
+        ],
+        runtime_base_history_len=0,
+    )
+
+    assert merged == [
+        {"role": "user", "content": "查下CMP待审批"},
+        {"role": "assistant", "content": "好的，我来查。"},
+        {"role": "user", "content": "上海周边有哪些自行车骑行公园"},
+        {"role": "assistant", "content": "我来帮你找。"},
+    ]
+
+
+def test_sanitize_turn_messages_for_persistence_drops_unmatched_tool_calls() -> None:
+    runner = _PostRunner()
+    sanitized = runner._sanitize_turn_messages_for_persistence(
+        messages=[
+            {"role": "user", "content": "查下CMP详情"},
+            {
+                "role": "assistant",
+                "content": "我来查一下",
+                "tool_calls": [{"id": "tc-1", "name": "smartcmp_get_request_detail", "args": {"identifier": "TIC-1"}}],
+            },
+        ],
+        start_index=1,
+        final_assistant="",
+        clear_tool_planning_text=True,
+    )
+
+    assert sanitized == [{"role": "user", "content": "查下CMP详情"}]
+
+
+def test_sanitize_turn_messages_for_persistence_restores_raw_user_message() -> None:
+    runner = _PostRunner()
+    sanitized = runner._sanitize_turn_messages_for_persistence(
+        messages=[
+            {"role": "user", "content": "previous question"},
+            {"role": "assistant", "content": "previous answer"},
+            {
+                "role": "user",
+                "content": (
+                    "Use only the selected knowledge base. You must call the selected search tool.\n"
+                    "Do not call realtime APIs. Do not access external systems.\n\n"
+                    "Question: TLS config?\n\n"
+                    "Please output:\n"
+                    "1. Top 5 retrieved paths\n"
+                    "2. Citations\n"
+                    "3. A short answer"
+                ),
+            },
+            {"role": "assistant", "content": "Tool-backed answer"},
+        ],
+        start_index=2,
+        final_assistant="Tool-backed answer",
+        persist_user_message="TLS config?",
+    )
+
+    assert sanitized == [
+        {"role": "user", "content": "previous question"},
+        {"role": "assistant", "content": "previous answer"},
+        {"role": "user", "content": "TLS config?"},
+        {"role": "assistant", "content": "Tool-backed answer"},
+    ]
+
+
+def test_sanitize_turn_messages_for_persistence_attaches_user_metadata() -> None:
+    runner = _PostRunner()
+    sanitized = runner._sanitize_turn_messages_for_persistence(
+        messages=[
+            {"role": "user", "content": "internal detail action"},
+            {"role": "assistant", "content": "Detail answer"},
+        ],
+        start_index=0,
+        final_assistant="Detail answer",
+        persist_user_message="internal detail action",
+        persist_user_metadata={"visible_user_turn": False},
+    )
+
+    assert sanitized == [
+        {
+            "role": "user",
+            "content": "internal detail action",
+            "metadata": {"visible_user_turn": False},
+        },
+        {"role": "assistant", "content": "Detail answer"},
+    ]
+
+
+def test_embed_scope_workflow_history_restores_generation_zero() -> None:
+    runner = _PostRunner()
+    embed_scope = {
+        "context_id": "ctx-1",
+        "generation": 0,
+        "provider_type": "smartcmp",
+        "provider_instance": "default",
+        "object_type": "catalog",
+        "object_id": "catalog-1",
+    }
+    persisted_metadata = runner._persist_user_message_metadata_from_deps(
+        SimpleNamespace(
+            extra={
+                "context": {
+                    "visible_user_turn": False,
+                    "embed_scope": embed_scope,
+                }
+            }
+        )
+    )
+    workflow_message = {
+        "role": "assistant",
+        "content": "Catalog workflow result",
+    }
+
+    restored = _embed_scope_workflow_history(
+        [
+            {
+                "role": "user",
+                "content": "Run catalog action",
+                "metadata": persisted_metadata,
+            },
+            workflow_message,
+        ],
+        embed_scope=embed_scope,
+    )
+
+    assert restored == [workflow_message]
+
+
+def test_embed_scope_workflow_history_rejects_latest_mismatching_hidden_action() -> None:
+    matching_scope = {
+        "context_id": "ctx-1",
+        "generation": 0,
+        "provider_type": "example",
+        "provider_instance": "primary",
+        "object_type": "item",
+        "object_id": "item-1",
+    }
+    newer_scope = {
+        **matching_scope,
+        "generation": 1,
+        "object_id": "item-2",
+    }
+
+    def hidden_action(scope: dict, trace_id: str) -> list[dict]:
+        return [
+            {
+                "role": "user",
+                "content": "Run a page action",
+                "metadata": {
+                    "visible_user_turn": False,
+                    "embed_scope": scope,
+                },
+            },
+            {
+                "role": "tool",
+                "content": {
+                    "_internal": {
+                        "internal_request_trace_id": trace_id,
+                    }
+                },
+            },
+        ]
+
+    restored = _embed_scope_workflow_history(
+        [
+            *hidden_action(matching_scope, "matching-trace"),
+            *hidden_action(newer_scope, "newer-trace"),
+        ],
+        embed_scope=matching_scope,
+    )
+
+    assert restored is None
+
+
+@pytest.mark.asyncio
+async def test_hidden_user_turn_does_not_finalize_session_title() -> None:
+    runner = _PostRunner()
+    session_manager = _SessionManager()
+    state = {
+        "deps": SimpleNamespace(extra={"context": {"visible_user_turn": False}}),
+        "context_history_for_hooks": [],
+        "session_title": "查看我的审批",
+    }
+
+    runner._schedule_post_success_side_effects(
+        state=state,
+        _log_step=lambda *args, **kwargs: None,
+        session_key="s-hidden-title",
+        run_id="run-hidden-title",
+        session_manager=session_manager,
+        persist_messages=[
+            {
+                "role": "user",
+                "content": "查看 RES20260518000001 的审批详情",
+                "metadata": {"visible_user_turn": False},
+            },
+            {"role": "assistant", "content": "CMP Request Detail: RES20260518000001"},
+        ],
+        final_assistant="CMP Request Detail: RES20260518000001",
+        final_messages=[
+            {"role": "user", "content": "查看 RES20260518000001 的审批详情"},
+            {"role": "assistant", "content": "CMP Request Detail: RES20260518000001"},
+        ],
+        session=SimpleNamespace(title="查看我的审批"),
+        user_message="查看 RES20260518000001 的审批详情",
+        system_prompt="system",
+        tool_call_summaries=[],
+    )
+    await runner._await_background_post_success_tasks()
+
+    assert runner.finalize_title_calls == []
+    assert session_manager.persisted_messages is not None
+    assert runner.runtime_events.context_ready_calls[0]["session_title"] == "查看我的审批"
+
+
+@pytest.mark.asyncio
+async def test_tool_required_turn_with_tool_error_fails_without_llm_fallback() -> None:
+    runner = _PostRunner()
+    session_manager = _SessionManager()
+    state = {
+        "start_time": 0.0,
+        "session_key": "s-3",
+        "session_manager": session_manager,
+        "session": SimpleNamespace(title=""),
+        "run_id": "run-3",
+        "user_message": "我要看下TIC20260316000001的详情",
+        "system_prompt": "system",
+        "deps": SimpleNamespace(extra={}),
+        "tool_gate_decision": ToolGateDecision(
+            needs_tool=True,
+            needs_external_system=True,
+            reason="provider request",
+            policy=ToolPolicyMode.PREFER_TOOL,
+        ),
+        "tool_match_result": SimpleNamespace(missing_capabilities=[], tool_candidates=[]),
+        "available_tools": [{"name": "smartcmp_get_request_detail", "capability_class": "provider:smartcmp"}],
+        "tool_execution_required": True,
+        "max_tool_calls": 5,
+        "timeout_seconds": 60.0,
+        "_token_failover_attempt": 0,
+        "_emit_lifecycle_bounds": False,
+        "selected_token_id": None,
+        "release_slot": None,
+        "tool_execution_retry_count": 0,
+        "persist_override_messages": None,
+        "persist_override_base_len": 0,
+        "run_output_start_index": 1,
+        "buffered_assistant_events": [],
+        "tool_call_summaries": [{"name": "smartcmp_get_request_detail", "args": {"identifier": "TIC20260316000001"}}],
+        "assistant_output_streamed": False,
+        "model_stream_timed_out": False,
+        "model_timeout_error_message": "",
+        "current_model_attempt": 1,
+        "thinking_emitter": SimpleNamespace(assistant_emitted=False),
+        "context_history_for_hooks": [],
+        "session_title": "",
+        "tool_intent_plan": ToolIntentPlan(
+            action=ToolIntentAction.USE_TOOLS,
+            target_provider_types=["smartcmp"],
+            target_tool_names=["smartcmp_get_request_detail"],
+            reason="provider action",
+        ),
+        "repeated_tool_failure": {
+            "tool_name": "smartcmp_get_request_detail",
+            "error": "[ERROR] Missing required identifier argument.",
+            "count": 2,
+        },
+    }
+
+    def _missing_required_tool_names(**kwargs):
+        return ["smartcmp_get_request_detail"]
+
+    runner._missing_required_tool_names = _missing_required_tool_names  # type: ignore[method-assign]
+
+    events = []
+    async for event in runner._process_agent_run_outcome(
+        agent_run=_AgentRun(
+            [
+                {"role": "user", "content": "我要看下TIC20260316000001的详情"},
+                {
+                    "role": "assistant",
+                    "content": "我来查一下。",
+                    "tool_calls": [
+                        {
+                            "id": "tc-1",
+                            "name": "smartcmp_get_request_detail",
+                            "args": {"workflowId": "TIC20260316000001"},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_name": "smartcmp_get_request_detail",
+                    "content": "[ERROR] Missing required identifier argument.",
+                },
+            ]
+        ),
+        state=state,
+        _log_step=lambda *args, **kwargs: None,
+    ):
+        events.append(event)
+
+    failed_states = [
+        event
+        for event in events
+        if event.type == "runtime" and str(event.metadata.get("state", "")).strip() == "failed"
+    ]
+    answered_states = [
+        event
+        for event in events
+        if event.type == "runtime" and str(event.metadata.get("state", "")).strip() == "answered"
+    ]
+    assistant_chunks = [event.content for event in events if event.type == "assistant"]
+    assert failed_states
+    assert answered_states == []
+    assert assistant_chunks == []
+    await runner._await_background_post_success_tasks()
+    assert session_manager.persisted_messages is not None
+
+
+@pytest.mark.asyncio
+async def test_tool_required_turn_with_terminal_no_results_uses_tool_only_answer() -> None:
+    runner = _PostRunner()
+    session_manager = _SessionManager()
+    state = {
+        "start_time": 0.0,
+        "session_key": "s-3b",
+        "session_manager": session_manager,
+        "session": SimpleNamespace(title=""),
+        "run_id": "run-3b",
+        "user_message": "我想查下上海周边的骑行公园",
+        "system_prompt": "system",
+        "deps": SimpleNamespace(extra={}),
+        "tool_gate_decision": ToolGateDecision(
+            needs_tool=True,
+            needs_live_data=True,
+            reason="public search",
+            policy=ToolPolicyMode.PREFER_TOOL,
+        ),
+        "tool_match_result": SimpleNamespace(missing_capabilities=[], tool_candidates=[]),
+        "available_tools": [{"name": "web_search", "capability_class": "web_search"}],
+        "tool_execution_required": True,
+        "max_tool_calls": 5,
+        "timeout_seconds": 60.0,
+        "_token_failover_attempt": 0,
+        "_emit_lifecycle_bounds": False,
+        "selected_token_id": None,
+        "release_slot": None,
+        "tool_execution_retry_count": 0,
+        "persist_override_messages": None,
+        "persist_override_base_len": 0,
+        "run_output_start_index": 1,
+        "persist_run_output_start_index": 1,
+        "buffered_assistant_events": [],
+        "tool_call_summaries": [{"name": "web_search", "args": {"query": "上海周边骑行公园"}}],
+        "assistant_output_streamed": False,
+        "model_stream_timed_out": False,
+        "model_timeout_error_message": "",
+        "current_model_attempt": 1,
+        "thinking_emitter": SimpleNamespace(assistant_emitted=False),
+        "context_history_for_hooks": [],
+        "session_title": "",
+        "tool_intent_plan": ToolIntentPlan(
+            action=ToolIntentAction.USE_TOOLS,
+            target_capability_classes=["web_search"],
+            target_tool_names=["web_search"],
+            reason="public search",
+        ),
+        "repeated_tool_no_progress": {
+            "tool_name": "web_search",
+            "count": 2,
+            "signature": '{"details":{"citations":[],"results":[],"summary":""},"is_error":false,"outcome":"no_results"}',
+        },
+    }
+
+    events = []
+    async for event in runner._process_agent_run_outcome(
+        agent_run=_AgentRun(
+            [
+                {"role": "user", "content": "我想查下上海周边的骑行公园"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{"id": "tc-1", "name": "web_search", "args": {"query": "上海周边骑行公园"}}],
+                },
+                {
+                    "role": "tool",
+                    "tool_name": "web_search",
+                    "content": {
+                        "content": [{"type": "text", "text": "Search '上海周边骑行公园' returned no results"}],
+                        "details": {
+                            "provider": "bing_html_fallback",
+                            "query": "上海周边骑行公园",
+                            "summary": "",
+                            "results": [],
+                            "citations": [],
+                        },
+                        "is_error": False,
+                    },
+                },
+            ]
+        ),
+        state=state,
+        _log_step=lambda *args, **kwargs: None,
+    ):
+        events.append(event)
+
+    failed_states = [
+        event
+        for event in events
+        if event.type == "runtime" and str(event.metadata.get("state", "")).strip() == "failed"
+    ]
+    answered_states = [
+        event
+        for event in events
+        if event.type == "runtime" and str(event.metadata.get("state", "")).strip() == "answered"
+    ]
+    assistant_chunks = [event.content for event in events if event.type == "assistant"]
+
+    assert failed_states == []
+    assert answered_states
+    assert any("returned no results" in chunk for chunk in assistant_chunks)
+    await runner._await_background_post_success_tasks()
+    assert session_manager.persisted_messages is not None
+
+
+@pytest.mark.asyncio
+async def test_must_use_tool_turn_with_real_evidence_uses_tool_only_answer_after_loop() -> None:
+    runner = _PostRunner()
+    session_manager = _SessionManager()
+    state = {
+        "start_time": 0.0,
+        "session_key": "s-must-tool-evidence",
+        "session_manager": session_manager,
+        "session": SimpleNamespace(title=""),
+        "run_id": "run-must-tool-evidence",
+        "user_message": "SmartCMP 是否支持某个云资源？",
+        "system_prompt": "system",
+        "deps": SimpleNamespace(extra={}),
+        "tool_gate_decision": ToolGateDecision(
+            needs_tool=True,
+            needs_grounded_verification=True,
+            reason="knowledge-base answer requires grounded evidence",
+            policy=ToolPolicyMode.MUST_USE_TOOL,
+        ),
+        "tool_match_result": SimpleNamespace(missing_capabilities=[], tool_candidates=[]),
+        "available_tools": [{"name": "markdown_vault_search", "capability_class": "provider:markdown-vault"}],
+        "tool_execution_required": True,
+        "max_tool_calls": 5,
+        "timeout_seconds": 60.0,
+        "_token_failover_attempt": 0,
+        "_emit_lifecycle_bounds": False,
+        "selected_token_id": None,
+        "release_slot": None,
+        "tool_execution_retry_count": 0,
+        "persist_override_messages": None,
+        "persist_override_base_len": 0,
+        "run_output_start_index": 1,
+        "persist_run_output_start_index": 1,
+        "buffered_assistant_events": [],
+        "tool_call_summaries": [{"name": "markdown_vault_search", "args": {"query": "云资源支持"}}],
+        "assistant_output_streamed": False,
+        "model_stream_timed_out": False,
+        "model_timeout_error_message": "",
+        "current_model_attempt": 2,
+        "thinking_emitter": SimpleNamespace(assistant_emitted=False),
+        "context_history_for_hooks": [],
+        "session_title": "",
+        "tool_intent_plan": ToolIntentPlan(
+            action=ToolIntentAction.USE_TOOLS,
+            target_provider_instances=["markdown-vault.knowledgebase"],
+            target_tool_names=["markdown_vault_search"],
+            reason="knowledge-base answer",
+        ),
+        "repeated_tool_no_progress": {"tool_name": "markdown_vault_search", "count": 2},
+    }
+
+    events = []
+    async for event in runner._process_agent_run_outcome(
+        agent_run=_AgentRun(
+            [
+                {"role": "user", "content": "SmartCMP 是否支持某个云资源？"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {"id": "tc-1", "name": "markdown_vault_search", "args": {"query": "云资源支持"}}
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_name": "markdown_vault_search",
+                    "content": {
+                        "result_count": 1,
+                        "results": [
+                            {
+                                "path": "支持边界.md",
+                                "excerpt": "未内置支持的资源类型可以通过 Terraform workflow 扩展。",
+                            }
+                        ],
+                    },
+                },
+            ]
+        ),
+        state=state,
+        _log_step=lambda *args, **kwargs: None,
+    ):
+        events.append(event)
+
+    failed_states = [
+        event
+        for event in events
+        if event.type == "runtime" and str(event.metadata.get("state", "")).strip() == "failed"
+    ]
+    answered_states = [
+        event
+        for event in events
+        if event.type == "runtime" and str(event.metadata.get("state", "")).strip() == "answered"
+    ]
+    assistant_text = "".join(event.content for event in events if event.type == "assistant")
+
+    assert failed_states == []
+    assert answered_states
+    assert "Terraform" in assistant_text
+    await runner._await_background_post_success_tasks()
+    assert session_manager.persisted_messages is not None
+
+
+@pytest.mark.asyncio
+async def test_non_required_turn_with_tool_loop_uses_tool_only_answer_from_evidence() -> None:
+    runner = _PostRunner()
+    session_manager = _SessionManager()
+    state = {
+        "start_time": 0.0,
+        "session_key": "s-optional-tool-loop",
+        "session_manager": session_manager,
+        "session": SimpleNamespace(title=""),
+        "run_id": "run-optional-tool-loop",
+        "user_message": "镜像模板是否可以过滤镜像名称？",
+        "system_prompt": "system",
+        "deps": SimpleNamespace(extra={}),
+        "tool_gate_decision": ToolGateDecision(
+            needs_tool=False,
+            reason="llm-first answer",
+            policy=ToolPolicyMode.ANSWER_DIRECT,
+        ),
+        "tool_match_result": SimpleNamespace(missing_capabilities=[], tool_candidates=[]),
+        "available_tools": [{"name": "markdown_vault_search", "capability_class": "provider:markdown-vault"}],
+        "tool_execution_required": False,
+        "max_tool_calls": 5,
+        "timeout_seconds": 60.0,
+        "_token_failover_attempt": 0,
+        "_emit_lifecycle_bounds": False,
+        "selected_token_id": None,
+        "release_slot": None,
+        "tool_execution_retry_count": 0,
+        "persist_override_messages": None,
+        "persist_override_base_len": 0,
+        "run_output_start_index": 1,
+        "persist_run_output_start_index": 1,
+        "buffered_assistant_events": [],
+        "tool_call_summaries": [{"name": "markdown_vault_search", "args": {"query": "镜像名称过滤"}}],
+        "assistant_output_streamed": False,
+        "model_stream_timed_out": False,
+        "model_timeout_error_message": "",
+        "current_model_attempt": 2,
+        "thinking_emitter": SimpleNamespace(assistant_emitted=False),
+        "context_history_for_hooks": [],
+        "session_title": "",
+        "tool_intent_plan": ToolIntentPlan(
+            action=ToolIntentAction.DIRECT_ANSWER,
+            reason="llm-first answer",
+        ),
+        "repeated_tool_loop": {"tool_name": "markdown_vault_search", "count": 2, "limit": 2},
+    }
+
+    events = []
+    async for event in runner._process_agent_run_outcome(
+        agent_run=_AgentRun(
+            [
+                {"role": "user", "content": "镜像模板是否可以过滤镜像名称？"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {"id": "tc-1", "name": "markdown_vault_search", "args": {"query": "镜像名称过滤"}}
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_name": "markdown_vault_search",
+                    "content": {
+                        "result_count": 1,
+                        "results": [
+                            {
+                                "path": "镜像模板.md",
+                                "excerpt": "镜像模板可按镜像名称关键字、正则表达式进行 include/exclude 过滤。",
+                            }
+                        ],
+                    },
+                },
+            ]
+        ),
+        state=state,
+        _log_step=lambda *args, **kwargs: None,
+    ):
+        events.append(event)
+
+    failed_states = [
+        event
+        for event in events
+        if event.type == "runtime" and str(event.metadata.get("state", "")).strip() == "failed"
+    ]
+    answered_states = [
+        event
+        for event in events
+        if event.type == "runtime" and str(event.metadata.get("state", "")).strip() == "answered"
+    ]
+    assistant_text = "".join(event.content for event in events if event.type == "assistant")
+
+    assert failed_states == []
+    assert answered_states
+    assert "镜像模板.md" in assistant_text
+    await runner._await_background_post_success_tasks()
+    assert session_manager.persisted_messages is not None
+
+
+@pytest.mark.asyncio
+async def test_artifact_request_with_only_lookup_results_fails_without_llm_fallback() -> None:
+    runner = _PostRunner()
+    session_manager = _SessionManager()
+    state = {
+        "start_time": 0.0,
+        "session_key": "s-artifact-1",
+        "session_manager": session_manager,
+        "session": SimpleNamespace(title=""),
+        "run_id": "run-artifact-1",
+        "user_message": "将这些申请写入一个新的PPT",
+        "system_prompt": "system",
+        "deps": SimpleNamespace(extra={}),
+        "tool_gate_decision": ToolGateDecision(
+            needs_tool=False,
+            reason="artifact request",
+            policy=ToolPolicyMode.ANSWER_DIRECT,
+        ),
+        "tool_match_result": SimpleNamespace(missing_capabilities=[], tool_candidates=[]),
+        "available_tools": [
+            {
+                "name": "smartcmp_list_pending",
+                "capability_class": "provider:smartcmp",
+                "result_mode": "tool_only_ok",
+            }
+        ],
+        "artifact_goal": {"kind": "pptx", "label": "PowerPoint deck"},
+        "tool_execution_required": False,
+        "max_tool_calls": 5,
+        "timeout_seconds": 60.0,
+        "_token_failover_attempt": 0,
+        "_emit_lifecycle_bounds": False,
+        "selected_token_id": None,
+        "release_slot": None,
+        "tool_execution_retry_count": 0,
+        "persist_override_messages": None,
+        "persist_override_base_len": 0,
+        "run_output_start_index": 1,
+        "persist_run_output_start_index": 1,
+        "buffered_assistant_events": [],
+        "tool_call_summaries": [{"name": "smartcmp_list_pending", "args": {}}],
+        "assistant_output_streamed": False,
+        "model_stream_timed_out": False,
+        "model_timeout_error_message": "",
+        "current_model_attempt": 1,
+        "thinking_emitter": SimpleNamespace(assistant_emitted=False),
+        "context_history_for_hooks": [],
+        "session_title": "",
+        "tool_intent_plan": ToolIntentPlan(
+            action=ToolIntentAction.CREATE_ARTIFACT,
+            reason="artifact request",
+        ),
+    }
+
+    events = []
+    async for event in runner._process_agent_run_outcome(
+        agent_run=_AgentRun(
+            [
+                {"role": "user", "content": "将这些申请写入一个新的PPT"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{"id": "tc-1", "name": "smartcmp_list_pending", "args": {}}],
+                },
+                {
+                    "role": "tool",
+                    "tool_name": "smartcmp_list_pending",
+                    "content": {
+                        "output": "count=3",
+                        "details": {
+                            "items": [
+                                {"id": "REQ-1", "name": "申请一"},
+                                {"id": "REQ-2", "name": "申请二"},
+                            ]
+                        },
+                    },
+                },
+            ]
+        ),
+        state=state,
+        _log_step=lambda *args, **kwargs: None,
+    ):
+        events.append(event)
+
+    failed_states = [
+        event
+        for event in events
+        if event.type == "runtime" and str(event.metadata.get("state", "")).strip() == "failed"
+    ]
+    answered_states = [
+        event
+        for event in events
+        if event.type == "runtime" and str(event.metadata.get("state", "")).strip() == "answered"
+    ]
+    assistant_chunks = [event.content for event in events if event.type == "assistant"]
+
+    assert failed_states
+    assert answered_states == []
+    assert assistant_chunks == []
+
+
+@pytest.mark.asyncio
+async def test_artifact_download_evidence_allows_repeat_loop_tool_only_answer() -> None:
+    runner = _PostRunner()
+    session_manager = _SessionManager()
+    state = {
+        "start_time": 0.0,
+        "session_key": "s-artifact-download",
+        "session_manager": session_manager,
+        "session": SimpleNamespace(title=""),
+        "run_id": "run-artifact-download",
+        "user_message": "/xlsx 生成表格",
+        "system_prompt": "system",
+        "deps": SimpleNamespace(extra={}),
+        "tool_gate_decision": ToolGateDecision(
+            needs_tool=True,
+            reason="artifact request",
+            policy=ToolPolicyMode.PREFER_TOOL,
+        ),
+        "tool_match_result": SimpleNamespace(missing_capabilities=[], tool_candidates=[]),
+        "available_tools": [
+            {
+                "name": "skill_exec",
+                "group": "skill_runtime",
+                "capability_class": "skill_runtime:process",
+                "result_mode": "tool_only_ok",
+            }
+        ],
+        "artifact_goal": {"kind": "xlsx", "label": "Excel workbook"},
+        "tool_execution_required": True,
+        "max_tool_calls": 5,
+        "timeout_seconds": 60.0,
+        "_token_failover_attempt": 0,
+        "_emit_lifecycle_bounds": False,
+        "selected_token_id": None,
+        "release_slot": None,
+        "tool_execution_retry_count": 0,
+        "persist_override_messages": None,
+        "persist_override_base_len": 0,
+        "run_output_start_index": 1,
+        "persist_run_output_start_index": 1,
+        "buffered_assistant_events": [],
+        "tool_call_summaries": [{"name": "skill_exec", "args": {}}],
+        "assistant_output_streamed": False,
+        "model_stream_timed_out": False,
+        "model_timeout_error_message": "",
+        "current_model_attempt": 1,
+        "thinking_emitter": SimpleNamespace(assistant_emitted=False),
+        "context_history_for_hooks": [],
+        "session_title": "",
+        "workspace_download_reference_keys": ["users/admin/work_dir/skill-only.xlsx"],
+        "repeated_tool_no_progress": {"tool_name": "skill_exec", "count": 2},
+        "tool_intent_plan": ToolIntentPlan(
+            action=ToolIntentAction.CREATE_ARTIFACT,
+            target_tool_names=["skill_exec"],
+            reason="artifact request",
+        ),
+    }
+
+    events = []
+    async for event in runner._process_agent_run_outcome(
+        agent_run=_AgentRun(
+            [
+                {"role": "user", "content": "/xlsx 生成表格"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{"id": "tc-1", "name": "skill_exec", "args": {}}],
+                },
+                {
+                    "role": "tool",
+                    "tool_name": "skill_exec",
+                    "content": {
+                        "is_error": False,
+                        "details": {"download_path": ["skill-only.xlsx"]},
+                    },
+                },
+            ]
+        ),
+        state=state,
+        _log_step=lambda *args, **kwargs: None,
+    ):
+        events.append(event)
+
+    failed_states = [
+        event
+        for event in events
+        if event.type == "runtime" and str(event.metadata.get("state", "")).strip() == "failed"
+    ]
+    answered_states = [
+        event
+        for event in events
+        if event.type == "runtime" and str(event.metadata.get("state", "")).strip() == "answered"
+    ]
+    assistant_chunks = [event.content for event in events if event.type == "assistant"]
+
+    assert failed_states == []
+    assert answered_states
+    assert any("download_path" in chunk or "skill-only.xlsx" in chunk for chunk in assistant_chunks)
+
+
+@pytest.mark.asyncio
+async def test_direct_answer_turn_replaces_tool_call_markup_with_recovery_answer() -> None:
+    runner = _PostRunner()
+    runner.direct_answer_recovery_answer = (
+        "上海周边适合休闲骑行的选择可以先看崇明岛环岛绿道、滴水湖环湖路线和淀山湖周边绿道。"
+        "如果你更偏爱公园场景，也可以优先考虑顾村公园和世纪公园周边的城市绿道。"
+    )
+    session_manager = _SessionManager()
+    state = {
+        "start_time": 0.0,
+        "session_key": "s-direct-answer",
+        "session_manager": session_manager,
+        "session": SimpleNamespace(title=""),
+        "run_id": "run-direct-answer",
+        "user_message": "我想查下上海周边的骑行公园",
+        "system_prompt": "system",
+        "deps": SimpleNamespace(extra={}),
+        "tool_gate_decision": ToolGateDecision(
+            needs_tool=False,
+            reason="public recommendation",
+            policy=ToolPolicyMode.ANSWER_DIRECT,
+        ),
+        "tool_match_result": SimpleNamespace(missing_capabilities=[], tool_candidates=[]),
+        "available_tools": [],
+        "tool_execution_required": False,
+        "max_tool_calls": 5,
+        "timeout_seconds": 60.0,
+        "_token_failover_attempt": 0,
+        "_emit_lifecycle_bounds": False,
+        "selected_token_id": None,
+        "release_slot": None,
+        "tool_execution_retry_count": 0,
+        "persist_override_messages": None,
+        "persist_override_base_len": 0,
+        "run_output_start_index": 1,
+        "persist_run_output_start_index": 1,
+        "buffered_assistant_events": [],
+        "tool_call_summaries": [],
+        "assistant_output_streamed": False,
+        "model_stream_timed_out": False,
+        "model_timeout_error_message": "",
+        "current_model_attempt": 1,
+        "thinking_emitter": SimpleNamespace(assistant_emitted=False),
+        "context_history_for_hooks": [],
+        "session_title": "",
+        "tool_intent_plan": ToolIntentPlan(
+            action=ToolIntentAction.DIRECT_ANSWER,
+            reason="public recommendation",
+        ),
+    }
+
+    events = []
+    async for event in runner._process_agent_run_outcome(
+        agent_run=_AgentRun(
+            [
+                {"role": "user", "content": "我想查下上海周边的骑行公园"},
+                {"role": "assistant", "content": "<tool_call>\n<web_search\n</think>"},
+            ]
+        ),
+        state=state,
+        _log_step=lambda *args, **kwargs: None,
+    ):
+        events.append(event)
+
+    assistant_chunks = [event.content for event in events if event.type == "assistant"]
+    answered_states = [
+        event
+        for event in events
+        if event.type == "runtime" and str(event.metadata.get("state", "")).strip() == "answered"
+    ]
+
+    assert answered_states
+    assert runner.direct_answer_recovery_calls
+    assert any("崇明岛" in chunk for chunk in assistant_chunks)
+    assert all("<tool_call>" not in chunk for chunk in assistant_chunks)
+    await runner._await_background_post_success_tasks()
+    assert session_manager.persisted_messages is not None
+
+
+@pytest.mark.asyncio
+async def test_plaintext_dsml_tool_call_attempt_retries_structured_tool_execution() -> None:
+    runner = _PostRunner()
+    session_manager = _SessionManager()
+    dsml_markup = (
+        "我来为您查询明天上海的天气情况。\n\n"
+        "<｜DSML｜function_calls>\n"
+        "<｜DSML｜invoke name=\"openmeteo_weather\">\n"
+        "<｜DSML｜parameter name=\"location\" string=\"true\">上海</｜DSML｜parameter>\n"
+        "<｜DSML｜parameter name=\"days\" string=\"false\">2</｜DSML｜parameter>\n"
+        "<｜DSML｜parameter name=\"target_date\" string=\"true\">2026-04-15</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n"
+        "</｜DSML｜function_calls>"
+    )
+    state = {
+        "start_time": 0.0,
+        "session_key": "s-weather-dsml",
+        "session_manager": session_manager,
+        "session": SimpleNamespace(title=""),
+        "run_id": "run-weather-dsml",
+        "user_message": "上海呢",
+        "system_prompt": "system",
+        "deps": SimpleNamespace(extra={"tool_policy": {"preferred_tools": ["openmeteo_weather"]}}),
+        "tool_gate_decision": ToolGateDecision(
+            needs_tool=False,
+            reason="follow-up weather lookup",
+            policy=ToolPolicyMode.PREFER_TOOL,
+        ),
+        "tool_match_result": SimpleNamespace(missing_capabilities=[], tool_candidates=[]),
+        "available_tools": [
+            {
+                "name": "openmeteo_weather",
+                "capability_class": "weather",
+                "result_mode": "tool_only_ok",
+            }
+        ],
+        "tool_execution_required": False,
+        "max_tool_calls": 5,
+        "timeout_seconds": 60.0,
+        "_token_failover_attempt": 0,
+        "_emit_lifecycle_bounds": False,
+        "selected_token_id": None,
+        "release_slot": None,
+        "tool_execution_retry_count": 0,
+        "persist_override_messages": None,
+        "persist_override_base_len": 0,
+        "run_output_start_index": 1,
+        "persist_run_output_start_index": 1,
+        "buffered_assistant_events": [],
+        "tool_call_summaries": [],
+        "assistant_output_streamed": False,
+        "model_stream_timed_out": False,
+        "model_timeout_error_message": "",
+        "current_model_attempt": 1,
+        "thinking_emitter": SimpleNamespace(assistant_emitted=False),
+        "context_history_for_hooks": [],
+        "session_title": "",
+        "tool_intent_plan": None,
+    }
+
+    events = []
+    async for event in runner._process_agent_run_outcome(
+        agent_run=_AgentRun(
+            [
+                {"role": "user", "content": "上海呢"},
+                {"role": "assistant", "content": dsml_markup},
+            ]
+        ),
+        state=state,
+        _log_step=lambda *args, **kwargs: None,
+    ):
+        events.append(event)
+
+    assistant_chunks = [event.content for event in events if event.type == "assistant"]
+    runtime_warnings = [
+        event for event in events if event.type == "runtime" and event.metadata.get("state") == "warning"
+    ]
+    retry_events = [
+        event for event in events if event.type == "runtime" and event.metadata.get("state") == "retrying"
+    ]
+
+    assert assistant_chunks == []
+    assert runtime_warnings
+    assert retry_events == []
+    assert runner.retry_after_missing_tool_execution_calls
+    retry_call = runner.retry_after_missing_tool_execution_calls[0]
+    assert retry_call["preferred_tools"] == ["openmeteo_weather"]
+    assert "plaintext tool-call markup" in retry_call["failure_message"]
+    assert state.get("should_stop") in {None, False}
+
+
+@pytest.mark.asyncio
+async def test_tool_required_exception_returns_tool_only_fallback_answer() -> None:
+    runner = _ErrorRunner()
+    session_manager = _SessionManager()
+    state = {
+        "start_time": 0.0,
+        "session_key": "s-4",
+        "session_manager": session_manager,
+        "run_id": "run-4",
+        "user_message": "明天上海天气如何",
+        "system_prompt": "system",
+        "deps": SimpleNamespace(extra={}),
+        "tool_call_summaries": [{"name": "openmeteo_weather", "args": {"location": "上海"}}],
+        "latest_agent_messages": [
+            {"role": "user", "content": "明天上海天气如何"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "tc-1", "name": "openmeteo_weather", "args": {"location": "上海"}}],
+            },
+            {
+                "role": "tool",
+                "tool_name": "openmeteo_weather",
+                "content": {
+                    "output": "明天（2026-04-11）上海：小雨，13.8°C - 18.6°C，降水概率 63%。"
+                },
+            },
+        ],
+        "message_history": [],
+        "run_output_start_index": 1,
+        "tool_intent_plan": ToolIntentPlan(
+            action=ToolIntentAction.USE_TOOLS,
+            target_capability_classes=["weather"],
+            target_tool_names=["openmeteo_weather"],
+            reason="weather tool required",
+        ),
+        "executed_tool_names": ["openmeteo_weather"],
+        "thinking_emitter": SimpleNamespace(close_if_active=lambda: _empty_async_iter()),
+        "session_title": "",
+        "context_history_for_hooks": [],
+        "final_assistant": "",
+        "answer_committed": False,
+        "assistant_output_streamed": False,
+        "buffered_assistant_events": [],
+    }
+
+    events = []
+    async for event in runner._handle_loop_phase_exception(
+        error=RuntimeError("Invalid response from openai chat completions endpoint"),
+        state=state,
+    ):
+        events.append(event)
+
+    warning_states = [
+        event
+        for event in events
+        if event.type == "runtime" and str(event.metadata.get("state", "")).strip() == "warning"
+    ]
+    answered_states = [
+        event
+        for event in events
+        if event.type == "runtime" and str(event.metadata.get("state", "")).strip() == "answered"
+    ]
+    failed_states = [
+        event
+        for event in events
+        if event.type == "runtime" and str(event.metadata.get("state", "")).strip() == "failed"
+    ]
+    assistant_chunks = [event.content for event in events if event.type == "assistant"]
+
+    assert warning_states
+    assert answered_states
+    assert failed_states == []
+    assert assistant_chunks
+    assert "上海" in assistant_chunks[0]
+    assert state["answer_committed"] is True
+    assert session_manager.persisted_messages is not None
+
+
+@pytest.mark.asyncio
+async def test_tool_required_exception_tool_only_fallback_parses_json_search_payload() -> None:
+    runner = _ErrorRunner()
+    session_manager = _SessionManager()
+    raw_payload = json.dumps(
+        {
+            "success": True,
+            "search_backend": "direct",
+            "result_count": 1,
+            "results": [
+                {
+                    "path": "财务系统 - 费用结算对接.md",
+                    "title": "财务系统 / 费用结算对接",
+                    "text": "SmartCMP 可通过定制财务系统对接，在申请、冻结或结算流程中调用外部账户校验接口。",
+                }
+            ],
+        },
+        ensure_ascii=False,
+    )
+    state = {
+        "start_time": 0.0,
+        "session_key": "s-json-search-fallback",
+        "session_manager": session_manager,
+        "run_id": "run-json-search-fallback",
+        "user_message": "申请资源时能否先检查财务账户余额？",
+        "system_prompt": "system",
+        "deps": SimpleNamespace(extra={}),
+        "tool_call_summaries": [{"name": "markdown_vault_search", "args": {"query": "财务账户余额"}}],
+        "latest_agent_messages": [
+            {"role": "user", "content": "申请资源时能否先检查财务账户余额？"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "tc-1", "name": "markdown_vault_search", "args": {"query": "财务账户余额"}}
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_name": "markdown_vault_search",
+                "content": {"success": True, "returncode": 0, "output": raw_payload},
+            },
+        ],
+        "message_history": [],
+        "run_output_start_index": 1,
+        "tool_intent_plan": ToolIntentPlan(
+            action=ToolIntentAction.USE_TOOLS,
+            target_provider_instances=["markdown-vault.knowledgebase"],
+            target_tool_names=["markdown_vault_search"],
+            reason="knowledge search required",
+        ),
+        "executed_tool_names": ["markdown_vault_search"],
+        "thinking_emitter": SimpleNamespace(close_if_active=lambda: _empty_async_iter()),
+        "session_title": "",
+        "context_history_for_hooks": [],
+        "final_assistant": "",
+        "answer_committed": False,
+        "assistant_output_streamed": False,
+        "buffered_assistant_events": [],
+    }
+
+    events = []
+    async for event in runner._handle_loop_phase_exception(
+        error=BrokenPipeError("Broken pipe"),
+        state=state,
+    ):
+        events.append(event)
+
+    assistant_text = "".join(event.content for event in events if event.type == "assistant")
+    answered_states = [
+        event
+        for event in events
+        if event.type == "runtime" and str(event.metadata.get("state", "")).strip() == "answered"
+    ]
+
+    assert answered_states
+    assert "财务系统对接" in assistant_text
+    assert "search_backend" not in assistant_text
+    assert '"results"' not in assistant_text
+    assert state["answer_committed"] is True
+    assert session_manager.persisted_messages is not None
+
+
+def test_invalid_chat_completion_validation_error_is_hard_failure() -> None:
+    runner = _ErrorRunner()
+
+    assert runner._is_hard_token_failure(
+        RuntimeError(
+            "Invalid response from openai chat completions endpoint: 4 validation errors for ChatCompletion"
+        )
+    )
+
+
+def test_insufficient_balance_model_error_is_hard_failure() -> None:
+    runner = _ErrorRunner()
+
+    assert runner._is_hard_token_failure(
+        RuntimeError(
+            "status_code: 402, model_name: deepseek-v4-flash, "
+            "body: {'message': 'Insufficient Balance'}"
+        )
+    )
+
+
+def test_detect_repeated_tool_no_progress_for_same_empty_search_results() -> None:
+    runner = _StreamRunner()
+
+    repeated = runner._detect_repeated_tool_no_progress(
+        messages=[
+            {"role": "user", "content": "上海周边有哪些自行车骑行公园"},
+            {
+                "role": "tool",
+                "tool_name": "web_search",
+                "content": {
+                    "query": "上海周边自行车骑行公园推荐",
+                    "results": [],
+                    "summary": "",
+                    "citations": [],
+                },
+            },
+            {
+                "role": "tool",
+                "tool_name": "web_search",
+                "content": {
+                    "query": "上海骑行公园 自行车道 推荐",
+                    "results": [],
+                    "summary": "",
+                    "citations": [],
+                },
+            },
+        ],
+        start_index=1,
+        target_tool_names=["web_search"],
+        threshold=2,
+    )
+
+    assert repeated is not None
+    assert repeated["tool_name"] == "web_search"
+    assert repeated["count"] == 2
+
+
+def test_detect_repeated_tool_no_progress_for_live_web_search_empty_payloads() -> None:
+    runner = _StreamRunner()
+
+    repeated = runner._detect_repeated_tool_no_progress(
+        messages=[
+            {"role": "user", "content": "上海周边有哪些自行车骑行公园"},
+            {
+                "role": "tool",
+                "tool_name": "web_search",
+                "content": {
+                    "content": [{"type": "text", "text": "Search '上海周边自行车骑行公园推荐' returned no results"}],
+                    "details": {
+                        "provider": "bing_html_fallback",
+                        "query": "上海周边自行车骑行公园推荐",
+                        "summary": "",
+                        "results": [],
+                        "citations": [],
+                        "expanded_queries": ["上海周边自行车骑行公园推荐"],
+                        "retrieved_at": "2026-04-11T01:32:58.968198",
+                    },
+                    "is_error": False,
+                },
+            },
+            {
+                "role": "tool",
+                "tool_name": "web_search",
+                "content": {
+                    "content": [{"type": "text", "text": "Search '上海自行车骑行公园 骑行道 推荐' returned no results"}],
+                    "details": {
+                        "provider": "bing_html_fallback",
+                        "query": "上海自行车骑行公园 骑行道 推荐",
+                        "summary": "",
+                        "results": [],
+                        "citations": [],
+                        "expanded_queries": ["上海自行车骑行公园 骑行道 推荐"],
+                        "retrieved_at": "2026-04-11T01:33:13.663424",
+                    },
+                    "is_error": False,
+                },
+            },
+        ],
+        start_index=1,
+        target_tool_names=["web_search"],
+        threshold=2,
+    )
+
+    assert repeated is not None
+    assert repeated["tool_name"] == "web_search"
+    assert repeated["count"] == 2
+
+
+def test_should_finalize_from_tool_results_when_tool_is_tool_only_ok() -> None:
+    runner = _StreamRunnerWithEvidence()
+
+    should_finalize = runner._should_finalize_from_tool_results(
+        messages=[
+            {"role": "user", "content": "明天上海天气如何"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "tc-1", "name": "openmeteo_weather", "args": {"location": "上海"}}],
+            },
+            {
+                "role": "tool",
+                "tool_name": "openmeteo_weather",
+                "content": {
+                    "output": "明天（2026-04-11）上海：小雨，13.8°C - 18.6°C，降水概率 63%。"
+                },
+            },
+        ],
+        start_index=1,
+        planned_tool_names=["openmeteo_weather"],
+        available_tools=[
+            {
+                "name": "openmeteo_weather",
+                "capability_class": "weather",
+                "result_mode": "tool_only_ok",
+            }
+        ],
+    )
+
+    assert should_finalize is True
+
+
+def test_should_not_finalize_provider_result_when_standard_skill_runtime_is_visible() -> None:
+    runner = _StreamRunnerWithEvidence()
+
+    should_finalize = runner._should_finalize_from_tool_results(
+        messages=[
+            {"role": "user", "content": "把待审批生成 excel"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "tc-1", "name": "smartcmp_list_pending", "args": {}}],
+            },
+            {
+                "role": "tool",
+                "tool_name": "smartcmp_list_pending",
+                "content": {"output": "待审批列表"},
+            },
+        ],
+        start_index=1,
+        planned_tool_names=["smartcmp_list_pending"],
+        available_tools=[
+            {
+                "name": "smartcmp_list_pending",
+                "capability_class": "provider:smartcmp",
+                "result_mode": "tool_only_ok",
+            },
+            {"name": "skill_exec", "capability_class": "skill_runtime_exec"},
+        ],
+    )
+
+    assert should_finalize is False
+
+
+def test_should_finalize_from_embedded_tool_results_when_tool_is_tool_only_ok() -> None:
+    runner = _StreamRunnerWithEvidence()
+
+    should_finalize = runner._should_finalize_from_tool_results(
+        messages=[
+            {"role": "user", "content": "明天上海天气如何"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "tc-1", "name": "openmeteo_weather", "args": {"location": "上海"}}],
+            },
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_results": [
+                    {
+                        "tool_name": "openmeteo_weather",
+                        "content": {
+                            "output": "明天（2026-04-11）上海：小雨，13.8°C - 18.6°C，降水概率 63%。"
+                        },
+                    }
+                ],
+            },
+        ],
+        start_index=1,
+        planned_tool_names=["openmeteo_weather"],
+        available_tools=[
+            {
+                "name": "openmeteo_weather",
+                "capability_class": "weather",
+                "result_mode": "tool_only_ok",
+            }
+        ],
+    )
+
+    assert should_finalize is True
+
+
+def test_should_not_finalize_identifier_contract_without_required_identifier() -> None:
+    runner = _StreamRunnerWithEvidence()
+
+    should_finalize = runner._should_finalize_from_tool_results(
+        messages=[
+            {"role": "user", "content": "提交 Linux VM 申请"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc-1",
+                        "name": "provider_submit_request",
+                        "args": {"json_body": "{\"name\":\"linux-test123\"}"},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_name": "provider_submit_request",
+                "content": {
+                    "output": "[SUCCESS] 申请已提交\n  State: INITIALING",
+                },
+            },
+        ],
+        start_index=1,
+        planned_tool_names=["provider_submit_request"],
+        available_tools=[
+            {
+                "name": "provider_submit_request",
+                "capability_class": "provider:demo",
+                "result_mode": "tool_only_ok",
+                "success_contract": {
+                    "type": "identifier_presence",
+                    "fields": ["id", "requestId", "request_id", "workflowId", "workflow_id"],
+                    "text_labels": ["Request ID", "Workflow ID"],
+                },
+            }
+        ],
+    )
+
+    assert should_finalize is False
+
+
+def test_should_finalize_identifier_contract_with_textual_request_id() -> None:
+    runner = _StreamRunnerWithEvidence()
+
+    should_finalize = runner._should_finalize_from_tool_results(
+        messages=[
+            {"role": "user", "content": "提交 Linux VM 申请"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc-1",
+                        "name": "provider_submit_request",
+                        "args": {"json_body": "{\"name\":\"linux-test123\"}"},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_name": "provider_submit_request",
+                "content": {
+                    "output": "[SUCCESS] 申请已提交\n  Request ID: req-123\n  State: INITIALING",
+                },
+            },
+        ],
+        start_index=1,
+        planned_tool_names=["provider_submit_request"],
+        available_tools=[
+            {
+                "name": "provider_submit_request",
+                "capability_class": "provider:demo",
+                "result_mode": "tool_only_ok",
+                "success_contract": {
+                    "type": "identifier_presence",
+                    "fields": ["id", "requestId", "request_id", "workflowId", "workflow_id"],
+                    "text_labels": ["Request ID", "Workflow ID"],
+                },
+            }
+        ],
+    )
+
+    assert should_finalize is True
+
+
+def test_should_finalize_identifier_contract_with_structured_identifier_field() -> None:
+    runner = _StreamRunnerWithEvidence()
+
+    should_finalize = runner._should_finalize_from_tool_results(
+        messages=[
+            {"role": "user", "content": "提交 Linux VM 申请"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc-1",
+                        "name": "provider_submit_request",
+                        "args": {"json_body": "{\"name\":\"linux-test123\"}"},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_name": "provider_submit_request",
+                "content": {
+                    "data": {
+                        "requestId": "req-456",
+                        "state": "INITIALING",
+                    },
+                },
+            },
+        ],
+        start_index=1,
+        planned_tool_names=["provider_submit_request"],
+        available_tools=[
+            {
+                "name": "provider_submit_request",
+                "capability_class": "provider:demo",
+                "result_mode": "tool_only_ok",
+                "success_contract": {
+                    "type": "identifier_presence",
+                    "fields": ["id", "requestId", "request_id", "workflowId", "workflow_id"],
+                    "text_labels": ["Request ID", "Workflow ID"],
+                },
+            }
+        ],
+    )
+
+    assert should_finalize is True
+
+
+def test_should_not_finalize_from_tool_results_for_silent_backend_lookup() -> None:
+    runner = _StreamRunnerWithEvidence()
+
+    should_finalize = runner._should_finalize_from_tool_results(
+        messages=[
+            {"role": "user", "content": "申请 2c4g Linux 虚拟机"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc-1",
+                        "name": "smartcmp_list_components",
+                        "args": {"source_key": "resource.iaas.machine.instance.abstract"},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_name": "smartcmp_list_components",
+                "content": {
+                    "output": "[INFO] Component metadata loaded.",
+                    "_internal": {"typeName": "cloudchef.nodes.Compute", "osType": "Linux"},
+                },
+            },
+        ],
+        start_index=1,
+        planned_tool_names=["smartcmp_list_components"],
+        available_tools=[
+            {
+                "name": "smartcmp_list_components",
+                "capability_class": "provider:smartcmp",
+                "description": "Internal lookup",
+                "result_mode": "tool_only_ok",
+                "routing_visibility": "hidden",
+            }
+        ],
+    )
+
+    assert should_finalize is False
+
+
+def test_should_not_finalize_from_single_terminal_no_results_tool_payload() -> None:
+    runner = _StreamRunnerWithEvidence()
+
+    should_finalize = runner._should_finalize_from_tool_results(
+        messages=[
+            {"role": "user", "content": "上海周边有哪些自行车骑行公园"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "tc-1", "name": "web_search", "args": {"query": "上海周边 自行车骑行公园 推荐"}}],
+            },
+            {
+                "role": "tool",
+                "tool_name": "web_search",
+                "content": {
+                    "content": [{"type": "text", "text": "Search '上海周边 自行车骑行公园 推荐' returned no results"}],
+                    "details": {
+                        "provider": "bing_html_fallback",
+                        "query": "上海周边 自行车骑行公园 推荐",
+                        "summary": "",
+                        "results": [],
+                        "citations": [],
+                    },
+                    "is_error": False,
+                },
+            },
+        ],
+        start_index=1,
+        planned_tool_names=["web_search"],
+        available_tools=[
+            {
+                "name": "web_search",
+                "capability_class": "web_search",
+            }
+        ],
+    )
+
+    assert should_finalize is False
+
+
+def test_should_finalize_from_repeated_terminal_no_results_tool_payload() -> None:
+    runner = _StreamRunnerWithEvidence()
+
+    should_finalize = runner._should_finalize_from_tool_results(
+        messages=[
+            {"role": "user", "content": "上海周边有哪些自行车骑行公园"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "tc-1", "name": "web_search", "args": {"query": "上海周边 自行车骑行公园 推荐"}}],
+            },
+            {
+                "role": "tool",
+                "tool_name": "web_search",
+                "content": {
+                    "content": [{"type": "text", "text": "Search '上海周边 自行车骑行公园 推荐' returned no results"}],
+                    "details": {
+                        "provider": "bing_html_fallback",
+                        "query": "上海周边 自行车骑行公园 推荐",
+                        "summary": "",
+                        "results": [],
+                        "citations": [],
+                    },
+                    "is_error": False,
+                },
+            },
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "tc-2", "name": "web_search", "args": {"query": "上海自行车公园推荐"}}],
+            },
+            {
+                "role": "tool",
+                "tool_name": "web_search",
+                "content": {
+                    "content": [{"type": "text", "text": "Search '上海自行车公园推荐' returned no results"}],
+                    "details": {
+                        "provider": "bing_html_fallback",
+                        "query": "上海自行车公园推荐",
+                        "summary": "",
+                        "results": [],
+                        "citations": [],
+                    },
+                    "is_error": False,
+                },
+            },
+        ],
+        start_index=1,
+        planned_tool_names=["web_search"],
+        available_tools=[
+            {
+                "name": "web_search",
+                "capability_class": "web_search",
+            }
+        ],
+        previous_result_count=1,
+    )
+
+    assert should_finalize is True
+
+
+def test_should_not_finalize_tool_only_result_when_artifact_goal_is_unsatisfied() -> None:
+    runner = _StreamRunnerWithEvidence()
+
+    should_finalize = runner._should_finalize_from_tool_results(
+        messages=[
+            {"role": "user", "content": "将这些申请写入一个新的PPT"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "tc-1", "name": "smartcmp_list_pending", "args": {}}],
+            },
+            {
+                "role": "tool",
+                "tool_name": "smartcmp_list_pending",
+                "content": {
+                    "output": "count=3",
+                    "details": {
+                        "items": [
+                            {"id": "REQ-1", "name": "申请一"},
+                            {"id": "REQ-2", "name": "申请二"},
+                        ]
+                    },
+                },
+            },
+        ],
+        start_index=1,
+        planned_tool_names=["smartcmp_list_pending"],
+        available_tools=[
+            {
+                "name": "smartcmp_list_pending",
+                "capability_class": "provider:smartcmp",
+                "result_mode": "tool_only_ok",
+            }
+        ],
+        artifact_goal={"kind": "pptx", "label": "PowerPoint deck"},
+    )
+
+    assert should_finalize is False
+
+
+def test_should_finalize_tool_only_result_when_artifact_goal_returns_artifact_path() -> None:
+    runner = _StreamRunnerWithEvidence()
+
+    should_finalize = runner._should_finalize_from_tool_results(
+        messages=[
+            {"role": "user", "content": "将这些申请整理成一个新的PDF文件"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "tc-1", "name": "pdf_create_document", "args": {}}],
+            },
+            {
+                "role": "tool",
+                "tool_name": "pdf_create_document",
+                "content": {
+                    "artifact_path": "exports/pending-approvals.pdf",
+                    "pages": 3,
+                },
+            },
+        ],
+        start_index=1,
+        planned_tool_names=["pdf_create_document"],
+        available_tools=[
+            {
+                "name": "pdf_create_document",
+                "capability_class": "artifact:pdf",
+                "result_mode": "tool_only_ok",
+            }
+        ],
+        artifact_goal={"kind": "pdf", "label": "PDF document"},
+    )
+
+    assert should_finalize is True
+
+
+def test_should_finalize_tool_only_result_when_artifact_goal_returns_download_path_list() -> None:
+    runner = _StreamRunnerWithEvidence()
+
+    should_finalize = runner._should_finalize_from_tool_results(
+        messages=[
+            {"role": "user", "content": "生成 PDF"},
+            {
+                "role": "tool",
+                "tool_name": "skill_exec",
+                "content": {
+                    "is_error": False,
+                    "details": {"download_path": ["pending.pdf"]},
+                },
+            },
+        ],
+        start_index=0,
+        planned_tool_names=["skill_exec"],
+        available_tools=[
+            {
+                "name": "skill_exec",
+                "capability_class": "artifact:pdf",
+                "result_mode": "tool_only_ok",
+            }
+        ],
+        artifact_goal={"kind": "pdf", "label": "PDF document"},
+    )
+
+    assert should_finalize is True
+
+
+def test_should_not_finalize_artifact_goal_from_failed_download_path_payload() -> None:
+    runner = _StreamRunnerWithEvidence()
+
+    should_finalize = runner._should_finalize_from_tool_results(
+        messages=[
+            {"role": "user", "content": "生成 PDF"},
+            {
+                "role": "tool",
+                "tool_name": "skill_exec",
+                "content": {
+                    "is_error": True,
+                    "details": {"download_path": ["stale.pdf"]},
+                },
+            },
+        ],
+        start_index=0,
+        planned_tool_names=["skill_exec"],
+        available_tools=[
+            {
+                "name": "skill_exec",
+                "capability_class": "artifact:pdf",
+                "result_mode": "tool_only_ok",
+            }
+        ],
+        artifact_goal={"kind": "pdf", "label": "PDF document"},
+    )
+
+    assert should_finalize is False
+
+
+def test_should_finalize_tool_only_result_for_absolute_artifact_inside_user_work_dir(tmp_path) -> None:
+    runner = _StreamRunnerWithEvidence()
+    artifact_path = tmp_path / "users" / "admin" / "work_dir" / "exports" / "pending.pdf"
+    artifact_path.parent.mkdir(parents=True)
+    artifact_path.write_bytes(b"%PDF-1.4\n")
+
+    should_finalize = runner._should_finalize_from_tool_results(
+        messages=[
+            {"role": "user", "content": "生成 PDF"},
+            {
+                "role": "tool",
+                "tool_name": "pdf_create_document",
+                "content": {"artifact_path": str(artifact_path)},
+            },
+        ],
+        start_index=0,
+        planned_tool_names=["pdf_create_document"],
+        available_tools=[
+            {
+                "name": "pdf_create_document",
+                "capability_class": "artifact:pdf",
+                "result_mode": "tool_only_ok",
+            }
+        ],
+        artifact_goal={"kind": "pdf", "label": "PDF document"},
+        workspace_path=tmp_path,
+        user_id="admin",
+    )
+
+    assert should_finalize is True
+
+
+def test_should_not_finalize_tool_only_result_for_absolute_artifact_outside_user_work_dir(tmp_path) -> None:
+    runner = _StreamRunnerWithEvidence()
+    artifact_path = tmp_path / "outside.pdf"
+    artifact_path.write_bytes(b"%PDF-1.4\n")
+
+    should_finalize = runner._should_finalize_from_tool_results(
+        messages=[
+            {"role": "user", "content": "生成 PDF"},
+            {
+                "role": "tool",
+                "tool_name": "pdf_create_document",
+                "content": {"artifact_path": str(artifact_path)},
+            },
+        ],
+        start_index=0,
+        planned_tool_names=["pdf_create_document"],
+        available_tools=[
+            {
+                "name": "pdf_create_document",
+                "capability_class": "artifact:pdf",
+                "result_mode": "tool_only_ok",
+            }
+        ],
+        artifact_goal={"kind": "pdf", "label": "PDF document"},
+        workspace_path=tmp_path,
+        user_id="admin",
+    )
+
+    assert should_finalize is False
+
+
+def test_should_not_finalize_tool_only_result_for_hidden_runtime_artifact_path() -> None:
+    runner = _StreamRunnerWithEvidence()
+
+    should_finalize = runner._should_finalize_from_tool_results(
+        messages=[
+            {"role": "user", "content": "将这些申请整理成一个新的PDF文件"},
+            {
+                "role": "tool",
+                "tool_name": "skill_exec",
+                "content": {
+                    "details": {
+                        "download_path": ".atlasclaw/skills/skill-pdf/tmp/debug.pdf",
+                    },
+                },
+            },
+        ],
+        start_index=0,
+        planned_tool_names=["skill_exec"],
+        available_tools=[
+            {
+                "name": "skill_exec",
+                "capability_class": "artifact:pdf",
+                "result_mode": "tool_only_ok",
+            }
+        ],
+        artifact_goal={"kind": "pdf", "label": "PDF document"},
+    )
+
+    assert should_finalize is False
+
+
+@pytest.mark.asyncio
+async def test_refresh_messages_after_tool_dispatch_waits_for_new_tool_results() -> None:
+    runner = _RefreshingStreamRunner()
+    before_messages = [
+        {"role": "user", "content": "上海周边有哪些自行车骑行公园"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "tc-1", "name": "web_search", "args": {"query": "上海周边自行车骑行公园推荐"}}],
+        },
+        {
+            "role": "tool",
+            "tool_name": "web_search",
+            "content": {
+                "content": [{"type": "text", "text": "Search '上海周边自行车骑行公园推荐' returned no results"}],
+                "details": {"results": [], "citations": [], "summary": "", "query": "上海周边自行车骑行公园推荐"},
+                "is_error": False,
+            },
+        },
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "tc-2", "name": "web_search", "args": {"query": "上海自行车骑行公园 骑行绿道推荐"}}],
+        },
+    ]
+    after_messages = before_messages + [
+        {
+            "role": "tool",
+            "tool_name": "web_search",
+            "content": {
+                "content": [{"type": "text", "text": "Search '上海自行车骑行公园 骑行绿道推荐' returned no results"}],
+                "details": {"results": [], "citations": [], "summary": "", "query": "上海自行车骑行公园 骑行绿道推荐"},
+                "is_error": False,
+            },
+        }
+    ]
+
+    agent_run = _SequencedAgentRun([before_messages, after_messages])
+    latest_runtime_messages, latest_messages = await runner._refresh_messages_after_tool_dispatch(
+        agent_run=agent_run,
+        session_message_history=[],
+        runtime_base_history_len=0,
+        start_index=1,
+        target_tool_names=["web_search"],
+        previous_result_count=1,
+    )
+
+    assert latest_runtime_messages == after_messages
+    repeated = runner._detect_repeated_tool_no_progress(
+        messages=latest_messages,
+        start_index=1,
+        target_tool_names=["web_search"],
+        threshold=2,
+    )
+    assert repeated is not None
+    assert repeated["tool_name"] == "web_search"
+
+
+def test_extract_synthetic_tool_messages_from_next_node_returns_tool_rows() -> None:
+    next_node = SimpleNamespace(
+        request=ModelRequest(
+            parts=[
+                ToolReturnPart(
+                    "openmeteo_weather",
+                    {"output": "明天上海小雨，13.8-18.6°C"},
+                    tool_call_id="weather-1",
+                )
+            ]
+        )
+    )
+
+    synthetic_messages = extract_synthetic_tool_messages_from_next_node(
+        history=_ToolAwareHistory(),
+        next_node=next_node,
+    )
+
+    assert synthetic_messages == [
+        {
+            "role": "tool",
+            "tool_name": "openmeteo_weather",
+            "tool_call_id": "weather-1",
+            "content": {"output": "明天上海小雨，13.8-18.6°C"},
+        }
+    ]
+
+
+def test_overlay_synthetic_tool_messages_inserts_before_final_assistant() -> None:
+    merged = overlay_synthetic_tool_messages(
+        messages=[
+            {"role": "user", "content": "明天上海天气如何"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "tc-1", "name": "openmeteo_weather", "args": {"location": "上海"}}],
+            },
+            {"role": "assistant", "content": "明天上海小雨，13.8-18.6°C。"},
+        ],
+        synthetic_tool_messages=[
+            {
+                "role": "tool",
+                "tool_name": "openmeteo_weather",
+                "tool_call_id": "tc-1",
+                "content": {"output": "明天上海小雨，13.8-18.6°C"},
+            }
+        ],
+        start_index=1,
+    )
+
+    assert [message.get("role") for message in merged] == ["user", "assistant", "tool", "assistant"]
+
+
+@pytest.mark.asyncio
+async def test_tool_required_turn_uses_synthetic_tool_messages_for_tool_only_fallback() -> None:
+    runner = _PostRunner()
+    runner.history = _ToolAwareHistory()
+    session_manager = _SessionManager()
+    state = {
+        "start_time": 0.0,
+        "session_key": "s-synth",
+        "session_manager": session_manager,
+        "session": SimpleNamespace(title=""),
+        "run_id": "run-synth",
+        "user_message": "明天上海天气如何",
+        "system_prompt": "system",
+        "deps": SimpleNamespace(extra={}),
+        "tool_gate_decision": ToolGateDecision(
+            needs_tool=True,
+            needs_live_data=True,
+            reason="weather tool required",
+            policy=ToolPolicyMode.PREFER_TOOL,
+        ),
+        "tool_match_result": SimpleNamespace(missing_capabilities=[], tool_candidates=[]),
+        "available_tools": [
+            {"name": "openmeteo_weather", "capability_class": "weather", "result_mode": "tool_only_ok"}
+        ],
+        "tool_execution_required": True,
+        "max_tool_calls": 5,
+        "timeout_seconds": 60.0,
+        "_token_failover_attempt": 0,
+        "_emit_lifecycle_bounds": False,
+        "selected_token_id": None,
+        "release_slot": None,
+        "tool_execution_retry_count": 0,
+        "persist_override_messages": None,
+        "persist_override_base_len": 0,
+        "run_output_start_index": 1,
+        "persist_run_output_start_index": 1,
+        "buffered_assistant_events": [],
+        "tool_call_summaries": [{"name": "openmeteo_weather", "args": {"location": "上海"}}],
+        "assistant_output_streamed": False,
+        "model_stream_timed_out": False,
+        "model_timeout_error_message": "",
+        "current_model_attempt": 1,
+        "thinking_emitter": SimpleNamespace(assistant_emitted=False),
+        "context_history_for_hooks": [],
+        "session_title": "",
+        "synthetic_tool_messages": [
+            {
+                "role": "tool",
+                "tool_name": "openmeteo_weather",
+                "tool_call_id": "weather-1",
+                "content": {"output": "明天（2026-04-12）上海：小雨，13.8-18.6°C，降水概率 63%。"},
+            }
+        ],
+        "tool_intent_plan": ToolIntentPlan(
+            action=ToolIntentAction.USE_TOOLS,
+            target_group_ids=["group:web"],
+            target_capability_classes=["weather"],
+            target_tool_names=["openmeteo_weather"],
+            reason="weather",
+        ),
+    }
+
+    events = []
+    async for event in runner._process_agent_run_outcome(
+        agent_run=_AgentRun(
+            [
+                {"role": "user", "content": "明天上海天气如何"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{"id": "weather-1", "name": "openmeteo_weather", "args": {"location": "上海"}}],
+                },
+            ]
+        ),
+        state=state,
+        _log_step=lambda *args, **kwargs: None,
+    ):
+        events.append(event)
+
+    assistant_chunks = [event.content for event in events if event.type == "assistant"]
+    failed_states = [
+        event
+        for event in events
+        if event.type == "runtime" and str(event.metadata.get("state", "")).strip() == "failed"
+    ]
+
+    assert failed_states == []
+    assert any("13.8-18.6" in chunk for chunk in assistant_chunks)
+    await runner._await_background_post_success_tasks()
+    assert session_manager.persisted_messages is not None
+    assert any(
+        str(message.get("role", "")).strip() == "tool"
+        and str(message.get("tool_name", "")).strip() == "openmeteo_weather"
+        for message in session_manager.persisted_messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_repeated_tool_no_progress_uses_fresh_tool_messages_for_tool_only_answer() -> None:
+    runner = _PostRunner()
+    session_manager = _SessionManager()
+    fresh_messages = [
+        {"role": "user", "content": "SmartCMP 是否支持漏扫展示？"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "search-1",
+                    "name": "markdown_vault_search",
+                    "args": {"query": "漏扫 VM 最近一次展示"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_name": "markdown_vault_search",
+            "tool_call_id": "search-1",
+            "content": json.dumps(
+                {
+                    "success": True,
+                    "result_count": 1,
+                    "results": [
+                        {
+                            "title": "漏洞扫描结果展示",
+                            "path": "20-功能域/安全与合规/漏洞扫描.md",
+                            "text": "支持从漏扫系统同步 VM 最近一次扫描结果，并在 VM 详情页展示。",
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+        },
+    ]
+    state = {
+        "start_time": 0.0,
+        "session_key": "s-fresh-tool",
+        "session_manager": session_manager,
+        "session": SimpleNamespace(title=""),
+        "run_id": "run-fresh-tool",
+        "user_message": "SmartCMP 是否支持漏扫展示？",
+        "system_prompt": "system",
+        "deps": SimpleNamespace(extra={}),
+        "tool_gate_decision": ToolGateDecision(
+            policy=ToolPolicyMode.ANSWER_DIRECT,
+            reason="model chose optional knowledge lookup",
+        ),
+        "tool_match_result": SimpleNamespace(missing_capabilities=[], tool_candidates=[]),
+        "available_tools": [{"name": "markdown_vault_search", "result_mode": "visible"}],
+        "tool_execution_required": False,
+        "max_tool_calls": 5,
+        "timeout_seconds": 60.0,
+        "_token_failover_attempt": 0,
+        "_emit_lifecycle_bounds": False,
+        "selected_token_id": None,
+        "release_slot": None,
+        "tool_execution_retry_count": 0,
+        "persist_override_messages": None,
+        "persist_override_base_len": 0,
+        "run_output_start_index": 1,
+        "persist_run_output_start_index": 1,
+        "buffered_assistant_events": [],
+        "tool_call_summaries": [{"name": "markdown_vault_search"}],
+        "executed_tool_names": ["markdown_vault_search"],
+        "assistant_output_streamed": False,
+        "model_stream_timed_out": False,
+        "model_timeout_error_message": "",
+        "current_model_attempt": 2,
+        "thinking_emitter": SimpleNamespace(assistant_emitted=False),
+        "context_history_for_hooks": [],
+        "session_title": "",
+        "synthetic_tool_messages": [],
+        "latest_agent_messages": fresh_messages,
+        "repeated_tool_no_progress": {"tool_name": "markdown_vault_search", "count": 2},
+    }
+
+    events = []
+    async for event in runner._process_agent_run_outcome(
+        agent_run=_AgentRun(fresh_messages[:2]),
+        state=state,
+        _log_step=lambda *args, **kwargs: None,
+    ):
+        events.append(event)
+
+    assistant_text = "".join(event.content for event in events if event.type == "assistant")
+    failed_states = [
+        event
+        for event in events
+        if event.type == "runtime" and str(event.metadata.get("state", "")).strip() == "failed"
+    ]
+
+    assert failed_states == []
+    assert "漏洞扫描结果展示" in assistant_text
+    assert "20-功能域/安全与合规/漏洞扫描.md" in assistant_text
+    assert '"results"' not in assistant_text
+    await runner._await_background_post_success_tasks()
+
+
+async def _empty_async_iter():
+    if False:
+        yield None
+
+
+async def _noop_async(*args, **kwargs):
+    return None
+
+
+def test_build_finalize_payload_is_minimal_for_tool_backed_answer() -> None:
+    payload = build_finalize_payload(
+        user_message="明天上海天气如何",
+        tool_results=[
+            {
+                "tool_name": "openmeteo_weather",
+                "content": "明天（2026-04-12）上海：小雨，13.8°C - 18.6°C，降水概率 63%。",
+            }
+        ],
+    )
+
+    assert "bootstrap" not in payload["system_prompt"].lower()
+    assert "service the user is trying to use is currently unavailable" in payload["system_prompt"]
+    assert "personal provider access credential is not configured" in payload["system_prompt"]
+    assert "personal account settings" in payload["system_prompt"]
+    assert "contact an administrator" in payload["system_prompt"]
+    assert "diagnostic questions about backend setup" in payload["system_prompt"]
+    assert "paste access credentials into chat" in payload["system_prompt"]
+    assert "atlasclaw.json" not in payload["system_prompt"]
+    assert "明天上海天气如何" in payload["user_prompt"]
+    assert "openmeteo_weather" in payload["user_prompt"]
+
+
+def test_build_lookup_dump_recovery_payload_rewrites_internal_lookup_dump() -> None:
+    payload = build_lookup_dump_recovery_payload(
+        user_message="我要申请工单",
+        invalid_output='{"success": true, "_internal": {"catalogs": [{"name": "通用工单"}]}}',
+        tool_results=[
+            {
+                "tool_name": "smartcmp_list_services",
+                "content": '{"catalogs":[{"name":"通用工单"}]}',
+            }
+        ],
+        workflow_notes=[
+            '已为您自动选择"通用工单"服务。',
+            "正在继续确认可用业务组。",
+        ],
+    )
+
+    assert "incorrectly echoed raw internal lookup metadata" in payload["system_prompt"]
+    assert "knowledge-base evidence blocks" in payload["system_prompt"]
+    assert "Preserve decisions already made in the workflow notes" in payload["system_prompt"]
+    assert "Do not quote JSON" in payload["system_prompt"]
+    assert "source heading" in payload["system_prompt"]
+    assert "Source:" in payload["system_prompt"]
+    assert "Discard this invalid draft" in payload["user_prompt"]
+    assert "Workflow notes:" in payload["user_prompt"]
+    assert '已为您自动选择"通用工单"服务。' in payload["user_prompt"]
+    assert "smartcmp_list_services" in payload["user_prompt"]
+
+
+def test_extract_lookup_workflow_notes_keeps_prior_assistant_steps() -> None:
+    runner = _PostRunner()
+
+    notes = runner._extract_lookup_workflow_notes(
+        final_messages=[
+            {"role": "user", "content": "我要申请工单"},
+            {
+                "role": "assistant",
+                "content": "我来帮您申请工单。首先让我查看可用的服务目录。",
+                "tool_calls": [{"id": "tc-1", "name": "smartcmp_list_services", "args": {}}],
+            },
+            {
+                "role": "tool",
+                "tool_name": "smartcmp_list_services",
+                "content": {"_internal": {"catalogs": [{"name": "通用工单"}]}},
+            },
+            {
+                "role": "assistant",
+                "content": '已为您自动选择"通用工单"服务。现在我需要确定您要在哪个业务组下申请工单。让我查看可用的业务组选项。',
+                "tool_calls": [{"id": "tc-2", "name": "smartcmp_list_all_business_groups", "args": {}}],
+            },
+            {
+                "role": "assistant",
+                "content": '{"success": true, "_internal": {"catalogs": [{"name": "通用工单"}]}}',
+            },
+        ],
+        start_index=1,
+        invalid_output='{"success": true, "_internal": {"catalogs": [{"name": "通用工单"}]}}',
+    )
+
+    assert notes == [
+        "我来帮您申请工单。首先让我查看可用的服务目录。",
+        '已为您自动选择"通用工单"服务。现在我需要确定您要在哪个业务组下申请工单。让我查看可用的业务组选项。',
+    ]
+
+
+def test_looks_like_raw_lookup_dump_rejects_legitimate_preview_json() -> None:
+    assert _PostRunner._looks_like_raw_lookup_dump(
+        '{"catalogId":"catalog-1","catalogName":"Linux VM","businessGroupName":"测试"}'
+    ) is False
+
+
+def test_looks_like_raw_lookup_dump_accepts_plain_lookup_lists() -> None:
+    assert _PostRunner._looks_like_raw_lookup_dump(
+        '[{"index":1,"id":"bg-1","name":"测试","code":"0003"},{"index":2,"id":"bg-2","name":"开发","code":"0002"}]'
+    ) is True
+
+
+def test_looks_like_raw_lookup_dump_accepts_markdown_vault_source_blocks() -> None:
+    assert _PostRunner._looks_like_raw_lookup_dump(
+        "### 阿里云公有云接入\n"
+        "- Source: 20-功能域/云资源管理/阿里云公有云接入.md\n\n"
+        "SmartCMP 支持通过插件接入云资源。"
+    ) is True
+
+
+def test_has_markdown_vault_tool_results_detects_vault_tool_messages() -> None:
+    assert _PostRunner._has_markdown_vault_tool_results(
+        messages=[
+            {"role": "user", "content": "SmartCMP 支持 MaxCompute 吗？"},
+            {
+                "role": "tool",
+                "tool_name": "markdown_vault_search",
+                "content": "### 阿里云公有云接入\n- Source: docs/cloud.md",
+            },
+        ],
+        start_index=1,
+    ) is True
+
+
+def test_looks_like_raw_tool_payload_dump_accepts_provider_search_payload() -> None:
+    assert _PostRunner._looks_like_raw_tool_payload_dump(
+        'Selected markdown-vault instance \'knowledgebase\'\n\n{"success": true, "search_backend": "direct", "results": []}'
+    ) is True
+
+
+def test_looks_like_raw_tool_payload_dump_rejects_artifact_path_payload() -> None:
+    assert _PostRunner._looks_like_raw_tool_payload_dump(
+        '{"artifact_path": "/Users/alice/work_dir/report.pptx", "success": true}'
+    ) is True
+
+
+@pytest.mark.asyncio
+async def test_lookup_dump_recovery_rewrites_buffered_lookup_output_before_emit() -> None:
+    runner = _PostRunner()
+    runner.lookup_dump_recovery_answer = "已为您自动选择通用工单。请选择业务组：1. 测试 2. 开发 3. 我的业务组。"
+    state = {
+        "start_time": 0.0,
+        "session_key": "s-lookup",
+        "session_manager": _SessionManager(),
+        "session": SimpleNamespace(title=""),
+        "run_id": "run-lookup",
+        "user_message": "我要申请工单",
+        "system_prompt": "system",
+        "deps": SimpleNamespace(extra={}),
+        "tool_gate_decision": ToolGateDecision(
+            needs_tool=False,
+            reason="lookup continuation",
+            policy=ToolPolicyMode.PREFER_TOOL,
+        ),
+        "tool_match_result": SimpleNamespace(missing_capabilities=[], tool_candidates=[]),
+        "available_tools": [{"name": "smartcmp_list_services"}],
+        "tool_execution_required": False,
+        "max_tool_calls": 5,
+        "timeout_seconds": 60.0,
+        "_token_failover_attempt": 0,
+        "_emit_lifecycle_bounds": False,
+        "selected_token_id": None,
+        "release_slot": None,
+        "tool_execution_retry_count": 0,
+        "persist_override_messages": None,
+        "persist_override_base_len": 0,
+        "run_output_start_index": 1,
+        "persist_run_output_start_index": 1,
+        "buffered_assistant_events": [],
+        "tool_call_summaries": [{"name": "smartcmp_list_services"}],
+        "assistant_output_streamed": False,
+        "model_stream_timed_out": False,
+        "model_timeout_error_message": "",
+        "current_model_attempt": 2,
+        "thinking_emitter": SimpleNamespace(assistant_emitted=False),
+        "context_history_for_hooks": [],
+        "session_title": "",
+        "tool_intent_plan": ToolIntentPlan(
+            action=ToolIntentAction.DIRECT_ANSWER,
+            target_provider_types=["smartcmp"],
+            reason="lookup follow-up",
+        ),
+        "synthetic_tool_messages": [],
+        "session_message_history": [],
+        "runtime_base_history_len": 0,
+    }
+
+    messages = [
+        {"role": "user", "content": "我要申请工单"},
+        {"role": "tool", "tool_name": "smartcmp_list_services", "content": {"_internal": {"catalogs": [{"name": "通用工单"}]}}},
+        {"role": "tool", "tool_name": "smartcmp_list_all_business_groups", "content": {"_internal": [{"name": "测试"}, {"name": "开发"}]}},
+        {"role": "assistant", "content": '{"success": true, "_internal": {"catalogs": [{"name": "通用工单"}]}}'},
+    ]
+
+    events = []
+    async for event in runner._process_agent_run_outcome(
+        agent_run=_AgentRun(messages),
+        state=state,
+        _log_step=lambda *args, **kwargs: None,
+    ):
+        events.append(event)
+    await runner._await_background_post_success_tasks()
+
+    assistant_events = [event.content for event in events if event.type == "assistant"]
+
+    assert assistant_events == [runner.lookup_dump_recovery_answer]
+    assert runner.lookup_dump_recovery_calls
+    assert state["session_manager"].persisted_messages[-1]["content"] == runner.lookup_dump_recovery_answer
+
+
+@pytest.mark.asyncio
+async def test_lookup_dump_recovery_rewrites_markdown_vault_source_blocks_before_emit() -> None:
+    runner = _PostRunner()
+    runner.lookup_dump_recovery_answer = "SmartCMP 支持 MaxCompute 相关资源接入，可通过云资源接入能力扩展。"
+    state = {
+        "start_time": 0.0,
+        "session_key": "s-markdown-source-dump",
+        "session_manager": _SessionManager(),
+        "session": SimpleNamespace(title=""),
+        "run_id": "run-markdown-source-dump",
+        "user_message": "SmartCMP 支持 MaxCompute 吗？",
+        "system_prompt": "system",
+        "deps": SimpleNamespace(extra={}),
+        "tool_gate_decision": ToolGateDecision(
+            needs_tool=False,
+            reason="knowledge-base lookup",
+            policy=ToolPolicyMode.PREFER_TOOL,
+        ),
+        "tool_match_result": SimpleNamespace(missing_capabilities=[], tool_candidates=[]),
+        "available_tools": [{"name": "markdown_vault_search"}],
+        "tool_execution_required": False,
+        "max_tool_calls": 5,
+        "timeout_seconds": 60.0,
+        "_token_failover_attempt": 0,
+        "_emit_lifecycle_bounds": False,
+        "selected_token_id": None,
+        "release_slot": None,
+        "tool_execution_retry_count": 0,
+        "persist_override_messages": None,
+        "persist_override_base_len": 0,
+        "run_output_start_index": 1,
+        "persist_run_output_start_index": 1,
+        "buffered_assistant_events": [],
+        "tool_call_summaries": [{"name": "markdown_vault_search"}],
+        "assistant_output_streamed": False,
+        "model_stream_timed_out": False,
+        "model_timeout_error_message": "",
+        "current_model_attempt": 1,
+        "thinking_emitter": SimpleNamespace(assistant_emitted=False),
+        "context_history_for_hooks": [],
+        "session_title": "",
+        "tool_intent_plan": ToolIntentPlan(
+            action=ToolIntentAction.DIRECT_ANSWER,
+            target_provider_types=["markdown-vault"],
+            reason="knowledge-base lookup",
+        ),
+        "synthetic_tool_messages": [],
+        "session_message_history": [],
+        "runtime_base_history_len": 0,
+    }
+
+    raw_source_block = (
+        "### 阿里云公有云接入\n"
+        "- Source: 20-功能域/云资源管理/阿里云公有云接入.md\n\n"
+        "SmartCMP 支持通过插件接入公有云资源，并可扩展相关资源类型。"
+    )
+    messages = [
+        {"role": "user", "content": "SmartCMP 支持 MaxCompute 吗？"},
+        {
+            "role": "tool",
+            "tool_name": "markdown_vault_search",
+            "content": raw_source_block,
+        },
+        {"role": "assistant", "content": raw_source_block},
+    ]
+
+    events = []
+    async for event in runner._process_agent_run_outcome(
+        agent_run=_AgentRun(messages),
+        state=state,
+        _log_step=lambda *args, **kwargs: None,
+    ):
+        events.append(event)
+    await runner._await_background_post_success_tasks()
+
+    assistant_events = [event.content for event in events if event.type == "assistant"]
+
+    assert assistant_events == [runner.lookup_dump_recovery_answer]
+    assert runner.lookup_dump_recovery_calls
+    assert state["session_manager"].persisted_messages[-1]["content"] == runner.lookup_dump_recovery_answer
+
+
+@pytest.mark.asyncio
+async def test_visible_raw_provider_payload_is_blocked_before_emit() -> None:
+    runner = _PostRunner()
+    state = {
+        "start_time": 0.0,
+        "session_key": "s-tool-dump",
+        "session_manager": _SessionManager(),
+        "session": SimpleNamespace(title=""),
+        "run_id": "run-tool-dump",
+        "user_message": "SmartCMP 是否支持工单处理由排班人员处理？",
+        "system_prompt": "system",
+        "deps": SimpleNamespace(extra={}),
+        "tool_gate_decision": ToolGateDecision(
+            needs_tool=False,
+            reason="provider search",
+            policy=ToolPolicyMode.PREFER_TOOL,
+        ),
+        "tool_match_result": SimpleNamespace(missing_capabilities=[], tool_candidates=[]),
+        "available_tools": [{"name": "markdown_vault_search"}],
+        "tool_execution_required": False,
+        "max_tool_calls": 5,
+        "timeout_seconds": 60.0,
+        "_token_failover_attempt": 0,
+        "_emit_lifecycle_bounds": False,
+        "selected_token_id": None,
+        "release_slot": None,
+        "tool_execution_retry_count": 0,
+        "persist_override_messages": None,
+        "persist_override_base_len": 0,
+        "run_output_start_index": 1,
+        "persist_run_output_start_index": 1,
+        "buffered_assistant_events": [],
+        "tool_call_summaries": [{"name": "markdown_vault_search"}],
+        "assistant_output_streamed": False,
+        "model_stream_timed_out": False,
+        "model_timeout_error_message": "",
+        "current_model_attempt": 1,
+        "thinking_emitter": SimpleNamespace(assistant_emitted=False),
+        "context_history_for_hooks": [],
+        "session_title": "",
+        "tool_intent_plan": ToolIntentPlan(
+            action=ToolIntentAction.DIRECT_ANSWER,
+            target_provider_types=["markdown-vault"],
+            reason="provider search",
+        ),
+        "synthetic_tool_messages": [],
+        "session_message_history": [],
+        "runtime_base_history_len": 0,
+    }
+
+    messages = [
+        {"role": "user", "content": "SmartCMP 是否支持工单处理由排班人员处理？"},
+        {
+            "role": "tool",
+            "tool_name": "markdown_vault_search",
+            "content": {
+                "success": True,
+                "returncode": 0,
+                "output": '{"success": true, "search_backend": "direct", "results": [{"path": "ITSM 与服务管理/排班管理.md", "text": "支持排班和值班相关配置。"}]}',
+            },
+        },
+        {
+            "role": "assistant",
+            "content": "Selected markdown-vault instance 'knowledgebase'\n\n{\"success\": true, \"search_backend\": \"direct\", \"results\": []}",
+        },
+    ]
+
+    events = []
+    async for event in runner._process_agent_run_outcome(
+        agent_run=_AgentRun(messages),
+        state=state,
+        _log_step=lambda *args, **kwargs: None,
+    ):
+        events.append(event)
+    await runner._await_background_post_success_tasks()
+
+    assistant_events = [event.content for event in events if event.type == "assistant"]
+    assistant_text = "".join(assistant_events)
+    answered_states = [
+        event
+        for event in events
+        if event.type == "runtime" and str(event.metadata.get("state", "")).strip() == "answered"
+    ]
+
+    assert answered_states
+    assert "支持排班和值班相关配置" in assistant_text
+    assert "search_backend" not in assistant_text
+    assert '"results"' not in assistant_text
+    assert runner.lookup_dump_recovery_calls == []
+
+
+@pytest.mark.asyncio
+async def test_tool_only_fallback_raw_provider_payload_is_blocked() -> None:
+    runner = _PostRunner()
+    raw_output = (
+        '{"success": true, "search_backend": "direct", "result_count": 0, '
+        '"results": [], "status": {"current_documents": 211}}'
+    )
+    state = {
+        "start_time": 0.0,
+        "session_key": "s-tool-only-raw",
+        "session_manager": _SessionManager(),
+        "session": SimpleNamespace(title=""),
+        "run_id": "run-tool-only-raw",
+        "user_message": "SmartCMP VM 部署是否支持基线化？",
+        "system_prompt": "system",
+        "deps": SimpleNamespace(extra={}),
+        "tool_gate_decision": ToolGateDecision(
+            needs_tool=False,
+            reason="provider search",
+            policy=ToolPolicyMode.PREFER_TOOL,
+        ),
+        "tool_match_result": SimpleNamespace(missing_capabilities=[], tool_candidates=[]),
+        "available_tools": [{"name": "markdown_vault_search"}],
+        "tool_execution_required": False,
+        "max_tool_calls": 5,
+        "timeout_seconds": 60.0,
+        "_token_failover_attempt": 0,
+        "_emit_lifecycle_bounds": False,
+        "selected_token_id": None,
+        "release_slot": None,
+        "tool_execution_retry_count": 0,
+        "persist_override_messages": None,
+        "persist_override_base_len": 0,
+        "run_output_start_index": 0,
+        "persist_run_output_start_index": 0,
+        "buffered_assistant_events": [],
+        "tool_call_summaries": [{"name": "markdown_vault_search"}],
+        "assistant_output_streamed": False,
+        "model_stream_timed_out": False,
+        "model_timeout_error_message": "",
+        "current_model_attempt": 1,
+        "thinking_emitter": SimpleNamespace(assistant_emitted=False),
+        "context_history_for_hooks": [],
+        "session_title": "",
+        "tool_intent_plan": ToolIntentPlan(
+            action=ToolIntentAction.DIRECT_ANSWER,
+            target_provider_types=["markdown-vault"],
+            reason="provider search",
+        ),
+        "synthetic_tool_messages": [],
+        "session_message_history": [],
+        "runtime_base_history_len": 0,
+    }
+    messages = [
+        {"role": "user", "content": "SmartCMP VM 部署是否支持基线化？"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "tc-1", "name": "markdown_vault_search", "args": "{}"}],
+        },
+        {
+            "role": "tool",
+            "tool_name": "markdown_vault_search",
+            "tool_call_id": "tc-1",
+            "content": {"success": True, "returncode": 0, "output": raw_output},
+        },
+    ]
+
+    events = []
+    async for event in runner._process_agent_run_outcome(
+        agent_run=_AgentRun(messages),
+        state=state,
+        _log_step=lambda *args, **kwargs: None,
+    ):
+        events.append(event)
+    await runner._await_background_post_success_tasks()
+
+    assistant_events = [event.content for event in events if event.type == "assistant"]
+    failed_states = [
+        event
+        for event in events
+        if event.type == "runtime" and str(event.metadata.get("state", "")).strip() == "failed"
+    ]
+    error_events = [event for event in events if event.type == "error"]
+
+    assert assistant_events == []
+    assert failed_states
+    assert error_events
+    assert runner.lookup_dump_recovery_calls == []
+
+
+def test_build_tool_only_markdown_answer_includes_sources_for_structured_tool_result() -> None:
+    runner = _PostRunner()
+
+    answer = runner._build_tool_only_markdown_answer_from_messages(
+        messages=[
+            {
+                "role": "tool",
+                "tool_name": "openmeteo_weather",
+                "content": {
+                    "output": "明天（2026-04-12）上海：小雨，13.8°C - 18.6°C，降水概率 63%。",
+                    "details": {
+                        "sources": [
+                            {
+                                "label": "Open-Meteo Forecast API",
+                                "url": "https://api.open-meteo.com/v1/forecast",
+                            }
+                        ]
+                    },
+                },
+            }
+        ],
+        start_index=0,
+    )
+
+    assert "## Answer" not in answer
+    assert "## Result" not in answer
+    assert "13.8°C - 18.6°C" in answer
+    assert "https://api.open-meteo.com/v1/forecast" in answer
+
+
+def test_build_tool_only_markdown_answer_parses_json_search_payload_without_raw_dump() -> None:
+    runner = _PostRunner()
+    raw_payload = json.dumps(
+        {
+            "success": True,
+            "search_backend": "direct",
+            "result_count": 1,
+            "results": [
+                {
+                    "path": "ITSM 系统对接.md",
+                    "title": "ITSM 系统对接",
+                    "text": "SmartCMP 支持通用工单、请求工单、问题工单、事件工单和变更工单等服务类型。",
+                }
+            ],
+        },
+        ensure_ascii=False,
+    )
+
+    answer = runner._build_tool_only_markdown_answer_from_messages(
+        messages=[
+            {
+                "role": "tool",
+                "tool_name": "markdown_vault_search",
+                "content": {"success": True, "returncode": 0, "output": raw_payload},
+            }
+        ],
+        start_index=0,
+    )
+
+    assert "SmartCMP 支持通用工单" in answer
+    assert "search_backend" not in answer
+    assert '"results"' not in answer
+
+
+def test_build_tool_only_markdown_answer_keeps_multi_item_structured_provider_output() -> None:
+    runner = _PostRunner()
+    pending_output = "\n".join(
+        [
+            "CMP pending approvals (3)",
+            "1) TIC20260316000001",
+            "title: Test ticket for build verification",
+            "catalog: Incident Ticket",
+            "stage: 一级审批",
+            "assignee: 待分配",
+            "wait_hours: 507.3",
+            "priority_factor: 等待超3天",
+            "2) TIC20260313000006",
+            "title: 加急加急",
+            "catalog: 问题工单",
+            "stage: 一级审批",
+            "assignee: 待分配",
+            "wait_hours: 579.3",
+            "priority_factor: 等待超3天",
+            "3) TIC20260313000004",
+            "title: (名称为空)",
+            "catalog: 问题工单",
+            "stage: 一级审批",
+            "assignee: 待分配",
+            "wait_hours: 580.7",
+            "priority_factor: 等待超3天",
+        ]
+    )
+
+    answer = runner._build_tool_only_markdown_answer_from_messages(
+        messages=[
+            {
+                "role": "tool",
+                "tool_name": "smartcmp_list_pending",
+                "content": {
+                    "output": pending_output,
+                    "details": {
+                        "sources": [
+                            {
+                                "label": "SmartCMP approvals",
+                                "url": "https://smartcmp.example.local/pending",
+                            }
+                        ]
+                    },
+                },
+            }
+        ],
+        start_index=0,
+    )
+
+    assert "TIC20260316000001" in answer
+    assert "TIC20260313000006" in answer
+    assert "TIC20260313000004" in answer
+    assert "\n..." not in answer
+
+
+def test_build_tool_only_markdown_answer_uses_latest_single_object_detail_result() -> None:
+    runner = _PostRunner()
+
+    answer = runner._build_tool_only_markdown_answer_from_messages(
+        messages=[
+            {
+                "role": "assistant",
+                "tool_results": [
+                    {
+                        "tool_name": "list_resources",
+                        "content": {
+                            "output": "\n".join(
+                                [
+                                    "Found 2 virtual machine(s):",
+                                    "[1] vm-1 | status: started",
+                                    "[2] vm-2 | status: stopped",
+                                ]
+                            ),
+                            "object_actions": [
+                                {
+                                    "index": 1,
+                                    "object_id": "vm-1",
+                                    "object_name": "vm-1",
+                                    "object_actions": [
+                                        {
+                                            "action_id": "open_detail",
+                                            "kind": "open_url",
+                                            "href": "https://console.example.com/resources/vm-1",
+                                        }
+                                    ],
+                                },
+                                {
+                                    "index": 2,
+                                    "object_id": "vm-2",
+                                    "object_name": "vm-2",
+                                    "object_actions": [
+                                        {
+                                            "action_id": "open_detail",
+                                            "kind": "open_url",
+                                            "href": "https://console.example.com/resources/vm-2",
+                                        }
+                                    ],
+                                },
+                            ],
+                        },
+                    },
+                    {
+                        "tool_name": "resource_detail",
+                        "content": {
+                            "output": "\n".join(
+                                [
+                                    "vm-1",
+                                    "",
+                                    "Status: started",
+                                    "Compute: 1 CPU / 1 GB",
+                                ]
+                            ),
+                            "object_id": "vm-1",
+                            "object_name": "vm-1",
+                            "object_actions": [
+                                {
+                                    "action_id": "open_detail",
+                                    "kind": "open_url",
+                                    "href": "https://console.example.com/resources/vm-1",
+                                }
+                            ],
+                        },
+                    },
+                ],
+            }
+        ],
+        start_index=0,
+    )
+
+    assert "Found 2 virtual machine(s)" not in answer
+    assert "[2] vm-2" not in answer
+    assert "vm-1" in answer
+    assert "Compute: 1 CPU / 1 GB" in answer
+
+
+def test_build_tool_only_markdown_answer_prefers_meta_block_over_ascii_layout() -> None:
+    runner = _PostRunner()
+
+    meta_output = "\n".join(
+        [
+            "===============================================================",
+            "待审批列表 - 共 3 项（按优先级排序）",
+            "===============================================================",
+            "+- [1] 高 ---------------------------------------------",
+            "| 名称: Test ticket for build verification",
+            "| 工单号: TIC20260316000001",
+            "##APPROVAL_META_START##",
+            '[{"index":1,"id":"A-1","requestId":"TIC20260316000001","name":"Test ticket for build verification","catalogName":"Incident Ticket","approvalStep":"一级审批","currentApprover":"待分配","waitHours":645.1},{"index":2,"id":"A-2","requestId":"TIC20260313000006","name":"加急加急","catalogName":"问题工单","approvalStep":"一级审批","currentApprover":"待分配","waitHours":619.2}]',
+            "##APPROVAL_META_END##",
+        ]
+    )
+
+    answer = runner._build_tool_only_markdown_answer_from_messages(
+        messages=[
+            {
+                "role": "tool",
+                "tool_name": "smartcmp_list_pending",
+                "content": {"output": meta_output},
+            }
+        ],
+        start_index=0,
+    )
+
+    assert "## Answer" not in answer
+    assert "## Result" not in answer
+    assert "TIC20260316000001" in answer
+    assert "Test ticket for build verification" in answer
+    assert "加急加急" in answer
+    assert "===============================================================" not in answer
+    assert "+- [1]" not in answer
+
+
+def test_build_tool_only_markdown_answer_normalizes_plain_ascii_layout_to_markdown() -> None:
+    runner = _PostRunner()
+
+    ascii_output = "\n".join(
+        [
+            "Answer",
+            "=====",
+            "===============================================================",
+            "待审批列表 - 共 2 项（按优先级排序）",
+            "===============================================================",
+            "+- [1] 高 ---------------------------------------------",
+            "| 名称: Test ticket for build verification",
+            "| 工单号: TIC20260316000001",
+            "| 类型: Incident Ticket",
+            "|",
+            "+- [2] 高 ---------------------------------------------",
+            "| 名称: 加急加急",
+            "| 工单号: TIC20260313000006",
+            "| 类型: 问题工单",
+            "+------------------------------------------------------",
+        ]
+    )
+
+    answer = runner._build_tool_only_markdown_answer_from_messages(
+        messages=[
+            {
+                "role": "tool",
+                "tool_name": "smartcmp_list_pending",
+                "content": {"output": ascii_output},
+            }
+        ],
+        start_index=0,
+    )
+
+    assert "Answer" not in answer
+    assert "=====" not in answer
+    assert "+- [1]" not in answer
+    assert "| 名称:" not in answer
+    assert "## 待审批列表 - 共 2 项（按优先级排序）" in answer
+    assert "### [1] 高" in answer
+    assert "- 名称: Test ticket for build verification" in answer
+    assert "- 工单号: TIC20260316000001" in answer
+    assert "### [2] 高" in answer
+
+
+def test_build_tool_only_markdown_answer_does_not_append_ellipsis_for_whitespace_only_compaction() -> None:
+    runner = _PostRunner()
+
+    tool_output = "\n".join(
+        [
+            "[SUCCESS] Request submitted",
+            "  Request ID: TIC20260422000004",
+            "  State: APPROVAL_PENDING",
+            "  Catalog: 通用工单",
+            "  Name: CRM 问题",
+        ]
+    )
+
+    answer = runner._build_tool_only_markdown_answer_from_messages(
+        messages=[
+            {
+                "role": "tool",
+                "tool_name": "smartcmp_submit_request",
+                "content": {"output": tool_output},
+            }
+        ],
+        start_index=0,
+    )
+
+    assert answer == "\n".join(
+        [
+            "[SUCCESS] Request submitted",
+            "Request ID: TIC20260422000004",
+            "State: APPROVAL_PENDING",
+            "Catalog: 通用工单",
+            "Name: CRM 问题",
+        ]
+    )
+    assert "\n..." not in answer
+
+
+def test_build_tool_only_markdown_answer_keeps_ellipsis_when_content_is_actually_truncated() -> None:
+    runner = _PostRunner()
+
+    tool_output = "Request summary: " + ("A" * 1600)
+
+    answer = runner._compact_tool_fallback_text(tool_output, max_chars=1200)
+
+    assert "Request summary:" in answer
+    assert len(answer) < len(tool_output)
+    assert "..." in answer
+
+
+@pytest.mark.asyncio
+async def test_post_success_side_effects_do_not_block_answer_completion() -> None:
+    runner = _SlowPostRunner()
+    session_manager = _SlowSessionManager()
+    state = {
+        "start_time": 0.0,
+        "session_key": "s-fast-return",
+        "session_manager": session_manager,
+        "session": SimpleNamespace(title=""),
+        "run_id": "run-fast-return",
+        "user_message": "明天上海天气如何",
+        "system_prompt": "system",
+        "deps": SimpleNamespace(extra={}),
+        "tool_gate_decision": ToolGateDecision(
+            needs_tool=True,
+            needs_live_data=True,
+            reason="weather tool required",
+            policy=ToolPolicyMode.PREFER_TOOL,
+        ),
+        "tool_match_result": SimpleNamespace(missing_capabilities=[], tool_candidates=[]),
+        "available_tools": [
+            {"name": "openmeteo_weather", "capability_class": "weather", "result_mode": "tool_only_ok"}
+        ],
+        "tool_execution_required": True,
+        "max_tool_calls": 5,
+        "timeout_seconds": 60.0,
+        "_token_failover_attempt": 0,
+        "_emit_lifecycle_bounds": False,
+        "selected_token_id": None,
+        "release_slot": None,
+        "tool_execution_retry_count": 0,
+        "persist_override_messages": None,
+        "persist_override_base_len": 0,
+        "run_output_start_index": 1,
+        "persist_run_output_start_index": 1,
+        "buffered_assistant_events": [],
+        "tool_call_summaries": [{"name": "openmeteo_weather", "args": {"location": "上海"}}],
+        "assistant_output_streamed": False,
+        "model_stream_timed_out": False,
+        "model_timeout_error_message": "",
+        "current_model_attempt": 1,
+        "thinking_emitter": SimpleNamespace(assistant_emitted=False),
+        "context_history_for_hooks": [],
+        "session_title": "",
+        "tool_intent_plan": ToolIntentPlan(
+            action=ToolIntentAction.USE_TOOLS,
+            target_group_ids=["group:web"],
+            target_capability_classes=["weather"],
+            target_tool_names=["openmeteo_weather"],
+            reason="weather",
+        ),
+        "executed_tool_names": ["openmeteo_weather"],
+    }
+
+    async def _collect():
+        events = []
+        async for event in runner._process_agent_run_outcome(
+            agent_run=_AgentRun(
+                [
+                    {"role": "user", "content": "明天上海天气如何"},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{"id": "weather-1", "name": "openmeteo_weather", "args": {"location": "上海"}}],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_name": "openmeteo_weather",
+                        "content": {
+                            "output": "明天（2026-04-12）上海：小雨，13.8°C - 18.6°C，降水概率 63%。"
+                        },
+                    },
+                ]
+            ),
+            state=state,
+            _log_step=lambda *args, **kwargs: None,
+        ):
+            events.append(event)
+        return events
+
+    started_at = time.monotonic()
+    events = await asyncio.wait_for(_collect(), timeout=0.1)
+    elapsed = time.monotonic() - started_at
+
+    answered_states = [
+        event
+        for event in events
+        if event.type == "runtime" and str(event.metadata.get("state", "")).strip() == "answered"
+    ]
+    assert answered_states
+    assert elapsed < 0.1
+
+    await runner._await_background_post_success_tasks()
+    assert session_manager.persisted_messages is not None
+    assert runner.runtime_events.context_ready_calls

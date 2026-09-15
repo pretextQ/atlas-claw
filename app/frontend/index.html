@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<!--
+  Copyright 2021  Qianyun, Inc. All rights reserved.
+-->
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title data-i18n="app.title">AtlasClaw</title>
+    <link rel="icon" href="__ATLASCLAW_BASE_PATH__/static/favicon.ico">
+    <script>
+        window.__atlasclawBasePath = __ATLASCLAW_BASE_PATH_JSON__
+        window.__atlasclawBuildUrl = function (path) {
+            const basePath = String(window.__atlasclawBasePath || '').replace(/\/$/, '')
+            const cleanPath = String(path || '/')
+            if (!cleanPath) {
+                return basePath ? `${basePath}/` : '/'
+            }
+            if (cleanPath === '/') {
+                return basePath ? `${basePath}/` : '/'
+            }
+            if (cleanPath.startsWith('http://') || cleanPath.startsWith('https://') || cleanPath.startsWith('//')) {
+                return cleanPath
+            }
+            const normalized = cleanPath.startsWith('/') ? cleanPath : `/${cleanPath}`
+            return `${basePath}${normalized}` || normalized
+        }
+        window.__atlasclawStripBasePath = function (path) {
+            const basePath = String(window.__atlasclawBasePath || '').replace(/\/$/, '')
+            const pathname = String(path || '/')
+            if (!basePath) {
+                return pathname || '/'
+            }
+            if (pathname === basePath) {
+                return '/'
+            }
+            if (pathname.startsWith(`${basePath}/`)) {
+                return pathname.slice(basePath.length) || '/'
+            }
+            return pathname || '/'
+        }
+    </script>
+    <script>
+        (() => {
+            const params = new URLSearchParams(window.location.search)
+            const explicitMode = params.get('embedded') || params.get('embed') || params.get('iframe')
+            const normalizedMode = String(explicitMode || '').trim().toLowerCase()
+            let embeddedMode = false
+
+            if (['1', 'true', 'yes'].includes(normalizedMode)) {
+                embeddedMode = true
+            } else if (['0', 'false', 'no'].includes(normalizedMode)) {
+                embeddedMode = false
+            } else {
+                try {
+                    embeddedMode = window.self !== window.top
+                } catch (error) {
+                    embeddedMode = true
+                }
+            }
+
+            const logicalPath = window.__atlasclawStripBasePath(window.location.pathname)
+            const chatEmbeddedMode = embeddedMode && logicalPath === '/'
+            const pageName = logicalPath.replace(/\/$/, '').split('/').pop()
+            const configEmbeddedMode = embeddedMode && ['models', 'channels', 'providers'].includes(pageName)
+            const surface = String(params.get('surface') || '').trim().toLowerCase()
+            const embedSurface = embeddedMode && ['floating', 'menu'].includes(surface)
+            window.__atlasclawEmbeddedMode = embeddedMode
+            window.__atlasclawChatEmbeddedMode = chatEmbeddedMode
+            window.__atlasclawConfigEmbeddedMode = configEmbeddedMode
+            document.documentElement.classList.toggle('atlas-embedded-mode', embeddedMode)
+            document.documentElement.classList.toggle('atlas-chat-embedded-mode', chatEmbeddedMode)
+            document.documentElement.classList.toggle('atlas-config-embedded-mode', configEmbeddedMode)
+            document.documentElement.classList.toggle('atlas-surface-floating', embedSurface && surface === 'floating')
+            document.documentElement.classList.toggle('atlas-surface-menu', embedSurface && surface === 'menu')
+        })()
+    </script>
+    <style>
+        html.atlas-embedded-mode .sidebar,
+        html.atlas-embedded-mode .header-actions {
+            display: none;
+        }
+
+        html.atlas-embedded-mode .chat-header {
+            padding: 12px 18px;
+        }
+
+        html.atlas-config-embedded-mode .sidebar,
+        html.atlas-config-embedded-mode .chat-header {
+            display: none;
+        }
+    </style>
+    <!-- Deep Chat - loaded globally for chat page -->
+    <script type="module" src="__ATLASCLAW_BASE_PATH__/static/deepChat.bundle.js?v=2.5.0"></script>
+    <!-- Styles -->
+    <link rel="stylesheet" href="__ATLASCLAW_BASE_PATH__/styles/main.css?v=27">
+    <link rel="stylesheet" href="__ATLASCLAW_BASE_PATH__/styles/floating-assistant.css?v=37">
+    <link rel="stylesheet" href="__ATLASCLAW_BASE_PATH__/styles/channels.css">
+    <link rel="stylesheet" href="__ATLASCLAW_BASE_PATH__/static/style.css">
+    <link rel="stylesheet" href="__ATLASCLAW_BASE_PATH__/static/mention.css">
+    <script>
+        (() => {
+            const routeStyles = [
+                { match: /^\/admin\/users\/?$/, id: 'admin-users-page-css', href: window.__atlasclawBuildUrl('/styles/admin-users.css') },
+                { match: /^\/account\/?$/, id: 'account-settings-page-css', href: window.__atlasclawBuildUrl('/styles/account-settings.css') },
+                { match: /^\/models\/?$/, id: 'models-page-css', href: window.__atlasclawBuildUrl('/styles/models.css') }
+            ]
+
+            const pathname = window.__atlasclawStripBasePath(window.location.pathname)
+            const target = routeStyles.find(({ match }) => match.test(pathname))
+
+            if (!target || document.getElementById(target.id)) {
+                return
+            }
+
+            const cssLink = document.createElement('link')
+            cssLink.rel = 'stylesheet'
+            cssLink.href = target.href
+            cssLink.id = target.id
+            document.head.appendChild(cssLink)
+        })()
+    </script>
+</head>
+<body>
+    <!-- SPA Layout Shell -->
+    <aside id="sidebar" class="sidebar"></aside>
+    <main id="main-content" class="main-content">
+        <header id="app-header" class="chat-header"></header>
+        <div id="page-content"></div>
+    </main>
+    <div id="toast-container" class="toast-container"></div>
+
+    <!-- SPA Entry Point -->
+    <script type="module" src="__ATLASCLAW_BASE_PATH__/scripts/main.js?v=43"></script>
+</body>
+</html>

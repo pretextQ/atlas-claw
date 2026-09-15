@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<!--
+  Copyright 2021  Qianyun, Inc. All rights reserved.
+-->
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SmartCMP AI - Test</title>
+    <script type="module" src="/static/deepChat.bundle.js?v=2.5.0"></script>
+    <style>
+        body {
+            margin: 0;
+            padding: 20px;
+            font-family: Arial, sans-serif;
+            background: #f0f0f0;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+            margin-bottom: 20px;
+        }
+        deep-chat {
+            width: 100%;
+            height: 500px;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+        }
+        .status {
+            margin-top: 10px;
+            padding: 10px;
+            background: #e8f5e9;
+            border-radius: 4px;
+            color: #2e7d32;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🤖 SmartCMP AI Assistant - 测试页面</h1>
+        <div class="status" id="status">正在加载...</div>
+        
+        <deep-chat
+            id="chat"
+            introMessage='{"text": "👋 你好！我是测试版本。如果你能看到这条消息，说明Deep Chat已成功加载！"}'
+            textInput='{"placeholder": {"text": "输入消息测试..."}}'
+            style="margin-top: 20px;">
+        </deep-chat>
+    </div>
+    
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            const status = document.getElementById('status');
+            const chat = document.getElementById('chat');
+            
+            // 检查Deep Chat是否加载
+            if (chat) {
+                status.textContent = '✅ Deep Chat组件加载成功！';
+                status.style.background = '#e8f5e9';
+                status.style.color = '#2e7d32';
+                
+                // 配置连接
+                chat.connect = {
+                    url: '/api/chat/stream',
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                };
+                
+                console.log('Deep Chat initialized successfully');
+            } else {
+                status.textContent = '❌ Deep Chat组件加载失败';
+                status.style.background = '#ffebee';
+                status.style.color = '#c62828';
+            }
+        });
+        
+        // 监听错误
+        window.addEventListener('error', (e) => {
+            console.error('页面错误:', e);
+            document.getElementById('status').textContent = '❌ 错误: ' + e.message;
+            document.getElementById('status').style.background = '#ffebee';
+            document.getElementById('status').style.color = '#c62828';
+        });
+    </script>
+</body>
+</html>

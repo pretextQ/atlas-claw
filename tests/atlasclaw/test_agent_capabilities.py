@@ -1,0 +1,363 @@
+# -*- coding: utf-8 -*-
+# Copyright 2026  Qianyun, Inc., www.cloudchef.io, All rights reserved.
+
+from __future__ import annotations
+
+from app.atlasclaw.api.agent_capabilities import (
+    build_agent_capabilities,
+    resolve_selected_capability,
+)
+from app.atlasclaw.agent.selected_capability import (
+    get_selected_capability_from_extra,
+    selected_capability_provider_instance_ref,
+    selected_capability_targets,
+)
+from app.atlasclaw.api.deps_context import APIContext
+from app.atlasclaw.auth.guards import AuthorizationContext
+from app.atlasclaw.auth.models import UserInfo
+from app.atlasclaw.session.manager import SessionManager
+from app.atlasclaw.session.queue import SessionQueue
+from app.atlasclaw.skills.registry import MdSkillEntry, SkillMetadata, SkillRegistry
+from app.atlasclaw.tools.registration import register_builtin_tools
+
+
+def _handler():
+    return "ok"
+
+
+def _build_context(tmp_path) -> APIContext:
+    registry = SkillRegistry()
+    registry._md_skills["smartcmp:linux-vm-request"] = MdSkillEntry(
+        name="linux-vm-request",
+        description="Request a Linux VM through a provider instance.",
+        file_path=str(tmp_path / "smartcmp" / "linux-vm-request" / "SKILL.md"),
+        provider="smartcmp",
+        qualified_name="smartcmp:linux-vm-request",
+        location="workspace",
+        metadata={"provider_type": "smartcmp"},
+    )
+    registry._md_skill_tools["smartcmp:linux-vm-request"] = {"smartcmp_linux_vm_request"}
+    registry.register(
+        SkillMetadata(
+            name="no-provider-vm-request",
+            description="Request a dry-run VM without a provider.",
+            source="md_skill",
+        ),
+        _handler,
+    )
+    return APIContext(
+        session_manager=SessionManager(agents_dir=str(tmp_path / "agents")),
+        session_queue=SessionQueue(),
+        skill_registry=registry,
+    )
+
+
+def _authz(
+    *,
+    skill_view: bool = False,
+    provider_allowed: bool = True,
+    provider_skill_enabled: bool = True,
+    standalone_skill_enabled: bool = True,
+) -> AuthorizationContext:
+    skill_permissions = [
+        {
+            "skill_id": "smartcmp:linux-vm-request",
+            "skill_name": "linux-vm-request",
+            "authorized": True,
+            "enabled": provider_skill_enabled,
+        },
+        {
+            "skill_id": "no-provider-vm-request",
+            "skill_name": "no-provider-vm-request",
+            "authorized": True,
+            "enabled": standalone_skill_enabled,
+        },
+    ]
+    return AuthorizationContext(
+        user=UserInfo(user_id="user"),
+        permissions={
+            "skills": {
+                "module_permissions": {"view": skill_view},
+                "skill_permissions": skill_permissions,
+            },
+            "providers": {
+                "provider_permissions": [
+                    {
+                        "provider_type": "smartcmp",
+                        "instance_name": "default",
+                        "allowed": provider_allowed,
+                    }
+                ],
+            },
+        },
+    )
+
+
+def test_agent_capabilities_include_provider_skill_command_and_direct_skill(tmp_path):
+    ctx = _build_context(tmp_path)
+
+    payload = build_agent_capabilities(
+        ctx=ctx,
+        authz=_authz(),
+        provider_instances={"smartcmp": {"default": {"base_url": "https://example.test"}}},
+    )
+
+    commands = {item["command"]: item for item in payload["capabilities"]}
+    assert "/default.linux-vm-request" in commands
+    assert (
+        commands["/default.linux-vm-request"]["id"]
+        == "provider_skill:default.linux-vm-request"
+    )
+    assert commands["/default.linux-vm-request"]["kind"] == "provider_skill"
+    assert commands["/default.linux-vm-request"]["provider_name"] == "default"
+    assert commands["/default.linux-vm-request"]["provider_type"] == "smartcmp"
+    assert commands["/default.linux-vm-request"]["instance_name"] == "default"
+    assert commands["/default.linux-vm-request"]["target_provider_instances"] == [
+        "smartcmp.default"
+    ]
+    assert commands["/default.linux-vm-request"]["target_provider_types"] == ["smartcmp"]
+    assert commands["/default.linux-vm-request"]["target_provider_skill_names"] == [
+        "default.linux-vm-request",
+    ]
+    assert "target_skill_names" not in commands["/default.linux-vm-request"]
+    assert "/no-provider-vm-request" in commands
+    assert commands["/no-provider-vm-request"]["kind"] == "skill"
+
+
+def test_agent_capabilities_hide_denied_provider_instance(tmp_path):
+    ctx = _build_context(tmp_path)
+
+    payload = build_agent_capabilities(
+        ctx=ctx,
+        authz=_authz(provider_allowed=False),
+        provider_instances={"smartcmp": {"default": {"base_url": "https://example.test"}}},
+    )
+
+    commands = {item["command"] for item in payload["capabilities"]}
+    assert "/default.linux-vm-request" not in commands
+    assert "/no-provider-vm-request" in commands
+
+
+def test_agent_capabilities_hide_internal_catalog_and_show_authorized_artifact_tools(tmp_path):
+    registry = SkillRegistry()
+    register_builtin_tools(registry)
+    registry.register(
+        SkillMetadata(
+            name="txt_create_document",
+            description="Create a TXT artifact from explicit content.",
+            source="md_skill",
+            capability_class="artifact:txt",
+            group_ids=["group:txt"],
+        ),
+        _handler,
+    )
+    ctx = APIContext(
+        session_manager=SessionManager(agents_dir=str(tmp_path / "agents")),
+        session_queue=SessionQueue(),
+        skill_registry=registry,
+    )
+    authz = AuthorizationContext(
+        user=UserInfo(user_id="user"),
+        permissions={
+            "skills": {
+                "module_permissions": {"view": True},
+                "skill_permissions": [
+                    {
+                        "skill_id": "txt_create_document",
+                        "skill_name": "txt_create_document",
+                        "authorized": True,
+                        "enabled": True,
+                    }
+                ],
+            },
+            "providers": {"provider_permissions": []},
+        },
+    )
+
+    payload = build_agent_capabilities(ctx=ctx, authz=authz, provider_instances={})
+
+    commands = {item["command"]: item for item in payload["capabilities"]}
+    assert "/txt_create_document" in commands
+    assert commands["/txt_create_document"]["target_tool_names"] == ["txt_create_document"]
+    assert commands["/txt_create_document"]["target_capability_classes"] == ["artifact:txt"]
+    assert "/atlasclaw_catalog_query" not in commands
+
+
+def test_resolve_selected_capability_rejects_disabled_standalone_skill(tmp_path):
+    ctx = _build_context(tmp_path)
+    selected = {
+        "kind": "skill",
+        "command": "/no-provider-vm-request",
+        "qualified_skill_name": "no-provider-vm-request",
+    }
+
+    resolved = resolve_selected_capability(
+        ctx=ctx,
+        selected=selected,
+        authz=_authz(standalone_skill_enabled=False),
+        provider_instances={"smartcmp": {"default": {"base_url": "https://example.test"}}},
+    )
+
+    assert resolved is None
+
+
+def test_resolve_selected_provider_capability_uses_provider_permission(tmp_path):
+    ctx = _build_context(tmp_path)
+    selected = {
+        "kind": "provider_skill",
+        "command": "/default.linux-vm-request",
+        "provider_type": "smartcmp",
+        "instance_name": "default",
+        "qualified_skill_name": "smartcmp:linux-vm-request",
+    }
+
+    resolved = resolve_selected_capability(
+        ctx=ctx,
+        selected=selected,
+        authz=_authz(provider_skill_enabled=False),
+        provider_instances={"smartcmp": {"default": {"base_url": "https://example.test"}}},
+    )
+
+    assert resolved is not None
+    assert resolved["provider_type"] == "smartcmp"
+
+    resolved = resolve_selected_capability(
+        ctx=ctx,
+        selected=selected,
+        authz=_authz(provider_allowed=False, provider_skill_enabled=False),
+        provider_instances={"smartcmp": {"default": {"base_url": "https://example.test"}}},
+    )
+
+    assert resolved is None
+
+
+def test_resolve_selected_provider_capability_rejects_bare_skill_payload(tmp_path):
+    ctx = _build_context(tmp_path)
+    selected = {
+        "kind": "provider_skill",
+        "qualified_skill_name": "smartcmp:linux-vm-request",
+    }
+
+    resolved = resolve_selected_capability(
+        ctx=ctx,
+        selected=selected,
+        authz=_authz(),
+        provider_instances={"smartcmp": {"default": {"base_url": "https://example.test"}}},
+    )
+
+    assert resolved is None
+
+
+def test_resolve_selected_provider_capability_requires_canonical_provider_skill_id(tmp_path):
+    ctx = _build_context(tmp_path)
+    provider_instances = {"smartcmp": {"default": {"base_url": "https://example.test"}}}
+
+    resolved = resolve_selected_capability(
+        ctx=ctx,
+        selected={"id": "provider_skill:default.linux-vm-request"},
+        authz=_authz(),
+        provider_instances=provider_instances,
+    )
+
+    assert resolved is not None
+    assert resolved["target_provider_instances"] == ["smartcmp.default"]
+    assert resolved["target_provider_skill_names"] == ["default.linux-vm-request"]
+    assert "target_skill_names" not in resolved
+
+    rejected = resolve_selected_capability(
+        ctx=ctx,
+        selected={
+            "id": (
+                "provider_skill|smartcmp|default|smartcmp:linux-vm-request|"
+                "linux-vm-request|/default.linux-vm-request"
+            )
+        },
+        authz=_authz(),
+        provider_instances=provider_instances,
+    )
+
+    assert rejected is None
+
+
+def test_scoped_deps_only_reads_server_validated_selected_capability():
+    unvalidated = {"id": "client-supplied"}
+    validated = {"id": "server-validated"}
+
+    assert get_selected_capability_from_extra({"selected_capability": unvalidated}) is None
+    assert (
+        get_selected_capability_from_extra(
+            {"context": {"selected_capability": unvalidated}}
+        )
+        is None
+    )
+    assert get_selected_capability_from_extra({"_selected_capability": validated}) == validated
+    assert (
+        get_selected_capability_from_extra(
+            {"context": {"_selected_capability": validated}}
+        )
+        == validated
+    )
+
+
+def test_selected_capability_targets_normalize_for_reusable_permission_checks():
+    selected = {
+        "provider_name": "default",
+        "provider_type": "SmartCMP",
+        "instance_name": "default",
+        "qualified_skill_name": "smartcmp:linux-vm-request",
+        "skill_name": "linux-vm-request",
+        "target_provider_instances": ["SmartCMP.default"],
+        "target_provider_types": ["SmartCMP"],
+        "target_provider_skill_names": ["default.linux-vm-request"],
+        "target_capability_classes": ["artifact:pptx", "ARTIFACT:PPTX", ""],
+        "target_tool_names": ["request_vm", "REQUEST_VM", ""],
+        "target_group_ids": ["group:smartcmp", "GROUP:SMARTCMP"],
+    }
+
+    targets = selected_capability_targets(selected)
+
+    assert targets.provider_instances == ["SmartCMP.default"]
+    assert targets.provider_types == ["SmartCMP"]
+    assert targets.provider_skill_names == ["default.linux-vm-request"]
+    assert targets.skill_names == []
+    assert targets.capability_classes == ["artifact:pptx"]
+    assert targets.tool_names == ["request_vm"]
+    assert targets.group_ids == ["group:smartcmp"]
+    assert targets.has_any() is True
+    assert selected_capability_provider_instance_ref(selected) == ("SmartCMP", "default")
+
+
+def test_selected_capability_targets_do_not_synthesize_provider_instance_target():
+    selected = {
+        "provider_name": "default",
+        "provider_type": "SmartCMP",
+        "instance_name": "default",
+        "qualified_skill_name": "smartcmp:linux-vm-request",
+        "target_skill_names": ["smartcmp:linux-vm-request"],
+    }
+
+    targets = selected_capability_targets(selected)
+
+    assert targets.provider_instances == []
+    assert targets.provider_types == []
+    assert targets.skill_names == []
+    assert targets.has_any() is False
+
+
+def test_selected_capability_targets_reject_provider_binding_with_only_tool_targets():
+    selected = {
+        "provider_name": "default",
+        "provider_type": "SmartCMP",
+        "instance_name": "default",
+        "qualified_skill_name": "smartcmp:linux-vm-request",
+        "target_tool_names": ["request_vm"],
+    }
+
+    targets = selected_capability_targets(selected)
+
+    assert targets.provider_instances == []
+    assert targets.provider_types == []
+    assert targets.provider_skill_names == []
+    assert targets.tool_names == []
+    assert targets.skill_names == []
+    assert targets.has_any() is False

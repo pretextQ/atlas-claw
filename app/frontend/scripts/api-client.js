@@ -1,0 +1,321 @@
+/*
+ *  Copyright 2026  Qianyun, Inc., www.cloudchef.io, All rights reserved.
+ */
+
+/**
+ * AtlasClaw API Client
+ * Encapsulate communication with backend API
+ */
+
+import { buildApiUrl } from './config.js';
+import { getCurrentLocale } from './i18n.js';
+
+export function buildWorkspaceFileDownloadUrl(path) {
+    const params = new URLSearchParams();
+    params.set('path', path);
+    return buildApiUrl(`/api/workspace/files/download?${params.toString()}`);
+}
+
+/**
+ * List all sessions for the current user
+ * @returns {Promise<Array>} List of sessions
+ */
+export async function listSessions() {
+    const response = await fetch(buildApiUrl('/api/sessions'), {
+        credentials: 'include'
+    });
+    
+    if (!response.ok) {
+        throw new Error(`Failed to list sessions: ${response.status}`);
+    }
+    
+    return response.json();
+}
+
+/**
+ * Create session
+ * @param {object} params - Session parameters
+ * @returns {Promise<object>} Session info { session_key, ... }
+ */
+export async function createSession(params = {}) {
+    const response = await fetch(buildApiUrl('/api/sessions'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({
+            agent_id: params.agentId || 'main',
+            channel: params.channel || 'web',
+            chat_type: params.chatType || 'dm',
+            scope: params.scope || 'main'
+        })
+    });
+    
+    if (!response.ok) {
+        throw new Error(`Failed to create session: ${response.status}`);
+    }
+    
+    return response.json();
+}
+
+/**
+ * Get public agent display metadata used by the SPA.
+ * @returns {Promise<object>} Agent info payload
+ */
+export async function getAgentInfo() {
+    const response = await fetch(buildApiUrl('/api/agent/info'), {
+        credentials: 'include'
+    });
+
+    if (!response.ok) {
+        throw new Error(`Failed to get agent info: ${response.status}`);
+    }
+
+    return response.json();
+}
+
+/**
+ * List request-visible chat slash capabilities.
+ * @returns {Promise<object>} Capability catalog payload
+ */
+export async function listAgentCapabilities() {
+    const response = await fetch(buildApiUrl('/api/agent/capabilities'), {
+        credentials: 'include'
+    });
+
+    if (!response.ok) {
+        throw new Error(`Failed to list agent capabilities: ${response.status}`);
+    }
+
+    return response.json();
+}
+
+/**
+ * Create a new independent chat thread
+ * @param {object} params - Thread parameters
+ * @returns {Promise<object>} Session info { session_key, ... }
+ */
+export async function createThreadSession(params = {}) {
+    const response = await fetch(buildApiUrl('/api/sessions/threads'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({
+            agent_id: params.agentId || 'main',
+            channel: params.channel || 'web',
+            chat_type: params.chatType || 'dm',
+            account_id: params.accountId || 'default',
+            peer_id: params.peerId || null
+        })
+    });
+
+    if (!response.ok) {
+        throw new Error(`Failed to create thread session: ${response.status}`);
+    }
+
+    return response.json();
+}
+
+/**
+ * Bootstrap one AtlasClaw Embed surface. The shared Host Cookie authenticates
+ * the request; a candidate Chat Active Session is only a localStorage pointer
+ * and is trusted only when this endpoint returns it as active_session_key.
+ *
+ * @param {object} params - Embed bootstrap fields.
+ * @returns {Promise<object>} Validated Embed profile and active chat key.
+ */
+export async function bootstrapEmbedIntegration(params) {
+    const response = await fetch(buildApiUrl('/api/embed/bootstrap'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({
+            surface: params.surface,
+            nonce: params.nonce || null,
+            candidate_session_key: params.candidateSessionKey || null
+        })
+    });
+
+    if (!response.ok) {
+        throw new Error(`Failed to bootstrap embed integration: ${response.status}`);
+    }
+    return response.json();
+}
+
+/**
+ * Resolve a normalized Host path to a server-owned context snapshot.
+ *
+ * @param {object} params - Surface, generation and normalized path.
+ * @returns {Promise<object>} Public Context object and action projection.
+ */
+export async function resolveEmbedContext(params) {
+    const response = await fetch(buildApiUrl('/api/embed/context/resolve'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({
+            surface_id: params.surfaceId,
+            generation: params.generation,
+            path: params.path
+        })
+    });
+
+    if (!response.ok) {
+        throw new Error(`Failed to resolve embed context: ${response.status}`);
+    }
+    return response.json();
+}
+
+/**
+ * Get session info
+ * @param {string} sessionKey - Session key
+ * @returns {Promise<object>} Session info
+ */
+export async function getSession(sessionKey) {
+    const response = await fetch(buildApiUrl(`/api/sessions/${encodeURIComponent(sessionKey)}`), {
+        credentials: 'include'
+    });
+    
+    if (!response.ok) {
+        throw new Error(`Failed to get session: ${response.status}`);
+    }
+    
+    return response.json();
+}
+
+/**
+ * Get persisted session history
+ * @param {string} sessionKey - Session key
+ * @returns {Promise<object>} Session history payload
+ */
+export async function getSessionHistory(sessionKey) {
+    const response = await fetch(
+        buildApiUrl(`/api/sessions/${encodeURIComponent(sessionKey)}/history`),
+        {
+            credentials: 'include'
+        }
+    );
+
+    if (!response.ok) {
+        throw new Error(`Failed to get session history: ${response.status}`);
+    }
+
+    return response.json();
+}
+
+/**
+ * Reset session
+ * @param {string} sessionKey - Session key
+ * @param {boolean} archive - Whether to archive
+ * @returns {Promise<object>} Result
+ */
+export async function resetSession(sessionKey, archive = true) {
+    const response = await fetch(buildApiUrl(`/api/sessions/${encodeURIComponent(sessionKey)}/reset`), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ archive })
+    });
+    
+    if (!response.ok) {
+        throw new Error(`Failed to reset session: ${response.status}`);
+    }
+    
+    return response.json();
+}
+
+/**
+ * Delete a session
+ * @param {string} sessionKey - Session key
+ * @returns {Promise<object>} Result
+ */
+export async function deleteSession(sessionKey) {
+    const response = await fetch(buildApiUrl(`/api/sessions/${encodeURIComponent(sessionKey)}`), {
+        method: 'DELETE',
+        credentials: 'include'
+    });
+
+    if (!response.ok) {
+        throw new Error(`Failed to delete session: ${response.status}`);
+    }
+
+    return response.json();
+}
+
+/**
+ * Start agent run
+ * @param {string} sessionKey - Session key
+ * @param {string} message - User message
+ * @returns {Promise<object>} Run info { run_id, status }
+ */
+export async function startAgentRun(sessionKey, message) {
+    const response = await fetch(buildApiUrl('/api/agent/run'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({
+            session_key: sessionKey,
+            message: message,
+            context: {
+                ui_locale: getCurrentLocale(),
+                timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || ''
+            }
+        })
+    });
+    
+    if (!response.ok) {
+        throw new Error(`Failed to start agent run: ${response.status}`);
+    }
+    
+    return response.json();
+}
+
+/**
+ * Get agent run status
+ * @param {string} runId - Run ID
+ * @returns {Promise<object>} Status info
+ */
+export async function getAgentStatus(runId) {
+    const response = await fetch(buildApiUrl(`/api/agent/runs/${runId}`), {
+        credentials: 'include'
+    });
+    
+    if (!response.ok) {
+        throw new Error(`Failed to get agent status: ${response.status}`);
+    }
+    
+    return response.json();
+}
+
+/**
+ * Abort agent run
+ * @param {string} runId - Run ID
+ * @returns {Promise<object>} Result
+ */
+export async function abortAgentRun(runId) {
+    const response = await fetch(buildApiUrl(`/api/agent/runs/${runId}/abort`), {
+        method: 'POST',
+        credentials: 'include'
+    });
+    
+    if (!response.ok) {
+        throw new Error(`Failed to abort agent run: ${response.status}`);
+    }
+    
+    return response.json();
+}
+
+export default {
+    getAgentInfo,
+    listSessions,
+    createSession,
+    createThreadSession,
+    bootstrapEmbedIntegration,
+    resolveEmbedContext,
+    getSession,
+    getSessionHistory,
+    resetSession,
+    deleteSession,
+    startAgentRun,
+    getAgentStatus,
+    abortAgentRun
+};

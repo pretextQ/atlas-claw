@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<!--
+  Copyright 2021  Qianyun, Inc. All rights reserved.
+-->
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <title data-i18n="login.title">AtlasClaw Login</title>
+  <link rel="icon" href="__ATLASCLAW_BASE_PATH__/static/favicon.ico">
+  <script>
+    window.__atlasclawBasePath = __ATLASCLAW_BASE_PATH_JSON__
+    window.__atlasclawBuildUrl = function (path) {
+      const basePath = String(window.__atlasclawBasePath || '').replace(/\/$/, '')
+      const cleanPath = String(path || '/')
+      if (!cleanPath || cleanPath === '/') {
+        return basePath ? `${basePath}/` : '/'
+      }
+      if (cleanPath.startsWith('http://') || cleanPath.startsWith('https://') || cleanPath.startsWith('//')) {
+        return cleanPath
+      }
+      const normalized = cleanPath.startsWith('/') ? cleanPath : `/${cleanPath}`
+      return `${basePath}${normalized}` || normalized
+    }
+  </script>
+  <link rel="stylesheet" href="__ATLASCLAW_BASE_PATH__/styles/login.css">
+</head>
+<body>
+  <main class="login-page">
+    <section class="login-card">
+      <header class="login-header">
+        <div class="logo-wrapper">
+          <svg class="logo" viewBox="0 0 56 56" xmlns="http://www.w3.org/2000/svg">
+            <circle cx="28" cy="28" r="28" fill="#667eea"/>
+            <text x="28" y="32" text-anchor="middle" font-size="28" font-weight="600" fill="white" font-family="Arial, sans-serif">A</text>
+          </svg>
+        </div>
+        <h1 data-i18n="login.welcome">Welcome to AtlasClaw</h1>
+        <p data-i18n="login.subtitle">Login to your account to continue</p>
+      </header>
+
+      <form id="loginForm" role="form">
+        <div class="form-group">
+          <label for="username" data-i18n="login.username">Username</label>
+          <input id="username" name="username" placeholder="Email or Username" data-i18n-placeholder="login.usernamePlaceholder" autocomplete="username" required>
+        </div>
+        <div class="form-group">
+          <label for="password" data-i18n="login.password">Password</label>
+          <div class="password-input-wrapper">
+            <input id="password" name="password" type="password" autocomplete="current-password" required>
+            <button type="button" id="passwordToggle" class="password-toggle" aria-label="Show/hide password" aria-pressed="false">
+              <svg class="eye-icon eye-open" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                <path fill="currentColor" d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z"/>
+              </svg>
+              <svg class="eye-icon eye-off" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" style="display:none">
+                <path fill="currentColor" d="M12 7c2.76 0 5 2.24 5 5 0 .65-.13 1.26-.36 1.83l2.92 2.92c1.51-1.26 2.7-2.89 3.43-4.75-1.73-4.39-6-7.5-11-7.5-1.4 0-2.74.25-3.98.7l2.16 2.16C10.74 7.13 11.35 7 12 7zM2 4.27l2.28 2.28.46.46C3.08 8.3 1.78 10.02 1 12c1.73 4.39 6 7.5 11 7.5 1.55 0 3.03-.3 4.38-.84l.42.42L19.73 22 21 20.73 3.27 3 2 4.27zM7.53 9.8l1.55 1.55c-.05.21-.08.43-.08.65 0 1.66 1.34 3 3 3 .22 0 .44-.03.65-.08l1.55 1.55c-.67.33-1.41.53-2.2.53-2.76 0-5-2.24-5-5 0-.79.2-1.53.53-2.2zm4.31-.78l3.15 3.15.02-.16c0-1.66-1.34-3-3-3l-.17.01z"/>
+              </svg>
+            </button>
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="remember-me-group">
+            <input type="checkbox" id="rememberMe" name="rememberMe" class="checkbox-input">
+            <label for="rememberMe" class="checkbox-label" data-i18n="login.rememberMe">Remember me</label>
+          </div>
+          <a href="#" class="forgot-password-link" data-i18n="login.forgotPassword">Forgot password?</a>
+        </div>
+        <button id="submitBtn" class="login-btn" type="submit" data-i18n="login.submit">Login</button>
+        <div id="errorMessage" class="error-message" role="alert"></div>
+      </form>
+
+      <footer class="login-footer">
+        <span data-i18n="login.noAccount">Don't have an account?</span>
+        <a href="#" class="signup-link" data-i18n="login.signUp">Sign Up</a>
+      </footer>
+    </section>
+  </main>
+
+  <script type="module">
+    import { checkAuth, login } from '__ATLASCLAW_BASE_PATH__/scripts/auth.js'
+    import { initI18n, t, updatePageTranslations } from '__ATLASCLAW_BASE_PATH__/scripts/i18n.js'
+
+    // Initialize i18n first (non-blocking)
+    try {
+      await initI18n()
+      updatePageTranslations()
+      const pwdToggle = document.getElementById('passwordToggle')
+      if (pwdToggle) {
+        pwdToggle.setAttribute('aria-label', t('login.togglePassword'))
+      }
+    } catch (i18nError) {
+      console.warn('[Login] i18n initialization failed:', i18nError)
+      // Continue without i18n - use default text content
+    }
+
+    const form = document.getElementById('loginForm')
+    const submitBtn = document.getElementById('submitBtn')
+    const errorMessage = document.getElementById('errorMessage')
+    const passwordInput = document.getElementById('password')
+    const passwordToggle = document.getElementById('passwordToggle')
+    const eyeOpen = passwordToggle.querySelector('.eye-open')
+    const eyeOff = passwordToggle.querySelector('.eye-off')
+
+    // Remember me restoration
+    const rememberMeCheckbox = document.getElementById('rememberMe')
+    const savedRemember = localStorage.getItem('atlasclaw_remember_me') === 'true'
+    if (savedRemember) {
+      rememberMeCheckbox.checked = true
+      const savedUsername = localStorage.getItem('atlasclaw_saved_username')
+      if (savedUsername) {
+        document.getElementById('username').value = savedUsername
+      }
+    }
+
+    // Password visibility toggle
+    passwordToggle.addEventListener('click', () => {
+      const isPassword = passwordInput.type === 'password'
+      passwordInput.type = isPassword ? 'text' : 'password'
+      passwordToggle.setAttribute('aria-pressed', isPassword ? 'true' : 'false')
+      eyeOpen.style.display = isPassword ? 'none' : ''
+      eyeOff.style.display = isPassword ? '' : 'none'
+    })
+    const params = new URLSearchParams(window.location.search)
+    const fallbackRedirect = window.__atlasclawBuildUrl('/')
+    const redirect = normalizeRedirectTarget(params.get('redirect') || fallbackRedirect)
+
+    const already = await checkAuth({ redirect: false })
+    if (already) {
+      window.location.href = redirect
+    }
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault()
+      errorMessage.textContent = ''
+
+      const username = form.username.value.trim()
+      const password = form.password.value
+      if (!username || !password) {
+        errorMessage.textContent = t('login.emptyFields')
+        return
+      }
+
+      try {
+        submitBtn.disabled = true
+        submitBtn.classList.add('loading')
+        await login(username, password)
+        if (rememberMeCheckbox.checked) {
+          localStorage.setItem('atlasclaw_remember_me', 'true')
+          localStorage.setItem('atlasclaw_saved_username', username)
+        } else {
+          localStorage.removeItem('atlasclaw_remember_me')
+          localStorage.removeItem('atlasclaw_saved_username')
+        }
+        window.location.href = redirect
+      } catch (error) {
+        errorMessage.textContent = error?.message || t('login.failed')
+      } finally {
+        submitBtn.disabled = false
+        submitBtn.classList.remove('loading')
+        submitBtn.textContent = t('login.submit')
+      }
+    })
+
+    function normalizeRedirectTarget(target) {
+      const value = String(target || '').trim()
+      const basePath = String(window.__atlasclawBasePath || '').replace(/\/$/, '')
+      if (!value) {
+        return fallbackRedirect
+      }
+      if (value.startsWith('http://') || value.startsWith('https://') || value.startsWith('//')) {
+        return fallbackRedirect
+      }
+      if (!basePath || value === basePath || value.startsWith(`${basePath}/`)) {
+        return value
+      }
+      if (value.startsWith('/')) {
+        return window.__atlasclawBuildUrl(value)
+      }
+      return window.__atlasclawBuildUrl(`/${value}`)
+    }
+  </script>
+</body>
+</html>

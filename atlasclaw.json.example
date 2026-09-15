@@ -1,0 +1,225 @@
+{
+  "_comment": "Example AtlasClaw configuration. This file stays valid JSON by using _comment fields instead of // comments.",
+  "_comment_base_path": "Optional reverse-proxy mount path for browser-visible URLs, e.g. /atlasclaw when Nginx publishes AtlasClaw under https://host/atlasclaw",
+  "base_path": "",
+  "workspace": {
+    "_comment": "Workspace configuration for runtime data and user sessions",
+    "path": "./.atlasclaw"
+  },
+  "database": {
+    "_comment": "Default sqlite. Switch type to mysql in enterprise deployments.",
+    "type": "sqlite",
+    "sqlite": {
+      "path": "./data/atlasclaw.db"
+    },
+    "mysql": {
+      "host": "${MYSQL_HOST}",
+      "port": 3306,
+      "database": "${MYSQL_DATABASE}",
+      "user": "${MYSQL_USER}",
+      "password": "${MYSQL_PASSWORD}",
+      "charset": "utf8mb4"
+    },
+    "pool_size": 5,
+    "max_overflow": 10,
+    "echo": false
+  },
+  "providers_root": "../atlasclaw-providers/providers",
+
+  "skills_root": "../atlasclaw-providers/skills",
+  "skills": {
+    "_comment": "Built-in tool registration controls. tools_exclusive removes named built-in tools or groups at startup.",
+    "tools_exclusive": []
+  },
+
+  "model": {
+    "_comment": "Token pool configuration for multi-token LLM access. Set reasoning: true for models that support thinking/reasoning output.",
+    "primary": "deepseek-main",
+    "fallbacks": [],
+    "temperature": 0.2,
+    "selection_strategy": "health",
+    "tokens": [
+      {
+        "id": "deepseek-main",
+        "provider": "deepseek",
+        "model": "deepseek-chat",
+        "base_url": "https://api.deepseek.com",
+        "api_key": "${DS_API_KEY}",
+        "api_type": "openai",
+        "priority": 100,
+        "weight": 100
+      },
+      {
+        "_comment": "Example reasoning model configuration. Enable reasoning: true for models with thinking output.",
+        "id": "deepseek-reasoner",
+        "provider": "deepseek",
+        "model": "deepseek-reasoner",
+        "base_url": "https://api.deepseek.com",
+        "api_key": "${DS_API_KEY}",
+        "api_type": "openai",
+        "reasoning": true,
+        "priority": 80,
+        "weight": 50
+      }
+    ]
+  },
+
+
+  "service_providers": {
+    "_comment": "Enterprise system instances used by skills. Instance names like dev/prod are referenced at runtime.",
+
+    "smartcmp": {
+      "_comment_auth_types": "Supported auth_type values: cookie | provider_token | user_token | credential. Use a single value or an ordered fallback chain.",
+
+      "default": {
+        "_comment": "auth_type=cookie — Embedded behind a host system. AtlasClaw reads the configured host authentication cookie from the browser automatically. No static credentials needed.",
+        "base_url": "https://172.16.0.81",
+        "auth_type": "cookie",
+        "usage_hint": "Use for the default CMP environment for service catalog, approvals, requests, deployments, and operations."
+      },
+
+      "_example_provider_token": {
+        "_comment": "auth_type=provider_token — Shared platform token configured once for all users.",
+        "base_url": "https://cmp.example.com",
+        "auth_type": "provider_token",
+        "provider_token": "${CMP_PROVIDER_TOKEN}"
+      },
+
+      "_example_cookie": {
+        "_comment": "auth_type=cookie — Use a pre-obtained static cookie token for server-to-server or testing.",
+        "base_url": "https://cmp.example.com",
+        "auth_type": "cookie",
+        "cookie": "${CMP_COOKIE}"
+      },
+
+      "_example_credential": {
+        "_comment": "auth_type=credential — Username/password login. The system will call CMP login API to obtain a session.",
+        "base_url": "https://cmp.example.com",
+        "auth_type": "credential",
+        "username": "${CMP_USERNAME}",
+        "password": "${CMP_PASSWORD}"
+      },
+
+      "_example_user_token": {
+        "_comment": "auth_type=user_token — Each user configures their own API token via the AtlasClaw UI. Only base_url is needed here.",
+        "base_url": "${CMP_URL}",
+        "auth_type": "user_token"
+      },
+
+      "_example_robot_execution": {
+        "_comment": "Robot execution profile for webhook-driven backend skills. The provider instance keeps normal user/cookie auth above; robot_auth is selected only when webhook args.robot_profile is set.",
+        "base_url": "${CMP_URL}",
+        "auth_type": "user_token",
+        "robot_auth": {
+          "preapproval_bot": {
+            "auth_type": "provider_token",
+            "provider_token": "${CMP_ROBOT_APPROVER_TOKEN}",
+            "allowed_skills": [
+              "cmp.preapproval-agent",
+              "cmp.request-decomposition-agent"
+            ]
+          }
+        }
+      }
+    },
+
+    "jira": {
+      "dev": {
+        "_comment": "Jira supports either password or token. Keep only the one you actually use.",
+        "base_url": "https://jira-dev.example.com/",
+        "username": "${JIRA_USERNAME}",
+        "password": "${JIRA_PASSWORD}",
+        "api_version": "2",
+        "default_project": "TEST"
+      }
+    },
+    
+    "markdown-vault": {
+      "knowledgebase": {
+        "vault_path": "${MARKDOWN_VAULT_REPO_PATH}",
+        "usage_hint": "Use for SmartCMP knowledge-base questions about product capabilities, configuration, integrations, deployment, operations, and implementation guidance. If a feature is not supported directly, try to search the related extensibility."
+      },
+      "atlasclaw-docs": {
+        "vault_path": "${PWD}/tests/markdown-vault-atlasclaw-docs",
+        "usage_hint": "Use for AtlasClaw function introduction, user workflows, conversations, skills, tools, and product usage documentation."
+      }
+    },
+
+    "github": {
+      "github": {
+        "base_url": "https://api.github.com",
+        "hostname": "github.com",
+        "auth_type": "user_token"
+      }
+    }
+  },
+
+  "_comment_embed_integration": "Optional default Provider for the single embedded UI. AtlasClaw matches Host page URLs only against this Provider's assistant_context/routes.json to select the page Skill. Omit this section to disable context-aware URL matching.",
+  "embed_integration": {
+    "provider_type": "smartcmp",
+    "provider_instance": "default"
+  },
+
+  "webhook": {
+    "_comment": "Inbound webhook dispatch for provider-qualified markdown skills already loaded from providers_root.",
+    "enabled": true,
+    "header_name": "X-AtlasClaw-SK",
+    "systems": [
+      {
+        "_comment": "One external caller. sk_env can be ${ENV_NAME}, a legacy env var name, or a direct shared secret.",
+        "system_id": "smartcmp-preapproval",
+        "enabled": true,
+        "sk_env": "${ATLASCLAW_WEBHOOK_SK_SMARTCMP_PREAPPROVAL}",
+        "default_agent_id": "main",
+        "allowed_skills": [
+          "cmp.preapproval-agent",
+          "cmp.request-decomposition-agent"
+        ]
+      }
+    ]
+  },
+
+  "auth": {
+    "_comment": "Optional API authentication config for normal REST/UI access. Webhook secret auth is configured separately above.",
+    "provider": "none",
+    "cache_ttl_seconds": 300,
+
+    "host_cookie": {
+      "_comment": "Header/cookie names used when an embedded host passes authenticated identity into AtlasClaw. Set these fields to the host application's cookie names.",
+      "header_name": "CloudChef-Authenticate",
+      "cookie_name": "CloudChef-Authenticate",
+      "subject_cookie_name": "userLoginId",
+      "display_name_cookie_name": "username",
+      "user_id_cookie_name": "userId",
+      "tenant_id_cookie_name": "tenant_id"
+    },
+
+    "smartcmp": {
+      "validate_url": "https://smartcmp.example.com/platform-api/auth/validate",
+      "api_base_url": "https://smartcmp.example.com"
+    },
+
+    "oidc": {
+      "_comment": "OIDC/OAuth2 configuration for Bearer token validation and SSO login flow",
+      "issuer": "https://auth.example.com",
+      "client_id": "${OIDC_CLIENT_ID}",
+      "client_secret": "${OIDC_CLIENT_SECRET}",
+      "jwks_uri": "",
+      "scopes": ["openid", "profile", "email"],
+      "_comment_sso": "SSO login flow endpoints (auto-discovered from issuer if empty)",
+      "authorization_endpoint": "",
+      "token_endpoint": "",
+      "userinfo_endpoint": "",
+      "redirect_uri": "https://atlasclaw.example.com/api/auth/callback",
+      "pkce_enabled": true,
+      "pkce_method": "S256"
+    }
+  },
+
+  "agent_defaults": {
+    "_comment": "Default agent execution settings",
+    "max_concurrent": 10,
+    "timeout_seconds": 600,
+    "max_tool_calls": 50
+  }
+}

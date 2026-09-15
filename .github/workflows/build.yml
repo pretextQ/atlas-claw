@@ -1,0 +1,283 @@
+name: Build and Push Docker Image
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Image tag (e.g. v0.6.1). Defaults to latest git tag if empty.'
+        required: false
+        type: string
+
+env:
+  REGISTRY: registry.cn-shanghai.aliyuncs.com
+  NAMESPACE: atlasclaw
+  IMAGE_NAME: atlasclaw
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.version.outputs.tag }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Determine version tag
+        id: version
+        run: |
+          IMAGE_REF="${{ env.REGISTRY }}/${{ env.NAMESPACE }}/${{ env.IMAGE_NAME }}"
+
+          if [[ "${{ github.event_name }}" == "push" && "${GITHUB_REF}" == refs/tags/* ]]; then
+            # Tag push: extract from ref (refs/tags/v0.6.1 -> v0.6.1)
+            TAG="${GITHUB_REF#refs/tags/}"
+            IMAGE_TAGS="${IMAGE_REF}:${TAG}"$'\n'"${IMAGE_REF}:latest"
+          elif [[ "${{ github.event_name }}" == "push" && "${GITHUB_REF}" == "refs/heads/main" ]]; then
+            # Main branch push: update latest only.
+            TAG="latest"
+            IMAGE_TAGS="${IMAGE_REF}:latest"
+          elif [[ -n "${{ inputs.tag }}" ]]; then
+            # Manual dispatch with explicit tag
+            TAG="${{ inputs.tag }}"
+            IMAGE_TAGS="${IMAGE_REF}:${TAG}"$'\n'"${IMAGE_REF}:latest"
+          else
+            # Manual dispatch without tag: use latest git tag
+            TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "latest")
+            IMAGE_TAGS="${IMAGE_REF}:${TAG}"$'\n'"${IMAGE_REF}:latest"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          {
+            echo "image_tags<<EOF"
+            echo "$IMAGE_TAGS"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "Resolved tag: $TAG"
+          echo "Image tags:"
+          echo "$IMAGE_TAGS"
+
+      - name: Generate default config for Docker build
+        run: |
+          mkdir -p config
+          cat > config/atlasclaw.json <<'EOF'
+          {
+            "workspace": { "path": "/app/data" },
+            "database": {
+              "type": "sqlite",
+              "sqlite": { "path": "/app/data/atlasclaw.db" }
+            },
+            "model": {
+              "primary": "deepseek-main",
+              "tokens": []
+            },
+            "providers_root": "/app/extensions/providers",
+            "skills_root": "/app/extensions/skills",
+            "channels_root": "/app/extensions/channels"
+          }
+          EOF
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Aliyun ACR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: build/Dockerfile
+          push: true
+          tags: ${{ steps.version.outputs.image_tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify image
+        run: |
+          docker pull ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.tag }}
+          docker image inspect ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.tag }}
+          echo "Image pushed successfully: ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.tag }}"
+
+  deploy-on-self-hosted:
+    name: Deploy to self-hosted runner
+    needs: build-and-push
+    runs-on: [self-hosted, linux, atlasclaw]
+
+    steps:
+      - name: Login to Aliyun ACR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Prepare deployment directories
+        run: |
+          sudo mkdir -p /opt/atlasclaw/{workspace,data,extensions/{providers,skills,channels}}
+          sudo chown -R "$(id -u):$(id -g)" /opt/atlasclaw
+
+      - name: Download compose and extensions with curl (with fallback)
+        run: |
+          set -euo pipefail
+          cd /opt/atlasclaw
+
+          if ! curl --retry 3 --retry-delay 3 --connect-timeout 10 -fL -o docker-compose.yml \
+            https://raw.githubusercontent.com/CloudChef/atlasclaw/main/build/docker-compose.yml; then
+            if [[ ! -f /opt/atlasclaw/docker-compose.yml ]]; then
+              echo "Failed to download docker-compose.yml and local file not found" >&2
+              exit 1
+            fi
+            echo "Using existing /opt/atlasclaw/docker-compose.yml"
+          fi
+
+          cd /opt/atlasclaw/extensions
+          if curl --retry 3 --retry-delay 3 --connect-timeout 10 -fL -o atlasclaw-providers.zip \
+            https://github.com/CloudChef/atlasclaw-providers/archive/refs/heads/main.zip; then
+            # Check if unzip is available
+            if ! command -v unzip &> /dev/null; then
+              echo "ERROR: unzip command not found. Please install unzip: sudo apt-get install unzip (or yum install unzip)" >&2
+              rm -f atlasclaw-providers.zip
+              exit 1
+            fi
+
+            # Clean up old temp directory
+            rm -rf atlasclaw-providers-main
+
+            # Extract zip
+            if ! unzip -o atlasclaw-providers.zip; then
+              echo "ERROR: Failed to extract atlasclaw-providers.zip" >&2
+              rm -f atlasclaw-providers.zip
+              exit 1
+            fi
+            rm -f atlasclaw-providers.zip
+
+            # Verify extracted directory exists
+            if [[ ! -d atlasclaw-providers-main ]]; then
+              echo "ERROR: Expected directory 'atlasclaw-providers-main' not found after extraction" >&2
+              exit 1
+            fi
+
+            # Copy files to extensions directories
+            if [[ -d atlasclaw-providers-main/providers ]]; then
+              cp -r atlasclaw-providers-main/providers/* ./providers/ 2>/dev/null || true
+            fi
+            if [[ -d atlasclaw-providers-main/skills ]]; then
+              cp -r atlasclaw-providers-main/skills/* ./skills/ 2>/dev/null || true
+            fi
+            if [[ -d atlasclaw-providers-main/channels ]]; then
+              cp -r atlasclaw-providers-main/channels/* ./channels/ 2>/dev/null || true
+            fi
+
+            # Clean up
+            rm -rf atlasclaw-providers-main
+            echo "Extensions updated successfully"
+          else
+            echo "Failed to download providers zip, keep existing extension directories"
+          fi
+
+      - name: Initialize atlasclaw.json if missing
+        env:
+          ATLASCLAW_MODEL_API_KEY: ${{ secrets.ATLASCLAW_MODEL_API_KEY }}
+          ATLASCLAW_JWT_SECRET: ${{ secrets.ATLASCLAW_JWT_SECRET }}
+        run: |
+          set -euo pipefail
+
+          CONFIG_PATH="/opt/atlasclaw/workspace/atlasclaw.json"
+          if [[ -f "$CONFIG_PATH" ]]; then
+            echo "atlasclaw.json exists, keeping current configuration."
+            exit 0
+          fi
+
+          if [[ -z "${ATLASCLAW_MODEL_API_KEY:-}" ]]; then
+            echo "ATLASCLAW_MODEL_API_KEY secret is required for deployment." >&2
+            exit 1
+          fi
+
+          JWT_SECRET="${ATLASCLAW_JWT_SECRET:-atlasclaw-docker-secret-CHANGE-ME}"
+          if [[ -z "${ATLASCLAW_JWT_SECRET:-}" ]]; then
+            echo "ATLASCLAW_JWT_SECRET not set, using default placeholder; change it after first deploy." >&2
+          fi
+
+          cat > "$CONFIG_PATH" <<EOF
+          {
+            "workspace": {
+              "path": "/app/workspace"
+            },
+            "database": {
+              "type": "sqlite",
+              "sqlite": {
+                "path": "/app/data/atlasclaw.db"
+              }
+            },
+            "providers_root": "/app/extensions/providers",
+            "skills_root": "/app/extensions/skills",
+            "channels_root": "/app/extensions/channels",
+            "model": {
+              "primary": "deepseek-main",
+              "fallbacks": [],
+              "temperature": 0.2,
+              "tokens": [
+                {
+                  "id": "deepseek-main",
+                  "provider": "deepseek",
+                  "model": "deepseek-chat",
+                  "base_url": "https://api.deepseek.com",
+                  "api_key": "${ATLASCLAW_MODEL_API_KEY}",
+                  "api_type": "openai"
+                }
+              ]
+            },
+            "auth": {
+              "provider": "local",
+              "local": {
+                "enabled": true,
+                "default_admin_username": "admin",
+                "default_admin_password": "admin"
+              },
+              "jwt": {
+                "secret_key": "${JWT_SECRET}",
+                "expires_minutes": 480
+              }
+            }
+          }
+          EOF
+          chmod 600 "$CONFIG_PATH"
+
+      - name: Pull and deploy latest image
+        run: |
+          set -euo pipefail
+          cd /opt/atlasclaw
+
+          IMAGE="${{ env.REGISTRY }}/${{ env.NAMESPACE }}/${{ env.IMAGE_NAME }}:${{ needs.build-and-push.outputs.image_tag }}"
+          docker pull "$IMAGE"
+          docker tag "$IMAGE" "${{ env.REGISTRY }}/${{ env.NAMESPACE }}/${{ env.IMAGE_NAME }}:latest"
+
+          docker compose up -d
+          docker compose ps
+
+      - name: Health check
+        run: |
+          set -euo pipefail
+
+          for i in {1..45}; do
+            status=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' atlasclaw 2>/dev/null || echo "missing")
+            echo "atlasclaw status: ${status}"
+            if [[ "${status}" == "healthy" || "${status}" == "running" ]]; then
+              echo "Health check passed"
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo "Health check failed after waiting for container readiness" >&2
+          docker compose -f /opt/atlasclaw/docker-compose.yml ps || true
+          docker compose -f /opt/atlasclaw/docker-compose.yml logs --tail=200 atlasclaw || true
+          exit 1

@@ -1,0 +1,75 @@
+# GitHub Actions Self-Hosted Runner (Docker Compose)
+# Directory: build/github-runner
+
+services:
+  github-runner:
+    image: myoung34/github-runner:latest
+    container_name: github-runner
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # GitHub target (one of REPO_URL / ORG_NAME / ENTERPRISE_NAME)
+      REPO_URL: ${REPO_URL:-}
+      ORG_NAME: ${ORG_NAME:-}
+      ENTERPRISE_NAME: ${ENTERPRISE_NAME:-}
+
+      # Registration method (RUNNER_TOKEN for repo, ACCESS_TOKEN for auto registration)
+      RUNNER_TOKEN: ${RUNNER_TOKEN:-}
+      ACCESS_TOKEN: ${ACCESS_TOKEN:-}
+
+      # Runner identity / behavior
+      RUNNER_NAME: ${RUNNER_NAME:-atlasclaw-runner}
+      RUNNER_NAME_PREFIX: ${RUNNER_NAME_PREFIX:-runner}
+      RUNNER_WORKDIR: ${RUNNER_WORKDIR:-/tmp/github-runner-workdir}
+      RUNNER_GROUP: ${RUNNER_GROUP:-Default}
+      RUNNER_SCOPE: ${RUNNER_SCOPE:-repo}
+      LABELS: ${LABELS:-self-hosted,linux,x64,docker}
+      NO_DEFAULT_LABELS: ${NO_DEFAULT_LABELS:-false}
+      RUN_AS_ROOT: ${RUN_AS_ROOT:-true}
+      EPHEMERAL: ${EPHEMERAL:-false}
+      DISABLE_AUTO_UPDATE: ${DISABLE_AUTO_UPDATE:-false}
+      UNSET_CONFIG_VARS: ${UNSET_CONFIG_VARS:-true}
+
+      # Runtime and diagnostics
+      TZ: ${TZ:-Asia/Shanghai}
+      DOCKER_HOST: unix:///var/run/docker.sock
+      GITHUB_HOST: ${GITHUB_HOST:-github.com}
+      START_DOCKER_SERVICE: ${START_DOCKER_SERVICE:-false}
+      DEBUG_ONLY: ${DEBUG_ONLY:-false}
+      DEBUG_OUTPUT: ${DEBUG_OUTPUT:-false}
+      CONFIGURED_ACTIONS_RUNNER_FILES_DIR: ${CONFIGURED_ACTIONS_RUNNER_FILES_DIR:-/runner/data}
+
+    volumes:
+      # Docker-in-Docker via host socket (required for docker build/run in jobs)
+      - /var/run/docker.sock:/var/run/docker.sock
+      - runner-data:${CONFIGURED_ACTIONS_RUNNER_FILES_DIR:-/runner/data}
+      # Persist runner work and cache to speed up repeated workflows
+      - runner-workdir:${RUNNER_WORKDIR:-/tmp/github-runner-workdir}
+      - runner-cache:/tmp/runner-cache
+
+    # Docker Compose local runtime resource controls
+    mem_limit: ${MEMORY_LIMIT:-4g}
+    mem_reservation: ${MEMORY_RESERVATION:-2g}
+    cpus: ${CPU_LIMIT:-2}
+
+    logging:
+      driver: json-file
+      options:
+        max-size: ${LOG_MAX_SIZE:-100m}
+        max-file: ${LOG_MAX_FILE:-5}
+
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f Runner.Listener >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+volumes:
+  runner-data:
+    driver: local
+  runner-workdir:
+    driver: local
+  runner-cache:
+    driver: local

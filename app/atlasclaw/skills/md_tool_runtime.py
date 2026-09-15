@@ -1,0 +1,1077 @@
+# -*- coding: utf-8 -*-
+# Copyright 2026  Qianyun, Inc., www.cloudchef.io, All rights reserved.
+
+"""Runtime helpers for executable tools declared in markdown skills."""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import importlib.util
+import inspect
+import json
+import os
+import sys
+from functools import wraps
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable, Optional
+
+from app.atlasclaw.agent.runner_tool.runner_tool_result_mode import should_hide_lookup_output
+from app.atlasclaw.core.trace import sanitize_log_value
+from app.atlasclaw.tools.providers.instance_tools import (
+    resolve_provider_instance_selection,
+)
+from app.atlasclaw.tools.work_dir_guard import contains_home_relative_path
+
+
+@dataclass(frozen=True)
+class ScriptInvocationConfig:
+    """Metadata-driven script invocation hints for markdown executable tools."""
+
+    positional_args: tuple[str, ...] = ()
+    split_args: tuple[str, ...] = ()
+    flag_name_overrides: dict[str, str] = field(default_factory=dict)
+    timeout_seconds: float = 120
+    max_output_bytes: int = 2 * 1024 * 1024
+    request_cookie_only: bool = False
+
+
+def parse_entrypoint(entrypoint: str) -> tuple[str, str]:
+    """Parse module entrypoint into (module_path, attr_name)."""
+    if ":" in entrypoint:
+        module_path, attr_name = entrypoint.rsplit(":", 1)
+        return module_path.strip(), attr_name.strip() or "handler"
+    return entrypoint.strip(), "handler"
+
+
+def should_override_location(existing_location: str, new_location: str) -> bool:
+    """Return whether new location should override existing by priority."""
+    priority = {"built-in": 0, "external": 1, "user": 2, "workspace": 3}
+    return priority.get(new_location, 0) >= priority.get(existing_location, 0)
+
+
+def _format_log_value(
+    key: str,
+    value: Any,
+    *,
+    provider_type: Optional[str] = None,
+    config: Optional[dict[str, Any]] = None,
+) -> str:
+    sanitized = sanitize_log_value(
+        {str(key): value},
+        redacted_text="***...",
+        provider_type=provider_type,
+        field_defaults=config,
+    )
+    if isinstance(sanitized, dict) and sanitized.get(str(key)) == "***...":
+        return "***..."
+    return f"{str(value)[:50]}..."
+
+
+def load_handler_from_file(
+    py_file: Path,
+    attr_name: str,
+    provider_type: Optional[str] = None,
+    invocation_config: Optional[ScriptInvocationConfig] = None,
+    *,
+    tool_name: str = "",
+    result_mode: str = "",
+    success_contract: dict[str, Any] | None = None,
+) -> Callable:
+    """Load callable handler from file or fallback to script wrapper."""
+    scripts_dir = str(py_file.parent)
+    inserted = False
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+        inserted = True
+
+    try:
+        if attr_name == "handler":
+            return create_script_wrapper(
+                py_file,
+                provider_type,
+                invocation_config=invocation_config,
+                tool_name=tool_name,
+                result_mode=result_mode,
+                success_contract=success_contract,
+            )
+
+        module_hash = hashlib.sha1(str(py_file).encode("utf-8")).hexdigest()[:12]
+        module_name = f"atlasclaw_md_skill_{module_hash}_{py_file.stem}"
+        spec = importlib.util.spec_from_file_location(module_name, py_file)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Cannot load module from {py_file}")
+
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        handler = getattr(module, attr_name, None)
+        if handler is not None and callable(handler):
+            return _wrap_function_handler_with_provider_guard(
+                handler,
+                provider_type=provider_type,
+                tool_name=tool_name or py_file.stem,
+            )
+        return create_script_wrapper(
+            py_file,
+            provider_type,
+            invocation_config=invocation_config,
+            tool_name=tool_name,
+            result_mode=result_mode,
+            success_contract=success_contract,
+        )
+    finally:
+        if inserted:
+            try:
+                sys.path.remove(scripts_dir)
+            except ValueError:
+                pass
+
+
+def _wrap_function_handler_with_provider_guard(
+    handler: Callable,
+    *,
+    provider_type: Optional[str],
+    tool_name: str,
+) -> Callable:
+    """Revalidate Embed scope before a function-style Provider Tool executes."""
+    if not str(provider_type or "").strip():
+        return handler
+
+    @wraps(handler)
+    async def guarded_handler(*args: Any, **kwargs: Any) -> Any:
+        ctx = kwargs.get("ctx")
+        if ctx is None and args and hasattr(args[0], "deps"):
+            ctx = args[0]
+        deps = getattr(ctx, "deps", None) if ctx is not None else None
+        extra = getattr(deps, "extra", None)
+        provider_io_guard = (
+            extra.get("_provider_io_guard") if isinstance(extra, dict) else None
+        )
+        if callable(provider_io_guard):
+            guard_result = provider_io_guard(str(tool_name or "").strip())
+            if inspect.isawaitable(guard_result):
+                await guard_result
+        result = handler(*args, **kwargs)
+        return await result if inspect.isawaitable(result) else result
+
+    return guarded_handler
+
+
+def create_script_wrapper(
+    py_file: Path,
+    provider_type: Optional[str] = None,
+    *,
+    invocation_config: Optional[ScriptInvocationConfig] = None,
+    tool_name: str = "",
+    result_mode: str = "",
+    success_contract: dict[str, Any] | None = None,
+) -> Callable:
+    """Create a wrapper function that executes a script file."""
+    config = invocation_config or ScriptInvocationConfig()
+
+    def _provider_bucket(extra: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        target_provider = str(provider_type or "").strip()
+        provider_instances = extra.get("provider_instances")
+        if not target_provider or not isinstance(provider_instances, dict):
+            return {}
+
+        bucket = provider_instances.get(target_provider)
+        if not isinstance(bucket, dict):
+            bucket = provider_instances.get(target_provider.lower())
+        if not isinstance(bucket, dict):
+            return {}
+
+        return {
+            str(instance_name): dict(instance_config)
+            for instance_name, instance_config in bucket.items()
+            if str(instance_name or "").strip() and isinstance(instance_config, dict)
+        }
+
+    def _selected_provider_config(
+        extra: dict[str, Any],
+        provider_resolution: Any,
+    ) -> dict[str, dict[str, dict[str, Any]]]:
+        provider_type_name = str(
+            getattr(provider_resolution, "provider_type", "") or ""
+        ).strip()
+        instance_name = str(getattr(provider_resolution, "instance_name", "") or "").strip()
+        provider_instance = extra.get("provider_instance")
+        if (
+            not provider_type_name
+            or not instance_name
+            or not isinstance(provider_instance, dict)
+        ):
+            return {}
+        selected_instance = dict(provider_instance)
+        if config.request_cookie_only:
+            selected_instance = {
+                key: selected_instance[key]
+                for key in ("base_url", "timeout")
+                if key in selected_instance
+            }
+        return {
+            provider_type_name: {
+                instance_name: selected_instance,
+            }
+        }
+
+    async def script_handler(ctx=None, **kwargs) -> dict:
+        runtime_kwargs = dict(kwargs)
+        if config.request_cookie_only:
+            # Resolver processes receive a deliberately small, provider-neutral
+            # environment. This is an authorization boundary, so unknown future
+            # credential variables must not pass through by default.
+            inherited_keys = (
+                "PATH",
+                "LANG",
+                "LC_ALL",
+                "LC_CTYPE",
+                "PYTHONPATH",
+                "PYTHONHOME",
+                "VIRTUAL_ENV",
+                "TMPDIR",
+                "SSL_CERT_FILE",
+                "SSL_CERT_DIR",
+                "REQUESTS_CA_BUNDLE",
+            )
+            env = {
+                key: os.environ[key]
+                for key in inherited_keys
+                if key in os.environ
+            }
+        else:
+            env = os.environ.copy()
+        # Request context must not inherit a service-level display timezone.
+        env.pop("ATLASCLAW_TIMEZONE", None)
+        env.setdefault("PYTHONIOENCODING", "utf-8")
+        env.setdefault("PYTHONUTF8", "1")
+        deps = getattr(ctx, "deps", None) if ctx is not None else None
+        extra = deps.extra if deps is not None and isinstance(getattr(deps, "extra", None), dict) else {}
+        normalized_tool_name = str(tool_name or py_file.stem).strip()
+        user_info = getattr(deps, "user_info", None)
+        user_id = str(getattr(user_info, "user_id", "") or "").strip()
+        if user_id:
+            env.setdefault("ATLASCLAW_USER_ID", user_id)
+
+        if deps is not None and hasattr(deps, "cookies"):
+            cookies = deps.cookies
+            if cookies:
+                try:
+                    env["ATLASCLAW_COOKIES"] = json.dumps(cookies)
+                    if user_info:
+                        print(
+                            f"[DEBUG] Set ATLASCLAW_COOKIES for user={user_id}, "
+                            f"cookies={list(cookies.keys())}"
+                        )
+                except (TypeError, ValueError) as exc:
+                    print(f"[WARNING] Failed to serialize cookies: {exc}")
+
+        if deps is not None and hasattr(deps, "extra"):
+            extra = deps.extra
+            request_context = extra.get("context") if isinstance(extra, dict) else None
+            request_timezone = (
+                str(request_context.get("timezone", "") or "").strip()
+                if isinstance(request_context, dict)
+                else ""
+            )
+            if request_timezone and request_timezone.isprintable():
+                env["ATLASCLAW_TIMEZONE"] = request_timezone
+            provider_resolution = resolve_provider_instance_selection(
+                provider_type=str(provider_type or ""),
+                instances=_provider_bucket(extra),
+                extra=extra,
+                deps=deps,
+            )
+            if not provider_resolution.resolved:
+                for _ in range(10):
+                    await asyncio.sleep(0.05)
+                    provider_resolution = resolve_provider_instance_selection(
+                        provider_type=str(provider_type or ""),
+                        instances=_provider_bucket(extra),
+                        extra=extra,
+                        deps=deps,
+                    )
+                    if provider_resolution.resolved:
+                        break
+            if not provider_resolution.resolved:
+                return {
+                    "success": False,
+                    "error": "Provider instance selection required",
+                    "output": provider_resolution.error_text,
+                }
+            provider_config = _selected_provider_config(extra, provider_resolution)
+            if provider_config:
+                try:
+                    env["ATLASCLAW_PROVIDER_CONFIG"] = json.dumps(provider_config)
+                    print(
+                        "[DEBUG] Set ATLASCLAW_PROVIDER_CONFIG with providers: "
+                        f"{list(provider_config.keys())}"
+                    )
+                except (TypeError, ValueError) as exc:
+                    print(f"[WARNING] Failed to serialize provider_config: {exc}")
+
+        if deps is not None and hasattr(deps, "extra"):
+            extra = deps.extra
+            print(
+                "[DEBUG] Tool execution: "
+                f"tool_name={normalized_tool_name}, provider_type={provider_type}"
+            )
+            print(f"[DEBUG] ctx.deps.extra keys: {list(extra.keys())}")
+
+            # Provider scripts consume these canonical selectors to fail closed
+            # on the exact instance/profile chosen for this run.
+            provider_type_meta = str(extra.get("provider_type", "") or "").strip()
+            provider_instance_meta = str(
+                extra.get("provider_instance_name", "") or ""
+            ).strip()
+            robot_profile_meta = str(extra.get("robot_profile", "") or "").strip()
+            if provider_type_meta:
+                env["ATLASCLAW_PROVIDER_TYPE"] = provider_type_meta
+            if provider_instance_meta:
+                env["ATLASCLAW_PROVIDER_INSTANCE"] = provider_instance_meta
+            if robot_profile_meta:
+                env["ATLASCLAW_ROBOT_PROFILE"] = robot_profile_meta
+
+            provider_sso_token = (
+                ""
+                if config.request_cookie_only
+                else str(extra.get("provider_sso_token", "") or "").strip()
+            )
+            provider_sso_available = bool(extra.get("provider_sso_available")) and bool(
+                provider_sso_token
+            )
+            env["ATLASCLAW_PROVIDER_SSO_AVAILABLE"] = "1" if provider_sso_available else "0"
+            if provider_sso_available:
+                env["ATLASCLAW_PROVIDER_SSO_TOKEN"] = provider_sso_token
+                print("[DEBUG] Set env var: ATLASCLAW_PROVIDER_SSO_TOKEN=***...")
+
+            provider_cookie_token = (
+                ""
+                if config.request_cookie_only
+                else str(extra.get("provider_cookie_token", "") or "").strip()
+            )
+            provider_cookie_available = bool(extra.get("provider_cookie_available")) and bool(
+                provider_cookie_token
+            )
+            env["ATLASCLAW_PROVIDER_COOKIE_AVAILABLE"] = (
+                "1" if provider_cookie_available else "0"
+            )
+            if provider_cookie_available:
+                env["ATLASCLAW_PROVIDER_COOKIE_TOKEN"] = provider_cookie_token
+                print("[DEBUG] Set env var: ATLASCLAW_PROVIDER_COOKIE_TOKEN=***...")
+
+            provider_instance = extra.get("provider_instance")
+            if provider_instance and not config.request_cookie_only:
+                safe_provider_instance = sanitize_log_value(
+                    provider_instance,
+                    redacted_text="***...",
+                    provider_type=str(provider_type or ""),
+                    field_defaults=provider_instance,
+                )
+                print(
+                    "[DEBUG] Using selected provider_instance: "
+                    f"{safe_provider_instance}"
+                )
+                for key, value in provider_instance.items():
+                    if value is not None and key not in ("token", "secret"):
+                        env[key.upper()] = str(value)
+                        formatted_value = _format_log_value(
+                            key,
+                            value,
+                            provider_type=provider_type,
+                            config=provider_instance,
+                        )
+                        print(
+                            "[DEBUG] Set env var: "
+                            f"{key.upper()}={formatted_value}"
+                        )
+        for key, value in runtime_kwargs.items():
+            if value is not None:
+                env[key.upper()] = str(value)
+
+        # Auto-inject active internal_request_trace_id so downstream scripts
+        # can associate their metadata with the current request flow instance.
+        if deps is not None and hasattr(deps, "extra"):
+            extra = deps.extra
+            if isinstance(extra, dict):
+                _trace_id = extra.get("active_internal_request_trace_id")
+                if isinstance(_trace_id, str) and _trace_id.strip():
+                    env.setdefault("INTERNAL_REQUEST_TRACE_ID", _trace_id.strip())
+
+        if py_file.suffix == ".py":
+            cmd = [sys.executable, str(py_file)]
+        elif py_file.suffix in [".sh", ".bash"]:
+            cmd = ["bash", str(py_file)]
+        elif py_file.suffix == ".ps1":
+            cmd = ["powershell", "-File", str(py_file)]
+        else:
+            cmd = [str(py_file)]
+
+        cmd.extend(_build_script_command_arguments(kwargs=runtime_kwargs, config=config))
+
+        try:
+            provider_io_guard = (
+                extra.get("_provider_io_guard")
+                if isinstance(extra, dict)
+                else None
+            )
+            if callable(provider_io_guard):
+                guard_result = provider_io_guard(normalized_tool_name)
+                if inspect.isawaitable(guard_result):
+                    await guard_result
+
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+                cwd=str(py_file.parent),
+            )
+            output_size = 0
+
+            async def read_limited(stream: asyncio.StreamReader) -> bytes:
+                nonlocal output_size
+                chunks: list[bytes] = []
+                while True:
+                    chunk = await stream.read(64 * 1024)
+                    if not chunk:
+                        return b"".join(chunks)
+                    output_size += len(chunk)
+                    if output_size > int(config.max_output_bytes):
+                        raise OverflowError("Script output exceeded the configured limit")
+                    chunks.append(chunk)
+
+            stdout_task = asyncio.create_task(read_limited(process.stdout))
+            stderr_task = asyncio.create_task(read_limited(process.stderr))
+            wait_task = asyncio.create_task(process.wait())
+
+            async def stop_process() -> None:
+                for task in (stdout_task, stderr_task, wait_task):
+                    if not task.done():
+                        task.cancel()
+                if process.returncode is None:
+                    process.kill()
+                await asyncio.gather(
+                    stdout_task,
+                    stderr_task,
+                    wait_task,
+                    return_exceptions=True,
+                )
+                if process.returncode is None:
+                    await process.wait()
+
+            try:
+                stdout_bytes, stderr_bytes, _ = await asyncio.wait_for(
+                    asyncio.gather(stdout_task, stderr_task, wait_task),
+                    timeout=float(config.timeout_seconds),
+                )
+            except asyncio.TimeoutError:
+                await stop_process()
+                return {"success": False, "error": "Script execution timed out"}
+            except OverflowError as exc:
+                await stop_process()
+                return {"success": False, "error": str(exc)}
+            except asyncio.CancelledError:
+                await stop_process()
+                raise
+
+            output = stdout_bytes.decode("utf-8", errors="replace")
+            stderr_text = stderr_bytes.decode("utf-8", errors="replace")
+            _internal_meta = ""
+            if stderr_text:
+                # Separate META blocks from error messages in stderr.
+                # META blocks (##xxx_META_START## ... ##xxx_META_END##) are
+                # placed in a separate "_internal" field so the LLM can
+                # read them for subsequent tool calls without displaying
+                # raw data to users (avoids <tool_meta> tag echoing).
+                import re as _re
+                _meta_blocks: list[str] = []
+                _other_stderr: list[str] = []
+                _in_meta = False
+                _meta_buf: list[str] = []
+                for _line in stderr_text.splitlines():
+                    if _re.match(r"^##\w+_META_START##$", _line.strip()):
+                        _in_meta = True
+                        _meta_buf = []
+                        continue
+                    if _re.match(r"^##\w+_META_END##$", _line.strip()):
+                        _in_meta = False
+                        if _meta_buf:
+                            _meta_blocks.append("\n".join(_meta_buf))
+                        continue
+                    if _in_meta:
+                        _meta_buf.append(_line)
+                    else:
+                        _other_stderr.append(_line)
+
+                if _meta_blocks:
+                    _internal_meta = "\n".join(_meta_blocks)
+                if _other_stderr:
+                    output += f"\n[STDERR] {''.join(_other_stderr)}"
+            result_dict = {
+                "success": process.returncode == 0,
+                "returncode": process.returncode,
+                "output": output,
+            }
+            if _internal_meta:
+                result_dict["_internal"] = _internal_meta
+            result_dict = _normalize_script_result(
+                py_file=py_file,
+                provider_type=provider_type,
+                tool_name=tool_name,
+                result_mode=result_mode,
+                success_contract=success_contract,
+                result=result_dict,
+            )
+            return result_dict
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+
+    return script_handler
+
+
+def _normalize_script_result(
+    *,
+    py_file: Path,
+    provider_type: Optional[str],
+    tool_name: str,
+    result_mode: str,
+    success_contract: dict[str, Any] | None,
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    """Apply generic normalization to script output before returning it to the runtime."""
+    del py_file, tool_name
+    normalized = dict(result)
+    output = normalized.get("output")
+    if not isinstance(output, str):
+        return normalized
+
+    normalized["output"] = output.replace("\r\n", "\n")
+    normalized["output"] = _normalize_provider_auth_failure_output(
+        output=normalized["output"],
+        provider_type=provider_type,
+        success=bool(normalized.get("success")),
+    )
+    if should_hide_lookup_output(
+        result_mode=result_mode,
+        success_contract=success_contract,
+        result=normalized,
+    ):
+        # Keep workflow metadata for follow-up tool calls, but hide scaffolding
+        # like "Found N ..." from the model during same-turn continuation.
+        normalized["output"] = ""
+        normalized["_lookup_output_hidden"] = True
+    return normalized
+
+
+def _normalize_provider_auth_failure_output(
+    *,
+    output: str,
+    provider_type: Optional[str],
+    success: bool,
+) -> str:
+    if success or not str(provider_type or "").strip():
+        return output
+    lowered = output.lower()
+    if not any(
+        marker in lowered
+        for marker in (
+            "401 client error",
+            "403 client error",
+            "http 401",
+            "http 403",
+            "status 401",
+            "status 403",
+            "401 unauthorized",
+            "403 forbidden",
+        )
+    ):
+        return output
+    return (
+        "[ERROR] Provider authentication failed. The provider service rejected "
+        "or expired the configured authentication credential.\n"
+    )
+
+
+def register_executable_tools_from_md(
+    *,
+    registry: Any,
+    entry: Any,
+    skill_metadata_cls: Any,
+    logger: Any,
+) -> None:
+    """Register executable tools declared in markdown skill metadata."""
+    skill_dir = Path(entry.file_path).parent
+    metadata = entry.metadata if isinstance(entry.metadata, dict) else {}
+
+    registered: set[str] = set()
+
+    single_tool_name = str(metadata.get("tool_name", "")).strip()
+    single_entrypoint = str(metadata.get("entrypoint", "")).strip()
+    if single_tool_name and single_entrypoint:
+        _register_md_tool_entry(
+            registry=registry,
+            skill_metadata_cls=skill_metadata_cls,
+            logger=logger,
+            tool_name=single_tool_name,
+            entrypoint=single_entrypoint,
+            tool_id="default",
+            entry=entry,
+            skill_dir=skill_dir,
+            registered=registered,
+        )
+
+    ids: set[str] = set()
+    for key in metadata.keys():
+        if key.startswith("tool_") and key.endswith("_name"):
+            ids.add(key[len("tool_") : -len("_name")])
+        elif key.startswith("tool_") and key.endswith("_entrypoint"):
+            ids.add(key[len("tool_") : -len("_entrypoint")])
+
+    for tool_id in sorted(ids):
+        tool_name = str(metadata.get(f"tool_{tool_id}_name", "")).strip()
+        entrypoint = str(metadata.get(f"tool_{tool_id}_entrypoint", "")).strip()
+        tool_description = str(metadata.get(f"tool_{tool_id}_description", "")).strip()
+        if not tool_name or not entrypoint:
+            logger.warning(
+                "Skipping md tool declaration for skill %s: incomplete pair for id '%s'",
+                entry.name,
+                tool_id,
+            )
+            continue
+
+        _register_md_tool_entry(
+            registry=registry,
+            skill_metadata_cls=skill_metadata_cls,
+            logger=logger,
+            tool_name=tool_name,
+            entrypoint=entrypoint,
+            tool_description=tool_description,
+            tool_id=tool_id,
+            entry=entry,
+            skill_dir=skill_dir,
+            registered=registered,
+        )
+
+    if registered:
+        registry._md_skill_tools[entry.qualified_name] = registered
+
+
+def _register_md_tool_entry(
+    *,
+    registry: Any,
+    skill_metadata_cls: Any,
+    logger: Any,
+    tool_name: str,
+    entrypoint: str,
+    entry: Any,
+    skill_dir: Path,
+    registered: set[str],
+    tool_description: str = "",
+    tool_id: str = "",
+) -> None:
+    module_path, attr_name = parse_entrypoint(entrypoint)
+    py_file = (skill_dir / module_path).resolve()
+    if not py_file.is_file():
+        logger.warning(
+            "Skipping md tool %s from %s: entrypoint file not found: %s",
+            tool_name,
+            entry.name,
+            py_file,
+        )
+        return
+
+    metadata = entry.metadata if isinstance(entry.metadata, dict) else {}
+    provider_type = str(metadata.get("provider_type", "")).strip() or entry.provider or None
+    capability_class = _extract_capability_class(metadata, provider_type, tool_id=tool_id)
+    result_mode = _extract_result_mode(metadata, tool_id=tool_id)
+    if _capability_is_artifact(capability_class) and result_mode == "llm":
+        result_mode = "tool_only_ok"
+    success_contract = _extract_success_contract(metadata, tool_id=tool_id)
+    try:
+        invocation_config = _extract_script_invocation_config(metadata, tool_id=tool_id)
+        handler = load_handler_from_file(
+            py_file,
+            attr_name,
+            provider_type,
+            invocation_config=invocation_config,
+            tool_name=tool_name,
+            result_mode=result_mode,
+            success_contract=success_contract,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Skipping md tool %s from %s: failed loading handler %s (%s)",
+            tool_name,
+            entry.name,
+            entrypoint,
+            exc,
+        )
+        return
+
+    description = tool_description if tool_description else entry.description
+    group_ids = _extract_group_ids(metadata, entry.provider, tool_id=tool_id)
+    priority = _extract_priority(metadata, tool_id=tool_id)
+    parameters_schema = _extract_parameters_schema(metadata, tool_id=tool_id)
+    source = "provider" if provider_type else "md_skill"
+    if _capability_is_artifact(capability_class):
+        handler = _wrap_artifact_handler(handler, capability_class=capability_class)
+    meta = skill_metadata_cls(
+        name=tool_name,
+        description=description,
+        category=str(metadata.get("category", "skill")),
+        location=entry.location,
+        provider_type=provider_type,
+        instance_required=str(metadata.get("instance_required", "")).lower() in ("1", "true", "yes"),
+        source=source,
+        group_ids=group_ids,
+        capability_class=capability_class,
+        priority=priority,
+        parameters_schema=parameters_schema,
+        aliases=_extract_string_sequence(
+            metadata.get(f"tool_{tool_id}_aliases") if tool_id else metadata.get("aliases")
+        ),
+        keywords=_extract_string_sequence(
+            metadata.get(f"tool_{tool_id}_keywords") if tool_id else metadata.get("triggers")
+        ),
+        use_when=_extract_string_sequence(
+            metadata.get(f"tool_{tool_id}_use_when") if tool_id else metadata.get("use_when")
+        ),
+        avoid_when=_extract_string_sequence(
+            metadata.get(f"tool_{tool_id}_avoid_when") if tool_id else metadata.get("avoid_when")
+        ),
+        result_mode=result_mode,
+        success_contract=success_contract,
+    )
+    registry.register(meta, handler)
+    registry._md_tool_owners[tool_name] = entry.qualified_name
+    registered.add(tool_name)
+
+
+def _wrap_artifact_handler(handler: Callable, *, capability_class: str) -> Callable:
+    """Apply minimal filename guarding for artifact-producing skill handlers."""
+    if not _capability_is_artifact(capability_class):
+        return handler
+
+    async def artifact_handler(ctx=None, **kwargs) -> dict[str, Any]:
+        if _artifact_user_requested_home_relative_output(ctx):
+            return {
+                "success": False,
+                "error": "home-relative output paths are not allowed; use a work_dir-relative filename",
+            }
+        if "output_filename" in kwargs and kwargs.get("output_filename") is not None:
+            try:
+                kwargs["output_filename"] = _sanitize_artifact_output_filename(
+                    kwargs.get("output_filename"),
+                )
+            except ValueError as exc:
+                return {
+                    "success": False,
+                    "error": str(exc),
+                }
+
+        result = handler(ctx, **kwargs) if ctx is not None else handler(**kwargs)
+        import inspect as _inspect
+
+        if _inspect.isawaitable(result):
+            result = await result
+        return result
+
+    artifact_handler.__name__ = getattr(handler, "__name__", "artifact_handler")
+    artifact_handler.__qualname__ = getattr(handler, "__qualname__", artifact_handler.__name__)
+    artifact_handler.__doc__ = getattr(handler, "__doc__", None)
+    return artifact_handler
+
+
+def _artifact_user_requested_home_relative_output(ctx: Any) -> bool:
+    deps = getattr(ctx, "deps", None) if ctx is not None else None
+    return contains_home_relative_path(str(getattr(deps, "user_message", "") or ""))
+
+
+def _sanitize_artifact_output_filename(output_filename: Any) -> str:
+    value = str(output_filename or "artifact").strip()
+    if not value:
+        value = "artifact"
+    if "\x00" in value or "/" in value or "\\" in value:
+        raise ValueError("output_filename must be a file name, not a path")
+    if Path(value).is_absolute() or value.startswith("~"):
+        raise ValueError("output_filename must be a file name, not a path")
+    if value in {".", ".."}:
+        raise ValueError("output_filename must be a safe file name")
+    return value
+
+
+def _capability_is_artifact(capability_class: str) -> bool:
+    normalized = str(capability_class or "").strip().lower()
+    return normalized == "artifact" or normalized.startswith("artifact:")
+
+
+def _extract_group_ids(
+    metadata: dict[str, Any],
+    provider_type: Optional[str],
+    *,
+    tool_id: str = "",
+) -> list[str]:
+    values: list[Any] = []
+    for key in ("group", "groups", "tool_group", "tool_groups"):
+        if key in metadata:
+            values.append(metadata.get(key))
+
+    if tool_id:
+        for key in (f"tool_{tool_id}_group", f"tool_{tool_id}_groups"):
+            if key in metadata:
+                values.append(metadata.get(key))
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+
+    def _append(group: str) -> None:
+        name = str(group or "").strip()
+        if not name:
+            return
+        if not name.startswith("group:"):
+            name = f"group:{name}"
+        if name in seen:
+            return
+        seen.add(name)
+        normalized.append(name)
+
+    for value in values:
+        if isinstance(value, str):
+            _append(value)
+            continue
+        if isinstance(value, list):
+            for item in value:
+                _append(str(item))
+            continue
+        if isinstance(value, dict):
+            for group_name, members in value.items():
+                if not tool_id:
+                    continue
+                member_names: list[str] = []
+                if isinstance(members, str):
+                    member_names = [members]
+                elif isinstance(members, list):
+                    member_names = [str(item) for item in members]
+                if tool_id in member_names:
+                    _append(group_name)
+
+    if provider_type:
+        _append(provider_type)
+    return normalized
+
+
+def _extract_capability_class(
+    metadata: dict[str, Any],
+    provider_type: Optional[str],
+    *,
+    tool_id: str = "",
+) -> str:
+    if tool_id:
+        per_tool = str(metadata.get(f"tool_{tool_id}_capability_class", "") or "").strip()
+        if per_tool:
+            return per_tool
+    explicit = str(metadata.get("capability_class", "") or "").strip()
+    if explicit:
+        return explicit
+    normalized_provider = str(provider_type or "").strip()
+    if normalized_provider:
+        return f"provider:{normalized_provider}"
+    return "skill"
+
+
+def _extract_priority(metadata: dict[str, Any], *, tool_id: str = "") -> int:
+    candidate: Any = metadata.get("priority", 100)
+    if tool_id and f"tool_{tool_id}_priority" in metadata:
+        candidate = metadata.get(f"tool_{tool_id}_priority", 100)
+    try:
+        return int(candidate)
+    except (TypeError, ValueError):
+        return 100
+
+
+def _extract_parameters_schema(metadata: dict[str, Any], *, tool_id: str = "") -> dict[str, Any]:
+    """Return the per-tool JSON schema declared in markdown metadata, if any."""
+    candidates: list[Any] = []
+    if tool_id:
+        candidates.append(metadata.get(f"tool_{tool_id}_parameters"))
+    else:
+        candidates.append(metadata.get("parameters"))
+        candidates.append(metadata.get("tool_parameters"))
+
+    for candidate in candidates:
+        schema = _coerce_parameters_schema(candidate)
+        if schema:
+            return schema
+    return {}
+
+
+def _extract_result_mode(metadata: dict[str, Any], *, tool_id: str = "") -> str:
+    candidate: Any = metadata.get("result_mode", "llm")
+    if tool_id and f"tool_{tool_id}_result_mode" in metadata:
+        candidate = metadata.get(f"tool_{tool_id}_result_mode", "llm")
+    normalized = str(candidate or "").strip().lower()
+    return normalized or "llm"
+
+
+def _extract_success_contract(metadata: dict[str, Any], *, tool_id: str = "") -> dict[str, Any]:
+    candidate: Any = {}
+    if tool_id and f"tool_{tool_id}_success_contract" in metadata:
+        candidate = metadata.get(f"tool_{tool_id}_success_contract", {})
+    elif "success_contract" in metadata:
+        candidate = metadata.get("success_contract", {})
+    return dict(candidate) if isinstance(candidate, dict) else {}
+
+
+def _extract_script_invocation_config(
+    metadata: dict[str, Any],
+    *,
+    tool_id: str = "",
+) -> ScriptInvocationConfig:
+    """Extract CLI invocation hints for script-backed markdown tools."""
+    positional_args = _extract_string_sequence(
+        metadata.get(f"tool_{tool_id}_cli_positional") if tool_id else metadata.get("cli_positional")
+    )
+    split_args = _extract_string_sequence(
+        metadata.get(f"tool_{tool_id}_cli_split") if tool_id else metadata.get("cli_split")
+    )
+    raw_flag_overrides = (
+        metadata.get(f"tool_{tool_id}_cli_flag_overrides")
+        if tool_id
+        else metadata.get("cli_flag_overrides")
+    )
+    flag_name_overrides: dict[str, str] = {}
+    if isinstance(raw_flag_overrides, dict):
+        for key, value in raw_flag_overrides.items():
+            normalized_key = str(key or "").strip()
+            normalized_value = str(value or "").strip()
+            if normalized_key and normalized_value:
+                flag_name_overrides[normalized_key] = normalized_value
+    return ScriptInvocationConfig(
+        positional_args=tuple(positional_args),
+        split_args=tuple(split_args),
+        flag_name_overrides=flag_name_overrides,
+    )
+
+
+def _extract_string_sequence(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        payload = value.strip()
+        if not payload:
+            return []
+        if payload.startswith("["):
+            try:
+                value = json.loads(payload)
+            except json.JSONDecodeError:
+                return [payload]
+        else:
+            return [payload]
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return []
+
+
+def _build_script_command_arguments(
+    *,
+    kwargs: dict[str, Any],
+    config: ScriptInvocationConfig,
+) -> list[str]:
+    """Serialize tool kwargs into CLI argv using metadata-driven hints."""
+    if not kwargs:
+        return []
+
+    args: list[str] = []
+    consumed: set[str] = set()
+    split_names = {name for name in config.split_args if name}
+
+    for name in config.positional_args:
+        normalized_name = str(name or "").strip()
+        if not normalized_name or normalized_name not in kwargs:
+            continue
+        consumed.add(normalized_name)
+        args.extend(
+            _serialize_cli_value(
+                value=kwargs.get(normalized_name),
+                split=normalized_name in split_names,
+            )
+        )
+
+    for name, value in kwargs.items():
+        normalized_name = str(name or "").strip()
+        if not normalized_name or normalized_name in consumed or value is None:
+            continue
+        if isinstance(value, bool):
+            if value:
+                args.append(_resolve_cli_flag_name(normalized_name, config))
+            continue
+        serialized = _serialize_cli_value(
+            value=value,
+            split=normalized_name in split_names,
+        )
+        if not serialized:
+            continue
+        args.append(_resolve_cli_flag_name(normalized_name, config))
+        args.extend(serialized)
+
+    return args
+
+
+def _resolve_cli_flag_name(name: str, config: ScriptInvocationConfig) -> str:
+    override = str(config.flag_name_overrides.get(name, "") or "").strip()
+    if override:
+        return override
+    return f"--{name.replace('_', '-')}"
+
+
+def _serialize_cli_value(*, value: Any, split: bool) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, dict):
+        return [json.dumps(value, ensure_ascii=False)]
+    if isinstance(value, (list, tuple, set)):
+        serialized: list[str] = []
+        for item in value:
+            serialized.extend(_serialize_cli_value(value=item, split=split))
+        return serialized
+    normalized = str(value).strip()
+    if not normalized:
+        return []
+    if split:
+        tokens = [token for token in normalized.replace(",", " ").split() if token]
+        return tokens or [normalized]
+    return [normalized]
+
+
+def _coerce_parameters_schema(candidate: Any) -> dict[str, Any]:
+    """Normalize markdown-frontmatter parameter declarations into an object JSON schema."""
+    if isinstance(candidate, str):
+        payload = candidate.strip()
+        if not payload:
+            return {}
+        try:
+            candidate = json.loads(payload)
+        except json.JSONDecodeError:
+            return {}
+
+    if not isinstance(candidate, dict):
+        return {}
+
+    schema_type = str(candidate.get("type", "") or "").strip().lower()
+    if schema_type and schema_type != "object":
+        return {}
+    properties = candidate.get("properties")
+    if not isinstance(properties, dict) or not properties:
+        return {}
+
+    normalized: dict[str, Any] = {
+        "type": "object",
+        "properties": properties,
+    }
+    required = candidate.get("required")
+    if isinstance(required, list):
+        normalized["required"] = [str(item) for item in required if str(item).strip()]
+    return normalized
