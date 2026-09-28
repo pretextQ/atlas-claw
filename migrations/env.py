@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from logging.config import fileConfig
 
 from alembic import context
@@ -16,7 +17,13 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 # Import models to ensure they are registered with Base.metadata
 from app.atlasclaw.db.models import Base
 from app.atlasclaw.core.config import get_config
-from app.atlasclaw.db.database import build_mysql_connect_args, _resolve_mysql_tls
+from app.atlasclaw.db.database import (
+    build_mysql_connect_args,
+    resolve_configured_database_url,
+    _resolve_mysql_tls,
+)
+
+logger = logging.getLogger("alembic.env")
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
@@ -31,49 +38,38 @@ if config.config_file_name is not None:
 target_metadata = Base.metadata
 
 
+def _resolve_configured_url(db_config: object) -> str:
+    """Resolve the database URL from a configured database section (raises on failure)."""
+    return resolve_configured_database_url(db_config)
+
+
 def get_url() -> str:
-    """Get database URL from configuration."""
+    """Get database URL from configuration.
+
+    A configured database section must resolve: silently migrating a stray
+    SQLite file while the application runs on MySQL leaves the real schema
+    unupgraded and still reports success. Only a deployment without any
+    database section (development/test) falls back to the alembic.ini URL.
+    """
     try:
         atlasclaw_config = get_config()
-        db_config = atlasclaw_config.database
+    except Exception as exc:
+        atlasclaw_config = None
+        logger.warning(
+            "Could not load atlasclaw.json for migration URL resolution (%s); "
+            "falling back to alembic.ini sqlalchemy.url",
+            exc,
+        )
 
-        if db_config is None:
-            raise ValueError("database config is not set in atlasclaw.json")
+    if atlasclaw_config is not None:
+        db_config = getattr(atlasclaw_config, "database", None)
+        if db_config is not None:
+            return _resolve_configured_url(db_config)
 
-        if hasattr(db_config, "get"):
-            # Dict format
-            db_type = db_config.get("type", "sqlite")
-            if db_type == "sqlite":
-                path = db_config.get("sqlite", {}).get("path", "./data/atlasclaw.db")
-                return f"sqlite+aiosqlite:///{path}"
-            elif db_type == "mysql":
-                mysql = db_config.get("mysql", {})
-                return (
-                    f"mysql+aiomysql://{mysql.get('user')}:{mysql.get('password')}"
-                    f"@{mysql.get('host')}:{mysql.get('port', 3306)}/{mysql.get('database')}"
-                    f"?charset={mysql.get('charset', 'utf8mb4')}"
-                )
-        else:
-            # Pydantic model format (config_schema.DatabaseConfig)
-            # mysql/sqlite are nested sub-models, NOT flat attributes like mysql_user/mysql_host
-            db_type = getattr(db_config, "type", "sqlite")
-            if db_type == "sqlite":
-                sqlite_cfg = getattr(db_config, "sqlite", None)
-                path = getattr(sqlite_cfg, "path", "./data/atlasclaw.db") if sqlite_cfg else "./data/atlasclaw.db"
-                return f"sqlite+aiosqlite:///{path}"
-            elif db_type == "mysql":
-                mysql_cfg = getattr(db_config, "mysql", None)
-                if mysql_cfg is None:
-                    raise ValueError("MySQL config section is missing in atlasclaw.json")
-                return (
-                    f"mysql+aiomysql://{mysql_cfg.user}:{mysql_cfg.password}"
-                    f"@{mysql_cfg.host}:{mysql_cfg.port}/{mysql_cfg.database}"
-                    f"?charset={mysql_cfg.charset}"
-                )
-    except Exception:
-        pass
-
-    # Fallback to alembic.ini setting
+    logger.warning(
+        "No database section in atlasclaw.json; falling back to alembic.ini "
+        "sqlalchemy.url"
+    )
     return config.get_main_option("sqlalchemy.url", "sqlite+aiosqlite:///./data/atlasclaw.db")
 
 

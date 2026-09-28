@@ -64,6 +64,49 @@ class Base(DeclarativeBase):
     pass
 
 
+def resolve_configured_database_url(db_config: object) -> str:
+    """Resolve a database connection URL from a configured database section.
+
+    Accepts either a plain dict (raw atlasclaw.json) or the nested pydantic
+    schema model (``core.config_schema.DatabaseConfig``). Raises ``ValueError``
+    for unsupported or incomplete configurations so callers — including the
+    Alembic environment — fail fast instead of silently migrating a different
+    database than the application uses.
+    """
+    if hasattr(db_config, "get"):
+        # Dict format
+        db_type = db_config.get("type", "sqlite")
+        if db_type == "sqlite":
+            path = db_config.get("sqlite", {}).get("path", "./data/atlasclaw.db")
+            return f"sqlite+aiosqlite:///{path}"
+        elif db_type == "mysql":
+            mysql = db_config.get("mysql", {})
+            return (
+                f"mysql+aiomysql://{mysql.get('user')}:{mysql.get('password')}"
+                f"@{mysql.get('host')}:{mysql.get('port', 3306)}/{mysql.get('database')}"
+                f"?charset={mysql.get('charset', 'utf8mb4')}"
+            )
+        raise ValueError(f"Unsupported database type in atlasclaw.json: {db_type!r}")
+
+    # Pydantic model format (core.config_schema.DatabaseConfig) with nested
+    # mysql/sqlite sub-models.
+    db_type = getattr(db_config, "type", "sqlite")
+    if db_type == "sqlite":
+        sqlite_cfg = getattr(db_config, "sqlite", None)
+        path = getattr(sqlite_cfg, "path", "./data/atlasclaw.db") if sqlite_cfg else "./data/atlasclaw.db"
+        return f"sqlite+aiosqlite:///{path}"
+    elif db_type == "mysql":
+        mysql_cfg = getattr(db_config, "mysql", None)
+        if mysql_cfg is None:
+            raise ValueError("MySQL config section is missing in atlasclaw.json")
+        return (
+            f"mysql+aiomysql://{mysql_cfg.user}:{mysql_cfg.password}"
+            f"@{mysql_cfg.host}:{mysql_cfg.port}/{mysql_cfg.database}"
+            f"?charset={mysql_cfg.charset}"
+        )
+    raise ValueError(f"Unsupported database type in atlasclaw.json: {db_type!r}")
+
+
 class DatabaseConfig:
     """Database configuration schema."""
 
