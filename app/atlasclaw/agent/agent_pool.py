@@ -20,7 +20,7 @@ class AgentInstance:
     agent_id: str
     token_id: str
     agent: Any
-    concurrency_sem: asyncio.Semaphore
+    concurrency_sem: asyncio.BoundedSemaphore
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     @property
@@ -54,7 +54,9 @@ class AgentInstancePool:
                 agent_id=agent_id,
                 token_id=token.token_id,
                 agent=agent,
-                concurrency_sem=asyncio.Semaphore(self._max_concurrent),
+                # Bounded so a stray double release surfaces as an error
+                # instead of silently inflating the concurrency cap.
+                concurrency_sem=asyncio.BoundedSemaphore(self._max_concurrent),
             )
             self._instances[cache_key] = instance
             return instance

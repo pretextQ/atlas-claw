@@ -1818,6 +1818,10 @@ class RunnerExecutionPreparePhaseMixin:
             )
 
             runtime_agent, selected_token_id, release_slot = await self._resolve_runtime_agent(session_key, deps)
+            # Publish the release handle immediately: a consumer that stops
+            # iterating after a later error event must still be able to
+            # release the permit from run()'s finally block.
+            state["release_slot"] = release_slot
             logger.warning(
                 "runtime token resolved: session=%s selected_token_id=%s managed_tokens=%s",
                 session_key,

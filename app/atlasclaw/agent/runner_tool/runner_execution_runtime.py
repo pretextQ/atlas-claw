@@ -14,6 +14,29 @@ from app.atlasclaw.agent.runner_tool.runner_agent_override import (
 from app.atlasclaw.core.deps import SkillDeps
 from app.atlasclaw.core.trace import bind_trace_context, resolve_trace_context
 
+
+class RuntimeAgentSlot:
+    """Idempotent handle for one agent-pool concurrency permit.
+
+    The release must survive async-generator finalization ordering: a consumer
+    that stops iterating early can close ``run()`` before the prepare phase
+    has published the release handle into the shared phase state, so every
+    release site goes through this handle and double releases are no-ops.
+    """
+
+    def __init__(self, release: Any) -> None:
+        self._release = release
+        self._released = False
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        self._release()
+
+    def __call__(self) -> None:
+        self.release()
+
 class RunnerExecutionRuntimeMixin:
     async def _resolve_runtime_agent(
         self,
@@ -54,7 +77,7 @@ class RunnerExecutionRuntimeMixin:
             self.agent_factory,
         )
         await instance.concurrency_sem.acquire()
-        return instance.agent, token.token_id, instance.concurrency_sem.release
+        return instance.agent, token.token_id, RuntimeAgentSlot(instance.concurrency_sem.release)
     def _extract_rate_limit_headers(self, deps: SkillDeps) -> dict[str, str]:
         """Best-effort extraction of ratelimit headers from deps.extra."""
         extra = deps.extra if isinstance(deps.extra, dict) else {}
