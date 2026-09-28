@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import time as _time
 from types import SimpleNamespace
 
 import pytest
@@ -180,3 +181,90 @@ async def test_fetch_follows_client_side_redirect_page(monkeypatch) -> None:
     assert calls[1] == "https://target.example/article"
     assert "target article content" in content
     assert details["final_url"] == "https://target.example/article"
+
+
+@pytest.mark.asyncio
+async def test_fetch_web_content_clamps_model_controlled_response_cap(monkeypatch) -> None:
+    """The model cannot raise max_response_bytes beyond the hard ceiling."""
+    captured: dict = {}
+
+    async def _fake_guarded(**kwargs):
+        captured.update(kwargs)
+        return "<html><body>hello</body></html>", 200, "https://example.com/", False, False
+
+    monkeypatch.setattr(
+        fetch_tool_module, "_guarded_get_text_with_proxy_fallback", _fake_guarded
+    )
+    monkeypatch.setattr(fetch_tool_module, "_extract_with_crawl4ai_placeholder", None, raising=False)
+
+    content, details = await fetch_web_content(
+        "https://example.com/",
+        max_response_bytes=10**12,
+        cache_ttl_seconds=0,
+    )
+
+    assert "hello" in content
+    assert details["max_response_bytes"] == fetch_tool_module.MAX_RESPONSE_BYTES_LIMIT
+    assert captured["max_response_bytes"] == fetch_tool_module.MAX_RESPONSE_BYTES_LIMIT
+
+
+def test_fetch_cache_enforces_total_byte_budget(monkeypatch) -> None:
+    """Cached entries evict oldest-first and never exceed the byte budget."""
+    monkeypatch.setattr(fetch_tool_module, "_FETCH_CACHE", {})
+    monkeypatch.setattr(fetch_tool_module, "_FETCH_CACHE_TOTAL_BYTES", 0)
+    monkeypatch.setattr(fetch_tool_module, "DEFAULT_FETCH_CACHE_MAX_BYTES", 1000)
+
+    for i in range(5):
+        fetch_tool_module._write_fetch_cache(
+            cache_key=f"key-{i}",
+            content="x" * 400,
+            details={"i": i},
+            ttl_seconds=60,
+        )
+
+    assert fetch_tool_module._FETCH_CACHE_TOTAL_BYTES <= 1000
+    assert len(fetch_tool_module._FETCH_CACHE) == 2  # 5 x 400B entries, budget 1000B
+    # Oldest entries were evicted first.
+    assert "key-0" not in fetch_tool_module._FETCH_CACHE
+    assert "key-3" in fetch_tool_module._FETCH_CACHE
+    assert "key-4" in fetch_tool_module._FETCH_CACHE
+
+    # Oversized single entries are never cached at all.
+    fetch_tool_module._write_fetch_cache(
+        cache_key="huge",
+        content="y" * 2000,
+        details={},
+        ttl_seconds=60,
+    )
+    assert "huge" not in fetch_tool_module._FETCH_CACHE
+    assert fetch_tool_module._FETCH_CACHE_TOTAL_BYTES <= 1000
+
+
+def test_fetch_cache_expiry_releases_byte_budget(monkeypatch) -> None:
+    """Expired entries free their bytes from the budget accounting."""
+    monkeypatch.setattr(fetch_tool_module, "_FETCH_CACHE", {})
+    monkeypatch.setattr(fetch_tool_module, "_FETCH_CACHE_TOTAL_BYTES", 0)
+
+    fetch_tool_module._write_fetch_cache(
+        cache_key="expiring",
+        content="z" * 500,
+        details={},
+        ttl_seconds=-1,  # already expired on write? ttl<=0 skips caching
+    )
+    # ttl <= 0 must not cache anything.
+    assert "expiring" not in fetch_tool_module._FETCH_CACHE
+    assert fetch_tool_module._FETCH_CACHE_TOTAL_BYTES == 0
+
+    fetch_tool_module._write_fetch_cache(
+        cache_key="fresh",
+        content="z" * 500,
+        details={},
+        ttl_seconds=60,
+    )
+    assert fetch_tool_module._FETCH_CACHE_TOTAL_BYTES == 500
+
+    # Force expiry and read: the entry is dropped and its bytes released.
+    expires_at, content, details = fetch_tool_module._FETCH_CACHE["fresh"]
+    fetch_tool_module._FETCH_CACHE["fresh"] = (_time.time() - 1, content, details)
+    assert fetch_tool_module._read_fetch_cache("fresh") is None
+    assert fetch_tool_module._FETCH_CACHE_TOTAL_BYTES == 0

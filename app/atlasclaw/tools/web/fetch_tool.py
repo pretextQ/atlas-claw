@@ -34,8 +34,14 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_REDIRECTS = 3
 DEFAULT_MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+# Hard ceiling for the per-request response cap: the model controls
+# max_response_bytes, so it must never be able to pull unbounded data into
+# memory through this tool.
+MAX_RESPONSE_BYTES_LIMIT = 5 * 1024 * 1024
 DEFAULT_FETCH_CACHE_TTL_SECONDS = 15 * 60
 DEFAULT_FETCH_CACHE_MAX_ENTRIES = 100
+# Total byte budget for the in-memory fetch cache.
+DEFAULT_FETCH_CACHE_MAX_BYTES = 32 * 1024 * 1024
 REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
 CROSS_ORIGIN_SENSITIVE_HEADERS = {
     "authorization",
@@ -50,6 +56,7 @@ BLOCKED_HOSTNAMES = {
 }
 BLOCKED_HOST_SUFFIXES = (".localhost", ".local", ".internal")
 _FETCH_CACHE: dict[str, tuple[float, str, dict[str, object]]] = {}
+_FETCH_CACHE_TOTAL_BYTES = 0
 
 
 class SSRFBlockedError(RuntimeError):
@@ -193,12 +200,14 @@ def _cache_key_for_fetch(
 
 
 def _read_fetch_cache(cache_key: str) -> tuple[str, dict[str, object]] | None:
+    global _FETCH_CACHE_TOTAL_BYTES
     entry = _FETCH_CACHE.get(cache_key)
     if not entry:
         return None
     expires_at, content, details = entry
     if time.time() > expires_at:
         _FETCH_CACHE.pop(cache_key, None)
+        _FETCH_CACHE_TOTAL_BYTES = max(0, _FETCH_CACHE_TOTAL_BYTES - len(content.encode("utf-8", errors="replace")))
         return None
     cached_details = dict(details)
     cached_details["cached"] = True
@@ -212,13 +221,29 @@ def _write_fetch_cache(
     details: dict[str, object],
     ttl_seconds: int,
 ) -> None:
+    global _FETCH_CACHE_TOTAL_BYTES
     ttl = max(0, int(ttl_seconds))
     if ttl <= 0:
         return
-    if len(_FETCH_CACHE) >= DEFAULT_FETCH_CACHE_MAX_ENTRIES:
+    content_bytes = len(content.encode("utf-8", errors="replace"))
+    if content_bytes > DEFAULT_FETCH_CACHE_MAX_BYTES:
+        return
+    existing = _FETCH_CACHE.pop(cache_key, None)
+    if existing is not None:
+        _FETCH_CACHE_TOTAL_BYTES = max(
+            0, _FETCH_CACHE_TOTAL_BYTES - len(existing[1].encode("utf-8", errors="replace"))
+        )
+    while _FETCH_CACHE and (
+        len(_FETCH_CACHE) >= DEFAULT_FETCH_CACHE_MAX_ENTRIES
+        or _FETCH_CACHE_TOTAL_BYTES + content_bytes > DEFAULT_FETCH_CACHE_MAX_BYTES
+    ):
         oldest_key = min(_FETCH_CACHE.items(), key=lambda item: item[1][0])[0]
-        _FETCH_CACHE.pop(oldest_key, None)
+        _removed = _FETCH_CACHE.pop(oldest_key)
+        _FETCH_CACHE_TOTAL_BYTES = max(
+            0, _FETCH_CACHE_TOTAL_BYTES - len(_removed[1].encode("utf-8", errors="replace"))
+        )
     _FETCH_CACHE[cache_key] = (time.time() + ttl, content, dict(details))
+    _FETCH_CACHE_TOTAL_BYTES += content_bytes
 
 
 async def _read_response_text_limited(response: object, *, max_bytes: int) -> tuple[str, bool, int]:
@@ -601,7 +626,10 @@ async def fetch_web_content(
     base_url = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else ""
     safe_extract_mode = extract_mode if extract_mode in {"text", "markdown", "html"} else "text"
     safe_timeout_seconds = max(1.0, float(timeout_seconds))
-    safe_max_response_bytes = max(1024, int(max_response_bytes))
+    safe_max_response_bytes = min(
+        MAX_RESPONSE_BYTES_LIMIT,
+        max(1024, int(max_response_bytes)),
+    )
     safe_max_redirects = max(0, int(max_redirects))
 
     cache_key = _cache_key_for_fetch(
