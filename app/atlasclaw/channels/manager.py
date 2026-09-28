@@ -42,6 +42,7 @@ class ChannelManager:
         self._agent_runner: Optional["AgentRunner"] = None
         self._session_manager_router: Optional["SessionManagerRouter"] = None
         self._event_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._background_tasks: set = set()
 
     def _set_connection_runtime_status(
         self,
@@ -459,65 +460,88 @@ class ChannelManager:
             self._set_connection_runtime_status(connection_id, ConnectionStatus.ERROR)
             return False
 
+    def find_active_connection(
+        self,
+        channel_type: str,
+        connection_id: str,
+    ) -> Optional[tuple]:
+        """Locate the active handler for a connection.
+
+        Args:
+            channel_type: Channel type
+            connection_id: Connection identifier
+
+        Returns:
+            Tuple of (owner_user_id, handler) or None when the connection
+            has no active handler.
+        """
+        suffix = f":{channel_type}:{connection_id}"
+        for key, handler in self._active_connections.items():
+            if key.endswith(suffix):
+                return key[: -len(suffix)], handler
+        return None
+
+    def schedule_inbound_processing(
+        self,
+        user_id: str,
+        channel_type: str,
+        connection_id: str,
+        message: InboundMessage
+    ) -> "asyncio.Task":
+        """Schedule Agent processing for a parsed inbound channel message.
+
+        The task is kept referenced so it cannot be garbage collected while
+        running.
+
+        Args:
+            user_id: Owner of the channel connection
+            channel_type: Channel type
+            connection_id: Connection identifier
+            message: Parsed inbound message
+
+        Returns:
+            The scheduled processing task.
+        """
+        task = asyncio.create_task(
+            self._process_message_async(user_id, channel_type, connection_id, message)
+        )
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
+
     async def route_inbound_message(
         self,
         channel_type: str,
         connection_id: str,
         request: Any
     ) -> Optional[InboundMessage]:
-        """Route incoming message to session manager.
+        """Parse an inbound webhook request and schedule Agent processing.
 
         Args:
             channel_type: Channel type
             connection_id: Connection identifier
-            request: Raw request data
+            request: Raw platform payload (dict or JSON string)
 
         Returns:
-            Standardized InboundMessage or None
+            Standardized InboundMessage, or None when no active handler
+            exists or the payload cannot be parsed.
         """
+        found = self.find_active_connection(channel_type, connection_id)
+        if not found:
+            logger.error(f"No active handler for connection: {channel_type}/{connection_id}")
+            return None
+        user_id, handler = found
+
         try:
-            # Get handler instance
-            handler = self._get_handler_for_connection(channel_type, connection_id)
-            if not handler:
-                logger.error(f"No handler for connection: {channel_type}/{connection_id}")
-                return None
-
-            # Handle inbound message
             inbound = await handler.handle_inbound(request)
-            if not inbound:
-                return None
-
-            # TODO: Route to SessionManager
-            # session_manager = get_session_manager()
-            # await session_manager.handle_message(inbound)
-
-            return inbound
-
         except Exception as e:
-            logger.error(f"Failed to route inbound message: {e}")
+            logger.error(f"Failed to parse inbound message: {channel_type}/{connection_id}: {e}")
+            return None
+        if not inbound:
             return None
 
-    def _get_handler_for_connection(
-        self,
-        channel_type: str,
-        connection_id: str
-    ) -> Optional[ChannelHandler]:
-        """Get handler instance for a connection.
-
-        Args:
-            channel_type: Channel type
-            connection_id: Connection identifier
-
-        Returns:
-            Handler instance or None
-        """
-        # Try to find in active connections
-        for key, handler in self._active_connections.items():
-            if key.endswith(f":{channel_type}:{connection_id}"):
-                return handler
-
-        # Try to get from registry
-        return ChannelRegistry.get_instance(connection_id)
+        self.schedule_inbound_processing(user_id, channel_type, connection_id, inbound)
+        return inbound
 
     def get_user_connections(
         self,

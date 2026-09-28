@@ -134,7 +134,7 @@ class TestChannelManager:
         instance_key = "user-123:websocket:conn-123"
         ChannelRegistry.create_instance(instance_key, "websocket", {})
         self.manager._active_connections[instance_key] = handler
-        
+
         # Route message
         request = {
             "message_id": "msg-123",
@@ -143,19 +143,63 @@ class TestChannelManager:
             "chat_id": "chat-789",
             "content": "Hello",
         }
-        
+
         inbound = await self.manager.route_inbound_message("websocket", "conn-123", request)
-        
+
         assert inbound is not None
         assert inbound.message_id == "msg-123"
         assert inbound.content == "Hello"
+        await self._drain_background_tasks()
 
     @pytest.mark.asyncio
     async def test_route_inbound_message_no_handler(self):
         """Test routing when handler not found."""
         inbound = await self.manager.route_inbound_message("websocket", "nonexistent", {})
-        
+
         assert inbound is None
+        await self._drain_background_tasks()
+
+    @pytest.mark.asyncio
+    async def test_route_inbound_message_schedules_agent_processing(self):
+        """Webhook-mode routing must hand the message to the Agent runner."""
+        ctx = APIContext(
+            session_manager=SessionManager(str(Path(self.temp_dir))),
+            session_queue=SessionQueue(),
+            skill_registry=SkillRegistry(),
+            provider_instances={},
+        )
+        manager = ChannelManager(self.temp_dir)
+        manager.set_session_manager_router(ctx.session_manager_router)
+        handler = WebSocketHandler({})
+        handler.send_message = AsyncMock(return_value=SendResult(success=True))
+        manager._active_connections["user-123:websocket:conn-123"] = handler
+
+        class DummyAgentRunner:
+            async def run(self, **kwargs):
+                del kwargs
+                yield SimpleNamespace(type="assistant", content="ok")
+
+        manager._agent_runner = DummyAgentRunner()
+        request = {
+            "message_id": "msg-123",
+            "sender_id": "user-456",
+            "chat_id": "chat-789",
+            "content": "Hello",
+        }
+
+        with patch("app.atlasclaw.api.deps_context.get_api_context", return_value=ctx):
+            inbound = await manager.route_inbound_message("websocket", "conn-123", request)
+            await self._drain_background_tasks(manager=manager)
+
+        assert inbound is not None
+        handler.send_message.assert_awaited_once()
+
+    async def _drain_background_tasks(self, manager=None):
+        """Await every scheduled background task so none stay pending."""
+        target = manager if manager is not None else self.manager
+        pending = [task for task in list(target._background_tasks) if not task.done()]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
     def test_get_user_connections(self):
         """Test getting user connections (sync version)."""

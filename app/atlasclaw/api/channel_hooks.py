@@ -5,12 +5,14 @@
 
 from __future__ import annotations
 
+import json
 import logging
-from typing import Any, Dict
+from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 
+from app.atlasclaw.api.channels import get_channel_manager
 from app.atlasclaw.channels.registry import ChannelRegistry
 
 logger = logging.getLogger(__name__)
@@ -24,66 +26,58 @@ async def receive_channel_webhook(
     connection_id: str,
     request: Request
 ) -> JSONResponse:
-    """Receive webhook from external channel platform.
-    
+    """Receive a webhook event from an external channel platform.
+
+    The raw platform payload is handed to the connection's handler for
+    parsing; the resulting inbound message is then scheduled onto the Agent
+    runner through the ChannelManager (same path as long-connection traffic).
+
     Args:
-        channel_type: Channel type (e.g., feishu, slack)
+        channel_type: Channel type (e.g., feishu, dingtalk)
         connection_id: Connection identifier
         request: FastAPI request object
-        
+
     Returns:
         JSON response
     """
+    handler_class = ChannelRegistry.get(channel_type)
+    if not handler_class:
+        logger.error(f"Channel type not found: {channel_type}")
+        raise HTTPException(status_code=404, detail=f"Channel type not found: {channel_type}")
+
+    manager = get_channel_manager()
+    found = manager.find_active_connection(channel_type, connection_id)
+    if not found:
+        logger.warning(f"No active handler for webhook: {channel_type}/{connection_id}")
+        raise HTTPException(
+            status_code=404,
+            detail=f"Connection not found or not active: {connection_id}",
+        )
+    user_id, handler = found
+
+    raw_body = await request.body()
+    content_type = request.headers.get("content-type", "")
+    if "application/json" in content_type:
+        try:
+            raw_event: Any = json.loads(raw_body.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            raise HTTPException(status_code=400, detail="Invalid JSON body")
+    else:
+        # Handlers accept JSON strings and parse them themselves.
+        raw_event = raw_body.decode("utf-8", errors="replace")
+
     try:
-        # Get handler class
-        handler_class = ChannelRegistry.get(channel_type)
-        if not handler_class:
-            logger.error(f"Channel type not found: {channel_type}")
-            raise HTTPException(status_code=404, detail=f"Channel type not found: {channel_type}")
-        
-        # Get handler instance
-        handler = ChannelRegistry.get_instance(connection_id)
-        if not handler:
-            # Try to create instance from connection config
-            # This requires ChannelManager to be available
-            logger.warning(f"Handler instance not found for: {connection_id}")
-            raise HTTPException(status_code=404, detail=f"Connection not found: {connection_id}")
-        
-        # Parse request body
-        body = await request.body()
-        content_type = request.headers.get("content-type", "")
-        
-        if "application/json" in content_type:
-            data = await request.json()
-        else:
-            data = {"body": body.decode("utf-8")}
-        
-        # Add request metadata
-        request_data = {
-            "headers": dict(request.headers),
-            "query_params": dict(request.query_params),
-            "body": data,
-        }
-        
-        # Handle inbound message
-        inbound = await handler.handle_inbound(request_data)
-        
-        if not inbound:
-            logger.warning(f"Failed to parse inbound message from {channel_type}")
-            raise HTTPException(status_code=400, detail="Invalid message format")
-        
-        # TODO: Route to SessionManager
-        # from app.atlasclaw.session.manager import get_session_manager
-        # session_manager = get_session_manager()
-        # await session_manager.handle_message(inbound)
-        
-        return JSONResponse(content={"status": "ok", "message_id": inbound.message_id})
-        
-    except HTTPException:
-        raise
+        inbound = await handler.handle_inbound(raw_event)
     except Exception as e:
-        logger.error(f"Failed to handle channel webhook: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Failed to parse inbound message from {channel_type}: {e}")
+        raise HTTPException(status_code=400, detail="Invalid message format")
+    if not inbound:
+        logger.warning(f"Handler could not parse inbound message from {channel_type}")
+        raise HTTPException(status_code=400, detail="Invalid message format")
+
+    manager.schedule_inbound_processing(user_id, channel_type, connection_id, inbound)
+
+    return JSONResponse(content={"status": "ok", "message_id": inbound.message_id})
 
 
 @router.get("/{channel_type}/{connection_id}")
@@ -93,25 +87,25 @@ async def verify_channel_webhook(
     request: Request
 ) -> JSONResponse:
     """Verify webhook endpoint (for platforms that require verification).
-    
+
     Args:
         channel_type: Channel type
         connection_id: Connection identifier
         request: FastAPI request object
-        
+
     Returns:
         JSON response
     """
     try:
         # Some platforms (like Feishu) require challenge verification
         params = dict(request.query_params)
-        
+
         if "challenge" in params:
             # Return challenge for verification
             return JSONResponse(content={"challenge": params["challenge"]})
-        
+
         return JSONResponse(content={"status": "ok"})
-        
+
     except Exception as e:
         logger.error(f"Failed to verify webhook: {e}")
         raise HTTPException(status_code=500, detail=str(e))
