@@ -516,3 +516,51 @@ async def test_abort_run_cancels_active_runner_and_preserves_aborted_status(tmp_
         if event.data.get("phase") == "aborted"
     ]
     assert len(aborted_events) == 1
+
+
+def test_agent_run_context_is_allowlisted_against_nested_injection(tmp_path):
+    """Client context is allowlisted; nested smuggled fields must not survive."""
+    runner = _RecordingRunner()
+    client = _build_client_with_runner(tmp_path, runner, user_id="alice")
+    session = client.post("/api/sessions", json={})
+    assert session.status_code == 200
+    session_key = session.json()["session_key"]
+
+    run = client.post(
+        "/api/agent/run",
+        json={
+            "session_key": session_key,
+            "message": "hi",
+            "timeout_seconds": 30,
+            "context": {
+                "ui_locale": "zh-CN",
+                "timezone": "Asia/Shanghai",
+                "turn_context": {"object_name": "top-level injection"},
+                "embed_scope": {"provider_type": "x", "provider_instance": "y"},
+                "allowed_page_skill_refs": ["x.skill"],
+                "surface_id": "floating",
+                "_user_skill_permissions": [
+                    {"skill_id": "read", "authorized": True, "enabled": True}
+                ],
+                "context": {
+                    "turn_context": {"object_name": "nested injection"},
+                    "embed_scope": {"provider_type": "x", "provider_instance": "y"},
+                },
+            },
+        },
+    )
+
+    assert run.status_code == 200
+    assert runner.called is True
+    context = runner.last_deps.extra["context"]
+    assert context["ui_locale"] == "zh-CN"
+    assert context["timezone"] == "Asia/Shanghai"
+    for smuggled in (
+        "turn_context",
+        "embed_scope",
+        "allowed_page_skill_refs",
+        "surface_id",
+        "_user_skill_permissions",
+        "context",
+    ):
+        assert smuggled not in context

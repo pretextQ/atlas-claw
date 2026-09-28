@@ -41,6 +41,22 @@ from .services.run_service import (
 
 _LEADING_SLASH_COMMAND_RE = re.compile(r"^/[A-Za-z0-9][A-Za-z0-9_.-]*(?=$|\s)")
 
+# The only fields a client may supply in `context`. Server-authoritative
+# fields (embed_scope, turn_context, allowed_page_skill_refs, surface_id,
+# RBAC snapshots) are rebuilt server-side and must never be client-settable:
+# a nested {"context": {"context": {...}}} used to smuggle them past the old
+# blacklist pops into the prompt and provider binding.
+_CLIENT_CONTEXT_ALLOWLIST = frozenset(
+    {
+        "ui_locale",
+        "timezone",
+        "selected_capability",
+        "visible_user_turn",
+        "embed_context_id",
+        "context_generation",
+    }
+)
+
 
 def _leading_slash_command(message: str) -> str:
     """Return the explicit leading slash command token from a user message."""
@@ -185,16 +201,17 @@ def register_agent_routes(router: APIRouter) -> None:
                 detail="Failed to resolve skill permissions for this run.",
             ) from exc
 
-        request_context = dict(request.context or {})
-        if "embed_tool_name" in request_context or "allowed_page_tool_names" in request_context:
+        raw_client_context = dict(request.context or {})
+        if "embed_tool_name" in raw_client_context or "allowed_page_tool_names" in raw_client_context:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail="Embed runs do not accept client-selected Tools",
             )
-        request_context.pop("turn_context", None)
-        request_context.pop("allowed_page_skill_refs", None)
-        request_context.pop("embed_scope", None)
-        request_context.pop("surface_id", None)
+        request_context = {
+            key: value
+            for key, value in raw_client_context.items()
+            if key in _CLIENT_CONTEXT_ALLOWLIST
+        }
         embed_context_id = request_context.pop("embed_context_id", None)
         embed_generation = request_context.pop("context_generation", None)
         embed_fields = (embed_context_id, embed_generation)
