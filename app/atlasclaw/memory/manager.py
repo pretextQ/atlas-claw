@@ -38,6 +38,34 @@ _HOOK_MEMORY_METADATA_PREFIXES = (
 LONG_TERM_PREFERENCES_SECTION = "Preferences"
 LONG_TERM_USAGE_PROFILE_SECTION = "Usage Profile"
 
+# Section headings are single-line Markdown titles. Anything else (newlines,
+# extra "#", control characters) would inject structure into MEMORY.md.
+_SECTION_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.-]{0,63}$")
+
+
+def normalize_memory_section(section: Any) -> str:
+    """Validate and normalize a memory section heading.
+
+    Args:
+        section: Requested section name.
+
+    Returns:
+        The trimmed section name.
+
+    Raises:
+        ValueError: If the section is blank, too long, or contains characters
+            that would let it break out of a single Markdown heading.
+    """
+    candidate = str(section or "").strip()
+    if not candidate:
+        raise ValueError("Section must not be blank")
+    if not _SECTION_NAME_RE.match(candidate):
+        raise ValueError(
+            "Section must be a single-line title using letters, digits, "
+            "spaces, dots, dashes, or underscores"
+        )
+    return candidate
+
 # Per-file write locks shared by every manager instance. A lock owned by one
 # instance cannot serialize concurrent requests, because per-request managers
 # are created through ``MemoryManager.for_user``.
@@ -203,7 +231,8 @@ class MemoryManager:
             The created memory entry.
         """
         timestamp = datetime.now(timezone.utc)
-        
+        section = normalize_memory_section(section)
+
         safe_content, encoded = encode_if_untrusted(content)
         entry = MemoryEntry(
             id=MemoryEntry.generate_id(content, timestamp),
@@ -252,6 +281,7 @@ class MemoryManager:
             Memory entries corresponding to the written section lines.
         """
         timestamp = datetime.now(timezone.utc)
+        section = normalize_memory_section(section)
         entries: list[MemoryEntry] = []
         safe_contents: list[str] = []
         for content in contents:
@@ -314,9 +344,7 @@ class MemoryManager:
             and merged under the same write lock as the final section rewrite, so
             concurrent writers do not overwrite each other's section additions.
         """
-        normalized_section = str(section or "").strip()
-        if not normalized_section:
-            return []
+        normalized_section = normalize_memory_section(section)
 
         timestamp = datetime.now(timezone.utc)
         candidate_entries: list[tuple[MemoryEntry, str]] = []
@@ -492,7 +520,9 @@ class MemoryManager:
             return f"# Long-term Memory\n\n## {section}\n\n{entry.content}\n"
             
         section_pattern = rf"(## {re.escape(section)}\n)"
-        match = re.search(section_pattern, existing)
+        # Match the heading case-insensitively so "general" and "General" update
+        # the same section instead of appending a duplicate heading.
+        match = re.search(section_pattern, existing, flags=re.IGNORECASE)
         
         if match:
             insert_pos = match.end()
@@ -526,7 +556,11 @@ class MemoryManager:
             return f"# Long-term Memory\n\n{replacement}"
 
         section_pattern = rf"^## {re.escape(section)}\s*$"
-        match = re.search(section_pattern, existing, flags=re.MULTILINE)
+        match = re.search(
+            section_pattern,
+            existing,
+            flags=re.MULTILINE | re.IGNORECASE,
+        )
         if not match:
             return existing.rstrip() + f"\n\n{replacement}"
 

@@ -132,3 +132,56 @@ class TestConcurrentMemoryWrites:
         leftovers = list(memory_dir.glob("*.tmp"))
         assert leftovers == []
         assert manager.long_term_path.exists()
+
+
+class TestMemorySectionHandling:
+    """Section headings must stay single-line and case-insensitively unique."""
+
+    @pytest.mark.asyncio
+    async def test_section_injection_is_rejected(self, tmp_path: Path) -> None:
+        manager = MemoryManager(workspace=str(tmp_path), user_id="u1")
+
+        for hostile in (
+            "General\n\n## Injected",
+            "General\r\n## Injected",
+            "# Heading",
+            "## Sub",
+            "   ",
+            "x" * 200,
+        ):
+            with pytest.raises(ValueError):
+                await manager.write_long_term("payload", source="test", section=hostile)
+
+        assert not manager.long_term_path.exists()
+
+    @pytest.mark.asyncio
+    async def test_section_aliases_with_different_case_share_one_section(
+        self, tmp_path: Path
+    ) -> None:
+        manager = MemoryManager(workspace=str(tmp_path), user_id="u1")
+
+        await manager.write_long_term("first fact", source="test", section="General")
+        await manager.write_long_term("second fact", source="test", section="general")
+
+        content = manager.long_term_path.read_text(encoding="utf-8")
+
+        assert content.count("## ") == 1
+        assert "first fact" in content
+        assert "second fact" in content
+
+    @pytest.mark.asyncio
+    async def test_replace_section_matches_case_insensitively(self, tmp_path: Path) -> None:
+        manager = MemoryManager(workspace=str(tmp_path), user_id="u1")
+        await manager.write_long_term("old fact", source="test", section="Preferences")
+
+        await manager.replace_long_term_section(
+            ["new fact"],
+            source="test",
+            section="preferences",
+        )
+
+        content = manager.long_term_path.read_text(encoding="utf-8")
+
+        assert content.count("## ") == 1
+        assert "new fact" in content
+        assert "old fact" not in content

@@ -197,3 +197,27 @@ def test_memory_search_returns_real_citation_results(tmp_path: Path) -> None:
     assert "TypeScript examples" in first["snippet"]
     assert first["path"] == "users/alice/memory/MEMORY.md"
     assert first["citation"].startswith("users/alice/memory/MEMORY.md#L")
+
+
+def test_memory_write_rejects_section_injection(tmp_path: Path) -> None:
+    """A section value must not be able to inject headings into MEMORY.md."""
+    memory_manager = MemoryManager(workspace=str(tmp_path), user_id="default")
+    client = _build_client(
+        tmp_path,
+        authz=None,
+        memory_manager=memory_manager,
+        current_user=UserInfo(user_id="local-dev", display_name="Local Dev", auth_type="none"),
+    )
+
+    response = client.post(
+        "/api/memory/write",
+        json={
+            "content": "injected",
+            "memory_type": "long_term",
+            "section": "General\n\n## Injected",
+        },
+    )
+
+    assert response.status_code == 400
+    assert "Section must be a single-line title" in response.json()["detail"]
+    assert not (tmp_path / "users" / "local-dev" / "memory" / "MEMORY.md").exists()

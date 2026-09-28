@@ -334,12 +334,18 @@ def register_skills_memory_routes(router: APIRouter) -> None:
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Invalid memory_type: {request.memory_type}",
             )
-        entry = await memory_manager.write_long_term(
-            request.content,
-            source=request.source,
-            tags=request.tags,
-            section=request.section,
-        )
+        try:
+            entry = await memory_manager.write_long_term(
+                request.content,
+                source=request.source,
+                tags=request.tags,
+                section=request.section,
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(exc),
+            ) from exc
 
         return {
             "id": entry.id,
