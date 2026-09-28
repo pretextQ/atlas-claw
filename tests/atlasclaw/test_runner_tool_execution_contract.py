@@ -4687,3 +4687,99 @@ async def test_post_success_side_effects_do_not_block_answer_completion() -> Non
     await runner._await_background_post_success_tasks()
     assert session_manager.persisted_messages is not None
     assert runner.runtime_events.context_ready_calls
+
+
+class _RecordingAutoMemory:
+    """Auto-memory double counting how often the distill+maintain path runs."""
+
+    def __init__(self, delay_seconds: float = 0.0) -> None:
+        self.calls: list[str] = []
+        self._delay_seconds = delay_seconds
+
+    async def write_after_success(self, **kwargs):
+        del kwargs
+        if self._delay_seconds:
+            await asyncio.sleep(self._delay_seconds)
+        self.calls.append("write")
+        return SimpleNamespace(status="ok", long_term_count=0, diagnostics={})
+
+
+def _post_success_kwargs(session_manager, run_id: str) -> dict:
+    return {
+        "state": {
+            "deps": SimpleNamespace(extra={}),
+            "persist_user_message_metadata": {},
+        },
+        "_log_step": lambda *args, **kwargs: None,
+        "session_key": "session-1",
+        "run_id": run_id,
+        "session_manager": session_manager,
+        "persist_messages": [{"role": "assistant", "content": "hi"}],
+        "final_assistant": "hi",
+        "final_messages": [{"role": "assistant", "content": "hi"}],
+        "session": SimpleNamespace(title=""),
+        "user_message": "hello",
+        "system_prompt": "system",
+        "tool_call_summaries": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_post_success_side_effects_scheduled_once_per_run() -> None:
+    """A run that reaches the scheduling point twice must not double-write."""
+    runner = _PostRunner()
+    runner.auto_memory = _RecordingAutoMemory()
+    session_manager = _SessionManager()
+
+    runner._schedule_post_success_side_effects(**_post_success_kwargs(session_manager, "run-1"))
+    runner._schedule_post_success_side_effects(**_post_success_kwargs(session_manager, "run-1"))
+
+    await runner._await_background_post_success_tasks()
+    detached = list(getattr(runner, "_detached_post_success_tasks", set()))
+    for task in detached:
+        await task
+
+    assert runner.auto_memory.calls == ["write"]
+    # Transcript persistence also happened exactly once.
+    assert session_manager.persisted_messages is not None
+
+
+@pytest.mark.asyncio
+async def test_distinct_runs_still_write_memories() -> None:
+    """Deduplication is per run, not per runner."""
+    runner = _PostRunner()
+    runner.auto_memory = _RecordingAutoMemory()
+    session_manager = _SessionManager()
+
+    runner._schedule_post_success_side_effects(**_post_success_kwargs(session_manager, "run-1"))
+    await runner._await_background_post_success_tasks()
+    for task in list(getattr(runner, "_detached_post_success_tasks", set())):
+        await task
+
+    runner._schedule_post_success_side_effects(**_post_success_kwargs(session_manager, "run-2"))
+    await runner._await_background_post_success_tasks()
+    for task in list(getattr(runner, "_detached_post_success_tasks", set())):
+        await task
+
+    assert runner.auto_memory.calls == ["write", "write"]
+
+
+@pytest.mark.asyncio
+async def test_auto_memory_write_does_not_block_run_drain() -> None:
+    """A slow distiller must not hold run completion open."""
+    runner = _PostRunner()
+    runner.auto_memory = _RecordingAutoMemory(delay_seconds=1.0)
+    session_manager = _SessionManager()
+
+    runner._schedule_post_success_side_effects(**_post_success_kwargs(session_manager, "run-1"))
+
+    # The drain returns while the detached memory write is still running.
+    await asyncio.wait_for(runner._await_background_post_success_tasks(), timeout=0.5)
+    assert runner.auto_memory.calls == []
+
+    detached = list(getattr(runner, "_detached_post_success_tasks", set()))
+    assert detached
+    for task in detached:
+        await asyncio.wait_for(task, timeout=2.0)
+
+    assert runner.auto_memory.calls == ["write"]

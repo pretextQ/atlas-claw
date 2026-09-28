@@ -112,6 +112,10 @@ class RunnerExecutionFlowPostMixin:
 
         Uses ``asyncio.wait`` (not gather) so a timeout leaves the tasks
         running instead of cancelling a transcript persist mid-rewrite.
+
+        Detached tasks (see ``_schedule_detached_post_success_task``) are
+        deliberately excluded: they may perform LLM calls and must not hold
+        the run's completion open.
         """
         background_tasks = [
             task
@@ -121,6 +125,48 @@ class RunnerExecutionFlowPostMixin:
         if not background_tasks:
             return
         await asyncio.wait(background_tasks, timeout=30.0)
+
+    def _schedule_detached_post_success_task(self, task: asyncio.Task[Any]) -> None:
+        """Track a best-effort post-success task the run must not wait for.
+
+        Used for work that can take seconds (the memory distiller performs up
+        to two LLM calls). The task is still referenced so it cannot be
+        garbage collected mid-flight.
+        """
+        detached_tasks = getattr(self, "_detached_post_success_tasks", None)
+        if detached_tasks is None:
+            detached_tasks = set()
+            setattr(self, "_detached_post_success_tasks", detached_tasks)
+        detached_tasks.add(task)
+        task.add_done_callback(self._on_background_post_success_done)
+
+    def _mark_post_success_scheduled(self, run_id: str) -> bool:
+        """Claim the single post-success side-effect slot for a run.
+
+        A run can reach the scheduling point more than once (unsupported-tool
+        recovery, then the final answer). Only the first call wins so
+        transcript persistence and memory distillation are not duplicated.
+
+        Args:
+            run_id: Identifier of the run currently finishing.
+
+        Returns:
+            True when the caller may schedule the side effects.
+        """
+        if not run_id:
+            return True
+        scheduled = getattr(self, "_post_success_run_ids", None)
+        if scheduled is None:
+            scheduled = set()
+            setattr(self, "_post_success_run_ids", scheduled)
+        if run_id in scheduled:
+            return False
+        scheduled.add(run_id)
+        # Bound the bookkeeping so a long-lived runner cannot grow it forever.
+        if len(scheduled) > 256:
+            scheduled.clear()
+            scheduled.add(run_id)
+        return True
 
     def _schedule_post_success_side_effects(
         self,
@@ -138,6 +184,9 @@ class RunnerExecutionFlowPostMixin:
         system_prompt: str,
         tool_call_summaries: list[dict[str, Any]],
     ) -> None:
+        if not self._mark_post_success_scheduled(run_id):
+            _log_step("post_success_side_effects_skipped", reason="already_scheduled")
+            return
         persist_user_metadata = self._persist_user_message_metadata_from_deps(state.get("deps"))
 
         async def _run_post_success_side_effects() -> None:
@@ -204,59 +253,66 @@ class RunnerExecutionFlowPostMixin:
                 logger.exception("post_success_run_context_ready failed")
                 _log_step("post_success_run_context_ready_error", error=str(exc))
 
+        async def _run_auto_memory_write() -> None:
             auto_memory = getattr(self, "auto_memory", None)
             deps = state.get("deps")
-            if auto_memory is not None and deps is not None:
-                # Auto memory runs after a successful final answer as a
-                # best-effort side effect. It is permission-gated inside the
-                # service and must never change or delay the user-visible reply.
-                _log_step("post_success_auto_memory_start")
-                try:
-                    result = await auto_memory.write_after_success(
-                        deps=deps,
-                        session_key=session_key,
-                        run_id=run_id,
-                        user_message=user_message,
-                        assistant_message=final_assistant,
-                        final_messages=final_messages,
-                        run_single=getattr(self, "run_single", None),
-                        agent=state.get("runtime_agent") or getattr(self, "agent", None),
-                    )
-                    diagnostics = getattr(result, "diagnostics", {}) or {}
-                    if not isinstance(diagnostics, dict):
-                        diagnostics = {}
-                    _log_step(
-                        "post_success_auto_memory_done",
-                        status=str(getattr(result, "status", "") or ""),
-                        long_term_count=int(getattr(result, "long_term_count", 0) or 0),
-                        skip_reason=str(diagnostics.get("skip_reason", "") or ""),
-                        model_skip_reason=str(diagnostics.get("model_skip_reason", "") or ""),
-                        json_parse_status=str(diagnostics.get("json_parse_status", "") or ""),
-                        distiller_attempted=bool(diagnostics.get("distiller_attempted", False)),
-                    )
-                    trigger_auto_memory_completed = getattr(
-                        self.runtime_events,
-                        "trigger_memory_auto_write_completed",
-                        None,
-                    )
-                    if callable(trigger_auto_memory_completed):
-                        try:
-                            await trigger_auto_memory_completed(
-                                session_key=session_key,
-                                run_id=run_id,
-                                status=str(getattr(result, "status", "") or ""),
-                                long_term_count=int(getattr(result, "long_term_count", 0) or 0),
-                                diagnostics=diagnostics,
-                            )
-                        except Exception as exc:
-                            logger.warning("post_success_auto_memory audit failed open: %s", exc)
-                            _log_step("post_success_auto_memory_audit_error", error=str(exc))
-                except Exception as exc:
-                    logger.warning("post_success_auto_memory failed open: %s", exc)
-                    _log_step("post_success_auto_memory_error", error=str(exc))
+            if auto_memory is None or deps is None:
+                return
+            # Auto memory runs after a successful final answer as a
+            # best-effort side effect. It is permission-gated inside the
+            # service, performs up to two LLM calls, and must never change or
+            # delay the user-visible reply: it runs detached from the drained
+            # side effects so run completion does not wait on it.
+            _log_step("post_success_auto_memory_start")
+            try:
+                result = await auto_memory.write_after_success(
+                    deps=deps,
+                    session_key=session_key,
+                    run_id=run_id,
+                    user_message=user_message,
+                    assistant_message=final_assistant,
+                    final_messages=final_messages,
+                    run_single=getattr(self, "run_single", None),
+                    agent=state.get("runtime_agent") or getattr(self, "agent", None),
+                )
+                diagnostics = getattr(result, "diagnostics", {}) or {}
+                if not isinstance(diagnostics, dict):
+                    diagnostics = {}
+                _log_step(
+                    "post_success_auto_memory_done",
+                    status=str(getattr(result, "status", "") or ""),
+                    long_term_count=int(getattr(result, "long_term_count", 0) or 0),
+                    skip_reason=str(diagnostics.get("skip_reason", "") or ""),
+                    model_skip_reason=str(diagnostics.get("model_skip_reason", "") or ""),
+                    json_parse_status=str(diagnostics.get("json_parse_status", "") or ""),
+                    distiller_attempted=bool(diagnostics.get("distiller_attempted", False)),
+                )
+                trigger_auto_memory_completed = getattr(
+                    self.runtime_events,
+                    "trigger_memory_auto_write_completed",
+                    None,
+                )
+                if callable(trigger_auto_memory_completed):
+                    try:
+                        await trigger_auto_memory_completed(
+                            session_key=session_key,
+                            run_id=run_id,
+                            status=str(getattr(result, "status", "") or ""),
+                            long_term_count=int(getattr(result, "long_term_count", 0) or 0),
+                            diagnostics=diagnostics,
+                        )
+                    except Exception as exc:
+                        logger.warning("post_success_auto_memory audit failed open: %s", exc)
+                        _log_step("post_success_auto_memory_audit_error", error=str(exc))
+            except Exception as exc:
+                logger.warning("post_success_auto_memory failed open: %s", exc)
+                _log_step("post_success_auto_memory_error", error=str(exc))
 
         self._schedule_background_post_success_task(
             asyncio.create_task(_run_post_success_side_effects())
+        )
+        self._schedule_detached_post_success_task(
+            asyncio.create_task(_run_auto_memory_write())
         )
 
     def _build_missing_tool_evidence_failure_reasons(
