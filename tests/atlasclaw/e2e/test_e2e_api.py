@@ -27,14 +27,6 @@ pytestmark = pytest.mark.e2e
 TEST_SERVER_URL = os.environ.get("TEST_SERVER_URL", "http://127.0.0.1:8000")
 
 
-@pytest.fixture(scope="module")
-def event_loop():
-    """创建事件循环"""
-    loop = asyncio.new_event_loop()
-    yield loop
-    loop.close()
-
-
 @pytest_asyncio.fixture
 async def client() -> AsyncGenerator[httpx.AsyncClient, None]:
     """HTTP 客户端 fixture"""

@@ -269,28 +269,49 @@ class TestConcurrentEdgeCases:
     @pytest.mark.asyncio
     async def test_concurrent_acquire_release(self):
         """
-        验证：并发获取和释放信号量不会死锁
+        验证：并发获取和释放信号量不会死锁，且同一会话内互斥
         """
         queue = SessionQueue(max_concurrent=2)
-        
+        active_per_session: dict[str, int] = {}
+        max_active_per_session: dict[str, int] = {}
+        completed = 0
+
         async def worker(session_key: str, duration: float):
+            nonlocal completed
             await queue.acquire(session_key)
             try:
+                active_per_session[session_key] = active_per_session.get(session_key, 0) + 1
+                max_active_per_session[session_key] = max(
+                    max_active_per_session.get(session_key, 0),
+                    active_per_session[session_key],
+                )
                 await asyncio.sleep(duration)
             finally:
+                active_per_session[session_key] -= 1
                 queue.release(session_key)
-        
-        # 多个 worker 并发执行
+            completed += 1
+
+        # 多个 worker 并发执行，三个会话共享
         workers = [
             worker(f"session-{i % 3}", 0.01)
             for i in range(10)
         ]
-        
+
         # 应在有限时间内完成，无死锁
         await asyncio.wait_for(
             asyncio.gather(*workers),
             timeout=5.0
         )
+
+        assert completed == 10, "部分 worker 未完成"
+        # 同一会话的运行必须串行：任何时刻每个会话最多一个活动运行
+        assert max_active_per_session == {
+            "session-0": 1,
+            "session-1": 1,
+            "session-2": 1,
+        }, f"同一会话出现并发运行: {max_active_per_session}"
+        # 全部释放后不再有活动会话
+        assert queue.get_stats()["active_sessions"] == 0
 
 
 # 运行测试的辅助函数

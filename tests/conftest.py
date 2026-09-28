@@ -22,14 +22,6 @@ os.environ.setdefault('ATLASCLAW_CONFIG', str((Path(__file__).parent / 'atlascla
 
 
 
-@pytest.fixture(scope="session")
-def event_loop():
-    """鍒涘缓浜嬩欢寰幆 fixture"""
-    loop = asyncio.new_event_loop()
-    yield loop
-    loop.close()
-
-
 @pytest.fixture
 def anyio_backend():
     """鎸囧畾 anyio 鍚庣"""
