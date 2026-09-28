@@ -120,15 +120,15 @@ class OIDCLoginProvider:
                     data=payload,
                     auth=auth,
                 )
-                logger.error(
-                    "[TokenExchange] status=%s body=%s",
-                    resp.status_code,
-                    resp.text[:500],
-                )
+                # Never log the response body: it carries access/refresh/id
+                # tokens even on success.
+                logger.debug("[TokenExchange] status=%s", resp.status_code)
                 resp.raise_for_status()
                 return resp.json()
         except httpx.HTTPStatusError as exc:
-            logger.error(f"Token exchange failed: {exc.response.text}")
+            logger.error(
+                "Token exchange failed: status=%s", exc.response.status_code
+            )
             raise AuthenticationError(f"Token exchange failed: {exc.response.status_code}")
         except Exception as exc:
             logger.error(f"Token exchange error: {exc}")

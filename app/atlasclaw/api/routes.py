@@ -25,6 +25,7 @@ from .routes_session import register_session_routes
 from .routes_skills_memory import register_skills_memory_routes
 from .routes_webhook import register_webhook_routes
 from .routes_workspace_files import register_workspace_file_routes
+from ..core.trace import sanitize_log_value
 
 logger = logging.getLogger(__name__)
 
@@ -34,9 +35,15 @@ def _safe_decode_request_body(body: bytes, max_chars: int = 1000) -> str:
         return "<empty>"
     try:
         parsed = json.loads(body)
-        text = json.dumps(parsed, ensure_ascii=True, sort_keys=True)
     except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
-        text = body.decode("utf-8", errors="replace")
+        # Raw non-JSON bodies cannot be field-redacted reliably and may
+        # contain passwords, so only their shape is logged.
+        return f"<non-json body: {len(body)} bytes>"
+    sanitized = sanitize_log_value(parsed, max_string_chars=max_chars)
+    try:
+        text = json.dumps(sanitized, ensure_ascii=True, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        return f"<unserializable body: {len(body)} bytes>"
     if len(text) > max_chars:
         return f"{text[:max_chars]}...<truncated>"
     return text
