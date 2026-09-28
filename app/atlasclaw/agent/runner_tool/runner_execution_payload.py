@@ -700,6 +700,13 @@ class RunnerExecutionPayloadMixin:
         if nominal_cut <= 0:
             return session_prefix + normalized_runtime
 
+        # If runtime is not longer than the prepared history it cannot carry
+        # both the history prefix and the new turn content (agents that return
+        # all_messages() without the prepared history, or heavily trimmed
+        # histories): everything it returned is new turn content.
+        if len(normalized_runtime) <= int(runtime_base_history_len or 0):
+            return session_prefix + normalized_runtime
+
         # Heuristic: if the nominal cut already places a user message as the first
         # item in the suffix, that's the expected normal case — use it directly.
         if nominal_cut < len(normalized_runtime):
