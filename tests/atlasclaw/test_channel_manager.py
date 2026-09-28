@@ -853,3 +853,27 @@ class TestChannelManagerInitialization:
 
         await asyncio.sleep(0)
         assert task not in self.manager._background_tasks
+
+
+@pytest.mark.asyncio
+async def test_stop_all_stops_every_active_connection():
+    """Application shutdown must stop every active channel connection."""
+    manager = ChannelManager(tempfile.mkdtemp())
+    stopped: list[str] = []
+
+    class _StoppableHandler(WebSocketHandler):
+        async def stop(self):
+            stopped.append("stop")
+            return True
+
+        async def disconnect(self):
+            stopped.append("disconnect")
+            return True
+
+    for index in (1, 2):
+        manager._active_connections[f"user-1:websocket:conn-{index}"] = _StoppableHandler({})
+
+    await manager.stop_all()
+
+    assert manager._active_connections == {}
+    assert stopped.count("stop") == 2

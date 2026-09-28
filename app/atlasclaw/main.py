@@ -868,6 +868,18 @@ async def lifespan(app: FastAPI):
     
     # Cleanup on shutdown
     print("[AtlasClaw] Application shutting down")
+
+    # Drain the channel manager's background tasks first so no initialization
+    # is still racing the shutdown sequence.
+    if _channel_manager is not None:
+        pending_tasks = [
+            task for task in list(getattr(_channel_manager, "_background_tasks", ())) if not task.done()
+        ]
+        for task in pending_tasks:
+            task.cancel()
+        if pending_tasks:
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
+
     if _heartbeat_task is not None:
         _heartbeat_task.cancel()
         try:
@@ -875,11 +887,31 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             pass
 
+    # Stop every channel connection (closes SDK subprocesses and WebSockets).
+    if _channel_manager is not None:
+        try:
+            await _channel_manager.stop_all()
+        except Exception as e:
+            print(f"[AtlasClaw] Channel shutdown failed: {e}")
+
     try:
         from app.atlasclaw.tools.ui.browser_tool import cleanup_all_browser_managers
         await cleanup_all_browser_managers()
     except Exception as e:
         print(f"[AtlasClaw] Browser cleanup skipped: {e}")
+
+    try:
+        from app.atlasclaw.tools.skill_runtime_tools import shutdown_skill_processes
+        await shutdown_skill_processes()
+    except Exception as e:
+        print(f"[AtlasClaw] Skill process cleanup skipped: {e}")
+
+    # Release the connection pool so the process can exit cleanly.
+    if db_initialized:
+        try:
+            await get_db_manager().close()
+        except Exception as e:
+            print(f"[AtlasClaw] Database shutdown failed: {e}")
 
 
 def create_app() -> FastAPI:

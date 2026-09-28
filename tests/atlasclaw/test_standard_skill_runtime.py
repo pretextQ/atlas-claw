@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,6 +17,7 @@ from app.atlasclaw.agent.runner_tool.runner_execution_prepare import (
 from app.atlasclaw.auth.models import UserInfo
 from app.atlasclaw.core.deps import SkillDeps
 from app.atlasclaw.skills.registry import SkillRegistry
+from app.atlasclaw.tools import skill_runtime_tools
 from app.atlasclaw.tools.registration import register_builtin_tools
 from app.atlasclaw.tools.skill_runtime_tools import (
     _runtime_dirs,
@@ -603,3 +605,171 @@ def test_standard_runtime_skill_directories_do_not_collapse_similar_skill_ids(
     second_root = _runtime_dirs(ctx_for("a_b"))["root"]
 
     assert first_root != second_root
+
+
+def _process_ctx(workspace: Path, skill_file: Path) -> SimpleNamespace:
+    """Build a minimal ctx that may own long-lived skill processes."""
+    return SimpleNamespace(
+        deps=SkillDeps(
+            user_info=UserInfo(user_id="u1", display_name="User One"),
+            session_key="s1",
+            session_manager=SimpleNamespace(workspace_path=workspace),
+            extra={
+                "standard_skill_runtime_enabled": True,
+                "target_md_skill": {
+                    "qualified_name": "xlsx",
+                    "file_path": str(skill_file),
+                },
+            },
+        )
+    )
+
+
+def test_standard_runtime_process_poll_reports_exit_and_reaps(tmp_path: Path) -> None:
+    """A finished process must report its exit and not linger in the registry."""
+    workspace = tmp_path / "workspace"
+    skill_dir = tmp_path / "skills" / "xlsx"
+    skill_dir.mkdir(parents=True)
+    skill_file = skill_dir / "SKILL.md"
+    skill_file.write_text("---\nname: xlsx\ndescription: xlsx\n---\n", encoding="utf-8")
+
+    script = skill_dir / "quick.py"
+    script.write_text("print('finished', flush=True)\n", encoding="utf-8")
+    ctx = _process_ctx(workspace, skill_file)
+
+    async def run_case() -> None:
+        start = await skill_process_tool(
+            ctx,
+            action="start",
+            command=f'{_python_exec()} -u "{script.as_posix()}"',
+        )
+        process_id = start["details"]["process_id"]
+        # Wait for the child to exit.
+        for _ in range(100):
+            await asyncio.sleep(0.05)
+            managed = skill_runtime_tools._PROCESSES.get(process_id)
+            if managed is not None and managed.proc.returncode is not None:
+                break
+
+        final_poll = await skill_process_tool(ctx, action="poll", process_id=process_id)
+
+        assert final_poll["is_error"] is False
+        assert final_poll["details"]["status"] == "exited"
+        assert final_poll["details"]["exit_code"] == 0
+        # Output is delivered incrementally, so the line may have already been
+        # returned by the start call; across both reads it must be visible.
+        observed = start["content"][0]["text"] + final_poll["content"][0]["text"]
+        assert "finished" in observed
+
+        # The finished entry is reaped once its retention window passes.
+        managed = skill_runtime_tools._PROCESSES[process_id]
+        managed.exited_at = time.time() - skill_runtime_tools.EXITED_PROCESS_RETENTION_SECONDS - 1
+        assert skill_runtime_tools._reap_exited_processes() >= 1
+        assert process_id not in skill_runtime_tools._PROCESSES
+
+    asyncio.run(run_case())
+
+
+def test_standard_runtime_process_start_enforces_capacity(tmp_path: Path) -> None:
+    """The tracked-process registry must refuse unbounded growth."""
+    workspace = tmp_path / "workspace"
+    skill_dir = tmp_path / "skills" / "xlsx"
+    skill_dir.mkdir(parents=True)
+    skill_file = skill_dir / "SKILL.md"
+    skill_file.write_text("---\nname: xlsx\ndescription: xlsx\n---\n", encoding="utf-8")
+    ctx = _process_ctx(workspace, skill_file)
+
+    class _FakeProcess:
+        returncode = None
+        stdout = None
+        stdin = None
+
+    saved = dict(skill_runtime_tools._PROCESSES)
+    skill_runtime_tools._PROCESSES.clear()
+    try:
+        for index in range(skill_runtime_tools.MAX_TRACKED_PROCESSES):
+            skill_runtime_tools._PROCESSES[f"fake-{index}"] = skill_runtime_tools._ManagedProcess(
+                process_id=f"fake-{index}",
+                owner_key="someone",
+                proc=_FakeProcess(),
+                command="sleep",
+            )
+
+        async def run_case() -> dict:
+            return await skill_process_tool(ctx, action="start", command=_python_exec())
+
+        result = asyncio.run(run_case())
+
+        assert result["is_error"] is True
+        assert "too many tracked processes" in result["content"][0]["text"]
+    finally:
+        skill_runtime_tools._PROCESSES.clear()
+        skill_runtime_tools._PROCESSES.update(saved)
+
+
+def test_standard_runtime_read_incremental_buffer_is_bounded() -> None:
+    """Output buffers keep only a tail so a chatty process cannot grow memory."""
+    managed = skill_runtime_tools._ManagedProcess(
+        process_id="p1",
+        owner_key="owner",
+        proc=SimpleNamespace(returncode=None),
+        command="chatty",
+    )
+    managed.MAX_BUFFER_CHARS = 32
+
+    class _Stdout:
+        def __init__(self, chunks: list[bytes]) -> None:
+            self._chunks = list(chunks)
+
+        async def read(self, size: int) -> bytes:
+            del size
+            return self._chunks.pop(0) if self._chunks else b""
+
+    async def run_case() -> str:
+        managed.proc = SimpleNamespace(
+            stdout=_Stdout([b"a" * 40, b"b" * 40]),
+            returncode=None,
+        )
+        return await managed.read_incremental()
+
+    output = asyncio.run(run_case())
+
+    # Only the newest MAX_BUFFER_CHARS characters are retained; the oldest
+    # output is dropped instead of growing the buffer without bound.
+    assert len(managed._buffer) <= managed.MAX_BUFFER_CHARS
+    assert output == "b" * managed.MAX_BUFFER_CHARS
+    assert managed._read_offset <= len(managed._buffer)
+
+
+def test_standard_runtime_shutdown_kills_tracked_processes() -> None:
+    """Application shutdown must terminate tracked skill processes."""
+    killed: list[str] = []
+
+    class _FakeProcess:
+        returncode = None
+
+        def kill(self) -> None:
+            killed.append("killed")
+
+        async def wait(self) -> int:
+            self.returncode = -9
+            return -9
+
+    saved = dict(skill_runtime_tools._PROCESSES)
+    skill_runtime_tools._PROCESSES.clear()
+    try:
+        for index in range(3):
+            skill_runtime_tools._PROCESSES[f"p{index}"] = skill_runtime_tools._ManagedProcess(
+                process_id=f"p{index}",
+                owner_key="owner",
+                proc=_FakeProcess(),
+                command="sleep",
+            )
+
+        asyncio.run(skill_runtime_tools.shutdown_skill_processes())
+
+        assert killed == ["killed"] * 3
+        assert skill_runtime_tools._PROCESSES == {}
+    finally:
+        skill_runtime_tools._PROCESSES.clear()
+        skill_runtime_tools._PROCESSES.update(saved)

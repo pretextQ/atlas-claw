@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import re
 import shlex
@@ -30,6 +31,8 @@ if TYPE_CHECKING:
     from pydantic_ai import RunContext
     from app.atlasclaw.core.deps import SkillDeps
 
+
+logger = logging.getLogger(__name__)
 
 _ABSOLUTE_PATH_RE = re.compile(r"(?<![:\w])/(?:[^\s'\"`<>|\\]+)")
 _WINDOWS_PATH_RE = re.compile(r"(?:\\\\[^\s'\"]+|[A-Za-z]:[\\/][^\s'\"]*)")
@@ -515,6 +518,15 @@ class _ManagedProcess:
     command: str
     _buffer: str = ""
     _read_offset: int = 0
+    exited_at: Optional[float] = None
+
+    # Keep only the tail of accumulated stdout: a chatty long-running skill
+    # would otherwise grow this buffer for the lifetime of the process.
+    MAX_BUFFER_CHARS = 64 * 1024
+
+    def has_exited(self) -> bool:
+        """Return whether the underlying process has finished."""
+        return self.exited_at is not None or self.proc.returncode is not None
 
     async def read_incremental(self) -> str:
         """Return unread stdout content without blocking for process completion."""
@@ -530,12 +542,55 @@ class _ManagedProcess:
                 break
             chunks.append(data.decode("utf-8", errors="replace"))
         self._buffer += "".join(chunks)
+        if len(self._buffer) > self.MAX_BUFFER_CHARS:
+            trimmed = len(self._buffer) - self.MAX_BUFFER_CHARS
+            self._buffer = self._buffer[trimmed:]
+            self._read_offset = max(0, self._read_offset - trimmed)
         result = self._buffer[self._read_offset :]
         self._read_offset = len(self._buffer)
         return result
 
 
 _PROCESSES: dict[str, _ManagedProcess] = {}
+
+# Bounds for the tracked-process registry. Exited processes are reaped on
+# every start; the cap prevents one session from holding unbounded subprocesses.
+MAX_TRACKED_PROCESSES = 32
+EXITED_PROCESS_RETENTION_SECONDS = 300.0
+
+
+def _reap_exited_processes(now: Optional[float] = None) -> int:
+    """Drop finished processes from the registry.
+
+    Entries are kept briefly after exit so a final ``poll`` can still report
+    the exit status; afterwards they are removed.
+
+    Returns:
+        Number of entries reaped.
+    """
+    current = time.time() if now is None else now
+    reaped = 0
+    for process_id, managed in list(_PROCESSES.items()):
+        if not managed.has_exited():
+            continue
+        if managed.exited_at is None:
+            managed.exited_at = current
+        if current - managed.exited_at >= EXITED_PROCESS_RETENTION_SECONDS:
+            _PROCESSES.pop(process_id, None)
+            reaped += 1
+    return reaped
+
+
+async def shutdown_skill_processes() -> None:
+    """Terminate every tracked skill process; used at application shutdown."""
+    for process_id, managed in list(_PROCESSES.items()):
+        _PROCESSES.pop(process_id, None)
+        try:
+            if managed.proc.returncode is None:
+                managed.proc.kill()
+                await managed.proc.wait()
+        except Exception:
+            logger.warning("[SkillRuntime] Failed to kill process %s", process_id, exc_info=True)
 
 
 def _get_process_for_ctx(
@@ -567,6 +622,14 @@ async def skill_process_tool(
     if normalized_action == "start":
         if not command:
             return ToolResult.error("command is required for start action").to_dict()
+        _reap_exited_processes()
+        if len(_PROCESSES) >= MAX_TRACKED_PROCESSES:
+            return ToolResult.error(
+                (
+                    f"too many tracked processes (limit {MAX_TRACKED_PROCESSES}); "
+                    "kill finished ones with action=kill before starting more"
+                )
+            ).to_dict()
         try:
             env = _runtime_env(ctx)
             args = _runtime_command_args(command, env)
@@ -600,8 +663,23 @@ async def skill_process_tool(
         managed = _get_process_for_ctx(ctx, process_id)
         if managed is None:
             return ToolResult.error(f"process {process_id} not found").to_dict()
+        output = await managed.read_incremental()
+        if managed.proc.returncode is not None:
+            # The process finished: report the real outcome instead of a
+            # perpetual "running" status, and note when it exited so the
+            # registry can reap the entry later.
+            if managed.exited_at is None:
+                managed.exited_at = time.time()
+            return ToolResult.text(
+                truncate_output(output),
+                details={
+                    "process_id": process_id,
+                    "status": "exited",
+                    "exit_code": managed.proc.returncode,
+                },
+            ).to_dict()
         return ToolResult.text(
-            truncate_output(await managed.read_incremental()),
+            truncate_output(output),
             details={"process_id": process_id, "status": "running"},
         ).to_dict()
     if normalized_action == "send_keys":

@@ -478,6 +478,22 @@ class ChannelManager:
         )
         return key.to_string(scope=SessionScope.PER_ACCOUNT_CHANNEL_PEER)
 
+    async def stop_all(self) -> None:
+        """Stop every active channel connection.
+
+        Used at application shutdown so SDK subprocesses and WebSockets do not
+        outlive the process.
+        """
+        for instance_key in list(self._active_connections.keys()):
+            parts = instance_key.split(":")
+            if len(parts) != 3:
+                continue
+            user_id, channel_type, connection_id = parts
+            try:
+                await self.stop_connection(user_id, channel_type, connection_id)
+            except Exception:
+                logger.warning("Failed to stop channel connection: %s", instance_key, exc_info=True)
+
     async def stop_connection(
         self,
         user_id: str,
