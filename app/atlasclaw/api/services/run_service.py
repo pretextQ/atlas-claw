@@ -235,8 +235,14 @@ async def execute_agent_run(
     encountered_error = False
     final_error_message = ""
     final_answer_committed = False
+    queue_acquired = False
 
     try:
+        # Serialize runs per session: concurrent turns in one session would
+        # otherwise interleave transcript writes and clobber each other.
+        await ctx.session_queue.acquire(session_key)
+        queue_acquired = True
+
         target_agent_id = SessionKey.from_string(session_key).agent_id or "main"
         runner = None
         if ctx.agent_runners:
@@ -399,6 +405,8 @@ async def execute_agent_run(
             ctx.sse_manager.push_lifecycle(run_id, "error")
 
     finally:
+        if queue_acquired:
+            ctx.session_queue.release(session_key)
         ctx.sse_manager.close_stream(run_id)
         run_info = ctx.active_runs.get(run_id)
         if run_info is not None:

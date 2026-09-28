@@ -22,11 +22,15 @@ Key settings:
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
+
+
+logger = logging.getLogger(__name__)
 
 
 class QueueMode(Enum):
@@ -115,17 +119,39 @@ class SessionQueue:
         self._channel_modes: dict[str, QueueMode] = {}
     
     async def acquire(self, session_key: str) -> bool:
-        """Acquire execution slots for a session run."""
-        # Acquire the global slot first.
-        await self._global_semaphore.acquire()
-        # Then acquire the session-local serialization slot.
+        """Acquire execution slots for a session run.
+
+        The session-local slot is taken before the global permit: acquiring in
+        the opposite order lets a run hold the global permit while waiting for
+        a session slot held by a run that is itself waiting for the global
+        permit, which deadlocks.
+
+        Args:
+            session_key: Serialized session key.
+
+        Returns:
+            True once both slots are held.
+        """
         await self._locks[session_key].acquire()
+        try:
+            await self._global_semaphore.acquire()
+        except BaseException:
+            # Cancellation while waiting for the global permit must not leak
+            # the session slot.
+            self._locks[session_key].release()
+            raise
         self._active[session_key] = True
         return True
-    
+
     def release(self, session_key: str) -> None:
-        """Release execution slots after a session run completes."""
-        self._active[session_key] = False
+        """Release execution slots after a session run completes.
+
+        Releasing a session that is not active is ignored so a double release
+        cannot inflate the global permit count.
+        """
+        if not self._active.pop(session_key, False):
+            logger.warning("[SessionQueue] release called without an active run: %s", session_key)
+            return
         self._locks[session_key].release()
         self._global_semaphore.release()
     

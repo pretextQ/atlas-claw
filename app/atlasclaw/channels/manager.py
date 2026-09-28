@@ -30,6 +30,10 @@ logger = logging.getLogger(__name__)
 class ChannelManager:
     """Manager for channel connections lifecycle."""
 
+    # Stable text sent to external group chats when a turn fails; the raw
+    # error stays in the server log.
+    USER_FACING_ERROR_TEXT = "抱歉，处理这条消息时出错了，请稍后重试。"
+
     def __init__(self, workspace_path: Path):
         """Initialize channel manager.
 
@@ -311,6 +315,7 @@ class ChannelManager:
             
             from app.atlasclaw.api.deps_context import build_scoped_deps, get_api_context
 
+            api_context = get_api_context()
             user_info = UserInfo(user_id=user_id, display_name=user_id.capitalize())
             session_key = self._build_channel_session_key(
                 owner_user_id=user_id,
@@ -319,7 +324,7 @@ class ChannelManager:
                 message=message,
             )
             deps = build_scoped_deps(
-                get_api_context(),
+                api_context,
                 user_info,
                 session_key,
                 extra={
@@ -335,22 +340,30 @@ class ChannelManager:
             response_text = ""
             event_count = 0
             logger.debug(f"[ChannelManager] Starting to collect events for message: {message.content[:30]}...")
-            async for event in self._agent_runner.run(
-                session_key=session_key,
-                user_message=message.content,
-                deps=deps,
-                max_tool_calls=10,
-                timeout_seconds=120,
-            ):
-                event_count += 1
-                logger.debug(f"[ChannelManager] Event {event_count}: type={event.type}")
-                # Collect text deltas
-                if event.type == "assistant":
-                    response_text += event.content or ""
-                elif event.type == "error":
-                    logger.error(f"[ChannelManager] Agent error: {event.error}")
-                    response_text = f"Processing error: {event.error}"
-                    break
+            # Serialize turns per session so channel traffic cannot interleave
+            # transcript writes with an HTTP run for the same session.
+            await api_context.session_queue.acquire(session_key)
+            try:
+                async for event in self._agent_runner.run(
+                    session_key=session_key,
+                    user_message=message.content,
+                    deps=deps,
+                    max_tool_calls=10,
+                    timeout_seconds=120,
+                ):
+                    event_count += 1
+                    logger.debug(f"[ChannelManager] Event {event_count}: type={event.type}")
+                    # Collect text deltas
+                    if event.type == "assistant":
+                        response_text += event.content or ""
+                    elif event.type == "error":
+                        # The raw error may carry provider/internal detail;
+                        # log it server-side and send the group a stable text.
+                        logger.error(f"[ChannelManager] Agent error: {event.error}")
+                        response_text = self.USER_FACING_ERROR_TEXT
+                        break
+            finally:
+                api_context.session_queue.release(session_key)
             
             logger.info(f"[ChannelManager] Processed {event_count} events, response length: {len(response_text)}")
             
