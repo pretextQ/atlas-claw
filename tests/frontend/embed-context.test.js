@@ -2,12 +2,23 @@
  *  Copyright 2026  Qianyun, Inc., www.cloudchef.io, All rights reserved.
  */
 
-import { parseEmbedSurface } from '../../app/frontend/scripts/embed/surface.js'
-import { EmbedContextStore } from '../../app/frontend/scripts/embed/context-store.js'
-import { EmbedContextBridge, EMBED_PROTOCOL } from '../../app/frontend/scripts/embed/context-bridge.js'
-import { EmbedContextController } from '../../app/frontend/scripts/embed/context-controller.js'
-import { renderContextObjectActions } from '../../app/frontend/scripts/chat-ui.js'
-import { jest } from '@jest/globals'
+// Jest runs this suite as CommonJS (the test directory has no "type": "module"
+// package boundary), so the ES modules under test are loaded dynamically, the
+// same pattern the other frontend suites use.
+let parseEmbedSurface
+let EmbedContextStore
+let EmbedContextBridge
+let EMBED_PROTOCOL
+let EmbedContextController
+let renderContextObjectActions
+
+beforeAll(async () => {
+  ;({ parseEmbedSurface } = await import('../../app/frontend/scripts/embed/surface.js'))
+  ;({ EmbedContextStore } = await import('../../app/frontend/scripts/embed/context-store.js'))
+  ;({ EmbedContextBridge, EMBED_PROTOCOL } = await import('../../app/frontend/scripts/embed/context-bridge.js'))
+  ;({ EmbedContextController } = await import('../../app/frontend/scripts/embed/context-controller.js'))
+  ;({ renderContextObjectActions } = await import('../../app/frontend/scripts/chat-ui.js'))
+})
 
 describe('atlasclaw-embed/v1 frontend contract', () => {
   test('parses only controlled surfaces and never accepts a Host Chat Active Session override', () => {
