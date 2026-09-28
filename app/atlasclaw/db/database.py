@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
+from fastapi import Request
 from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy.pool import NullPool, QueuePool
 
@@ -299,6 +300,16 @@ class DatabaseManager:
             self._session_factory = None
             logger.info("Database connections closed")
 
+    def new_session(self) -> AsyncSession:
+        """Create a session owned by the caller.
+
+        Used by the request-scoped unit of work, which commits before the
+        response is sent instead of relying on dependency teardown.
+        """
+        if self._session_factory is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        return self._session_factory()
+
     @asynccontextmanager
     async def get_session(self) -> AsyncGenerator[AsyncSession, None]:
         """Get a database session.
@@ -357,8 +368,17 @@ async def init_database(config: DatabaseConfig) -> DatabaseManager:
     return _db_manager
 
 
-async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
-    """FastAPI dependency to get a database session.
+async def get_db_session(request: Request) -> AsyncGenerator[AsyncSession, None]:
+    """FastAPI dependency to get the request-scoped database session.
+
+    The session is created and committed by ``DatabaseSessionMiddleware``
+    before the response is sent. Committing there keeps a transaction failure
+    inside the request: dependency teardown runs after the response has been
+    sent, so a commit failure at that point could not change the status code
+    and the client would see success for a rolled-back write.
+
+    When no request-scoped session exists (direct calls, jobs, tests) the
+    dependency falls back to a self-contained session that commits on exit.
 
     Usage in FastAPI:
         @router.get("/")
@@ -366,9 +386,14 @@ async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
             # Use session
             pass
     """
-    manager = get_db_manager()
-    async with manager.get_session() as session:
+    session = getattr(getattr(request, "state", None), "db_session", None)
+    if session is not None:
         yield session
+        return
+
+    manager = get_db_manager()
+    async with manager.get_session() as fallback_session:
+        yield fallback_session
 
 
 async def get_db_session_dependency() -> AsyncGenerator[AsyncSession, None]:

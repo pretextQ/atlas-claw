@@ -91,6 +91,7 @@ from app.atlasclaw.db.database import DatabaseConfig, init_database, get_db_mana
 from app.atlasclaw.db.orm.user import UserService
 from app.atlasclaw.db.orm.model_config import ModelConfigService
 from app.atlasclaw.bootstrap.app_factory_helpers import (
+    DatabaseSessionMiddleware,
     ExternalBasePathMiddleware,
     StaticFileCacheMiddleware,
     mount_frontend,
@@ -938,6 +939,9 @@ def create_app() -> FastAPI:
     )
     install_request_validation_logging(app)
     app.add_middleware(StaticFileCacheMiddleware)
+    # Owns the per-request database transaction; commits before the response
+    # is sent so a failed write cannot be reported as success.
+    app.add_middleware(DatabaseSessionMiddleware)
 
     frontend_dir = Path(__file__).parent.parent / "frontend"
     mount_frontend(app, frontend_dir)

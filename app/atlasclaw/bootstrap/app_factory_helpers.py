@@ -66,6 +66,56 @@ class StaticFileCacheMiddleware(BaseHTTPMiddleware):
         return response
 
 
+class DatabaseSessionMiddleware(BaseHTTPMiddleware):
+    """Own one database unit of work per request.
+
+    The session is committed *before* the response is returned to the client.
+    FastAPI runs yield-dependency teardown after the response has been sent,
+    so committing there means a failed transaction is reported too late: the
+    caller already received a success status for a write that was rolled back.
+    Requests whose routes never touch the database only pay for an unopened
+    session object.
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        try:
+            from app.atlasclaw.db import get_db_manager
+        except Exception:  # pragma: no cover - import guard
+            return await call_next(request)
+
+        try:
+            manager = get_db_manager()
+        except Exception:  # pragma: no cover - defensive
+            manager = None
+        if manager is None or not getattr(manager, "is_initialized", False):
+            return await call_next(request)
+
+        session = manager.new_session()
+        request.state.db_session = session
+        try:
+            response = await call_next(request)
+        except BaseException:
+            try:
+                await session.rollback()
+            except Exception:
+                pass
+            raise
+        try:
+            await session.commit()
+        except Exception:
+            try:
+                await session.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            try:
+                await session.close()
+            except Exception:
+                pass
+        return response
+
+
 class ExternalBasePathMiddleware(BaseHTTPMiddleware):
     """Accept proxied requests with the external base_path still attached."""
 
