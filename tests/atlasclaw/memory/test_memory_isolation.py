@@ -185,3 +185,92 @@ class TestMemorySectionHandling:
         assert content.count("## ") == 1
         assert "new fact" in content
         assert "old fact" not in content
+
+
+class TestCjkMemorySearch:
+    """Chinese memory text must be searchable, and stats must stay consistent."""
+
+    def test_whole_sentence_is_not_one_token(self) -> None:
+        from app.atlasclaw.memory.search import HybridSearcher
+
+        searcher = HybridSearcher()
+        tokens = searcher._tokenize("用户偏好简洁的中文回答")
+
+        # Bigrams let a sub-phrase query match a longer stored sentence.
+        assert "中文" in tokens
+        assert "简洁" in tokens
+        assert len(tokens) > 3
+
+    @pytest.mark.asyncio
+    async def test_chinese_subphrase_query_matches_stored_memory(
+        self, tmp_path: Path
+    ) -> None:
+        from app.atlasclaw.memory.search import HybridSearcher
+        from app.atlasclaw.memory.manager import MemoryEntry, MemoryType
+
+        searcher = HybridSearcher()
+        searcher.index_sync(
+            MemoryEntry(
+                id="cjk-1",
+                content="用户偏好简洁的中文回答",
+                memory_type=MemoryType.LONG_TERM,
+                source="test",
+            )
+        )
+        searcher.index_sync(
+            MemoryEntry(
+                id="en-1",
+                content="The user prefers deploy windows on fridays",
+                memory_type=MemoryType.LONG_TERM,
+                source="test",
+            )
+        )
+
+        results = await searcher.search("中文回答", top_k=5)
+
+        assert results
+        assert results[0].entry.id == "cjk-1"
+        assert results[0].text_score > 0
+
+    @pytest.mark.asyncio
+    async def test_removed_entries_roll_back_term_statistics(self) -> None:
+        from app.atlasclaw.memory.search import HybridSearcher
+        from app.atlasclaw.memory.manager import MemoryEntry, MemoryType
+
+        searcher = HybridSearcher()
+        for index in range(3):
+            searcher.index_sync(
+                MemoryEntry(
+                    id=f"e{index}",
+                    content="deploy window",
+                    memory_type=MemoryType.LONG_TERM,
+                    source="test",
+                )
+            )
+
+        assert searcher._term_doc_freq["deploy"] == 3
+        for index in range(3):
+            assert searcher.remove(f"e{index}") is True
+
+        # Every term statistic is back to empty rather than stale.
+        assert searcher._term_doc_freq == {}
+        assert searcher._doc_count == 0
+        assert searcher._avg_doc_length == 0.0
+
+    @pytest.mark.asyncio
+    async def test_reindexing_same_entry_does_not_inflate_frequencies(self) -> None:
+        from app.atlasclaw.memory.search import HybridSearcher
+        from app.atlasclaw.memory.manager import MemoryEntry, MemoryType
+
+        searcher = HybridSearcher()
+        entry = MemoryEntry(
+            id="dup",
+            content="deploy window",
+            memory_type=MemoryType.LONG_TERM,
+            source="test",
+        )
+        searcher.index_sync(entry)
+        searcher.index_sync(entry)
+
+        assert searcher._term_doc_freq["deploy"] == 1
+        assert searcher._doc_count == 1

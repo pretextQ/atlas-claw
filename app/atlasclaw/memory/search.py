@@ -20,6 +20,14 @@ from .manager import MemoryEntry
 from app.atlasclaw.core.user_paths import user_runtime_dir
 
 
+# CJK runs carry no spaces, so whitespace tokenization collapses a whole
+# sentence into a single token that no query can match. Runs are indexed as
+# character bigrams instead, which lets sub-phrase queries score.
+_CJK_RUN_RE = re.compile(
+    r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff66-\uff9f]+"
+)
+
+
 @dataclass
 class SearchResult:
     """
@@ -133,6 +141,7 @@ initialize search
         # (used for BM25)
         self._doc_count = 0
         self._doc_lengths: dict[str, int] = {}
+        self._entry_terms: dict[str, set[str]] = {}
         self._avg_doc_length = 0.0
         self._term_doc_freq: dict[str, int] = {}
         
@@ -180,43 +189,64 @@ memory entry()
         self._update_term_stats(entry)
         
     def _update_term_stats(self, entry: MemoryEntry) -> None:
-        """"""
-        tokens = self._tokenize(entry.content)
-        doc_length = len(tokens)
-        
-        self._doc_count += 1
-        self._doc_lengths[entry.id] = doc_length
-        
-        # 
-        total_length = sum(self._doc_lengths.values())
-        self._avg_doc_length = total_length / self._doc_count if self._doc_count > 0 else 0
-        
-        # 
-        seen_terms: set[str] = set()
-        for token in tokens:
-            if token not in seen_terms:
-                self._term_doc_freq[token] = self._term_doc_freq.get(token, 0) + 1
-                seen_terms.add(token)
-                
-    def remove(self, entry_id: str) -> bool:
-        """
+        """Add one entry's terms to the corpus statistics.
 
-from in entry
-        
+        Re-indexing an entry ID first rolls back its previous contribution so
+        document frequencies and the average length cannot drift.
+        """
+        self._rollback_entry_stats(entry.id)
+
+        tokens = self._tokenize(entry.content)
+        terms = set(tokens)
+        self._doc_count += 1
+        self._doc_lengths[entry.id] = len(tokens)
+        self._entry_terms[entry.id] = terms
+        for token in terms:
+            self._term_doc_freq[token] = self._term_doc_freq.get(token, 0) + 1
+        self._refresh_avg_doc_length()
+
+    def remove(self, entry_id: str) -> bool:
+        """Remove one entry and roll back its term statistics.
+
+        Term document frequencies and the average document length must be
+        decremented here; otherwise IDF drifts (a term can keep a document
+        frequency that no longer matches the corpus) and scores for every
+        remaining entry become wrong.
+
         Args:
-            entry_id:entry ID
-            
+            entry_id: Entry ID
+
         Returns:
-            
-        
-"""
+            True when an entry was removed
+        """
         if entry_id in self._entries:
-            del self._entries[entry_id]
+            self._entries.pop(entry_id)
             self._embeddings.pop(entry_id, None)
-            self._doc_lengths.pop(entry_id, None)
-            self._doc_count = max(0, self._doc_count - 1)
+            self._rollback_entry_stats(entry_id)
             return True
         return False
+
+    def _rollback_entry_stats(self, entry_id: str) -> None:
+        """Undo one entry's contribution to the corpus statistics."""
+        terms = self._entry_terms.pop(entry_id, None)
+        if terms is None and entry_id not in self._doc_lengths:
+            return
+        self._doc_lengths.pop(entry_id, None)
+        for token in terms or set():
+            current = self._term_doc_freq.get(token, 0)
+            if current <= 1:
+                self._term_doc_freq.pop(token, None)
+            else:
+                self._term_doc_freq[token] = current - 1
+        self._doc_count = max(0, self._doc_count - 1)
+        self._refresh_avg_doc_length()
+
+    def _refresh_avg_doc_length(self) -> None:
+        """Recompute the average document length from live entries."""
+        total_length = sum(self._doc_lengths.values())
+        self._avg_doc_length = (
+            total_length / self._doc_count if self._doc_count > 0 else 0
+        )
         
     async def search(
         self,
@@ -306,18 +336,21 @@ execute search
         return results
         
     def _tokenize(self, text: str) -> list[str]:
+        """Tokenize text into searchable terms.
+
+        Latin text splits on punctuation and whitespace. CJK runs have no
+        delimiters, so each run contributes character bigrams (and single
+        characters for one-character runs) instead of one unsplittable token.
         """
+        lowered = (text or "").lower()
+        tokens = [t for t in re.sub(r'[^\w\s]', ' ', lowered).split() if t.strip()]
 
+        for run in _CJK_RUN_RE.findall(lowered):
+            if len(run) == 1:
+                tokens.append(run)
+                continue
+            tokens.extend(run[index:index + 2] for index in range(len(run) - 1))
 
-        
-        implement:and split,.
-        use(such as jieba).
-        
-"""
-        # 
-        text = re.sub(r'[^\w\s]', ' ', text.lower())
-        # split filter
-        tokens = [t.strip() for t in text.split() if t.strip()]
         return tokens
         
     def _cosine_similarity(self, vec1: list[float], vec2: list[float]) -> float:
@@ -486,5 +519,6 @@ apply MMR(Maximal Marginal Relevance)
         self._embeddings.clear()
         self._doc_count = 0
         self._doc_lengths.clear()
+        self._entry_terms.clear()
         self._avg_doc_length = 0.0
         self._term_doc_freq.clear()
