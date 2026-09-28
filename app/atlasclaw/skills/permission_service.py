@@ -29,6 +29,13 @@ class SkillPermissionService:
         if group_id != GROUP_ATLASCLAW and tool_names
     )
 
+    # Explicit, audited equivalences between a bare skill id and its
+    # qualified name. Only bare identifiers may match through this table, so a
+    # permission for one provider skill never grants a different provider's
+    # skill that happens to share a local name. Entries are added deliberately
+    # when a skill is renamed from bare to qualified form.
+    skill_id_aliases: dict[str, frozenset[str]] = {}
+
     def normalize_id(self, value: Any) -> str:
         """Return a trimmed display/runtime identifier for permission comparisons."""
         return str(value or "").strip()
@@ -48,12 +55,34 @@ class SkillPermissionService:
         return ""
 
     def skill_identifier_matches(self, candidate: Any, target: Any) -> bool:
-        """Return True when two skill IDs match directly or by unqualified suffix."""
+        """Return True when two skill IDs refer to the same permission target.
+
+        Matching is exact on the full identifier: ``jira:query`` and
+        ``gitlab:query`` are different skills even though they share a local
+        name, so a grant for one never covers the other. Bare identifiers
+        (without a provider qualifier) additionally match through the explicit
+        ``skill_id_aliases`` table.
+
+        Args:
+            candidate: Skill id from a permission entry.
+            target: Skill id being checked.
+
+        Returns:
+            True when the permission entry applies to the target skill.
+        """
         candidate_key = self.normalize_key(candidate)
         target_key = self.normalize_key(target)
         if not candidate_key or not target_key:
             return False
-        return candidate_key == target_key or candidate_key.split(":")[-1] == target_key.split(":")[-1]
+        if candidate_key == target_key:
+            return True
+
+        # A bare candidate may match a qualified target only through the table.
+        if ":" not in candidate_key and target_key in self.skill_id_aliases.get(
+            candidate_key, frozenset()
+        ):
+            return True
+        return False
 
     def provider_type_from_tool_snapshot(self, tool: dict[str, Any]) -> str:
         """Extract the provider type from an executable tool snapshot."""

@@ -337,3 +337,67 @@ def test_disabled_memory_group_disables_memory_members(tmp_path: Path) -> None:
         permissions["skills"]["skill_permissions"],
         "memory_search",
     ) is False
+
+
+class TestQualifiedSkillMatching:
+    """Grants must be scoped to the exact qualified skill identifier."""
+
+    def test_same_local_name_in_different_providers_do_not_cross_grant(self):
+        """A grant for jira:query must never enable gitlab:query."""
+        entry = {
+            "skill_id": "jira:query",
+            "skill_name": "jira:query",
+            "authorized": True,
+            "enabled": True,
+        }
+
+        assert skill_permission_service.is_skill_enabled([entry], "jira:query") is True
+        assert skill_permission_service.is_skill_enabled([entry], "gitlab:query") is False
+        assert skill_permission_service.is_skill_enabled([entry], "query") is False
+
+    def test_bare_grant_does_not_enable_qualified_skill(self):
+        """A bare grant must not authorise a provider-qualified skill."""
+        entry = {
+            "skill_id": "query",
+            "skill_name": "query",
+            "authorized": True,
+            "enabled": True,
+        }
+
+        assert skill_permission_service.is_skill_enabled([entry], "query") is True
+        assert skill_permission_service.is_skill_enabled([entry], "jira:query") is False
+
+    def test_qualified_grant_matches_case_insensitively(self):
+        entry = {
+            "skill_id": "SmartCMP:Preapproval-Agent",
+            "authorized": True,
+            "enabled": True,
+        }
+
+        assert skill_permission_service.is_skill_enabled([entry], "smartcmp:preapproval-agent") is True
+
+    def test_explicit_alias_allows_bare_to_qualified_match(self):
+        """Only an explicit alias entry bridges bare and qualified ids."""
+        service = skill_permission_service.__class__()
+        service.skill_id_aliases = {"legacy-skill": frozenset({"atlasclaw:legacy-skill"})}
+
+        assert service.skill_identifier_matches("legacy-skill", "atlasclaw:legacy-skill") is True
+        # Unrelated qualified ids stay unrelated.
+        assert service.skill_identifier_matches("legacy-skill", "other:legacy-skill") is False
+        # Qualified candidates never match through the table.
+        assert service.skill_identifier_matches("atlasclaw:legacy-skill", "legacy-skill") is False
+
+    def test_group_member_grants_still_apply_exactly(self):
+        """Tool-group member grants keep working with exact matching."""
+        entry = {
+            "skill_id": "group:web",
+            "skill_name": "group:web",
+            "member_skill_ids": ["web_search"],
+            "authorized": True,
+            "enabled": True,
+        }
+
+        assert skill_permission_service.is_skill_enabled([entry], "web_search") is True
+        assert skill_permission_service.is_skill_enabled([entry], "web_fetch") is False
+        # A qualified id sharing the member's local name is not covered.
+        assert skill_permission_service.is_skill_enabled([entry], "provider:web_search") is False
