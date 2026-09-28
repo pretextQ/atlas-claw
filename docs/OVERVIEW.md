@@ -994,13 +994,12 @@ AtlasClaw-Core/
 │       ├── agent/              # Agent engine (runner, routing, prompt builder, streaming)
 │       ├── api/                # REST / WebSocket / SSE endpoints
 │       ├── auth/               # Authentication (middleware, strategy, providers)
-│       ├── channels/           # Channel adapters (REST, SSE, WebSocket)
+│       ├── channels/           # Channel adapters (Feishu, DingTalk, WeCom)
 │       ├── core/               # Config, dependency injection, provider registry
 │       ├── memory/             # Long-term memory (vector + full-text)
 │       ├── session/            # Session persistence and management
 │       ├── skills/             # Skill loading and registry
-│       ├── tools/              # Built-in tool suite
-│       └── workflow/           # Workflow engine
+│       └── tools/              # Built-in tool suite
 ├── tests/                      # Test suite
 │   ├── atlasclaw/              # Python tests
 │   └── frontend/               # JavaScript tests

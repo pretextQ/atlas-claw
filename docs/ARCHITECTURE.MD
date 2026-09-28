@@ -170,7 +170,6 @@ app/atlasclaw/
 |  |- workspace.py               # Workspace initialization helpers
 |  |- provider_registry.py       # ServiceProviderRegistry
 |  |- provider_scanner.py        # ProviderScanner (filesystem discovery)
-|  |- tenant.py                  # TenantManager, TenantConfig, TenantIsolation
 |  |- token_pool.py              # TokenPool, TokenEntry, TokenHealth
 |  \- token_interceptor.py      # TokenHealthInterceptor
 |- auth/
@@ -242,19 +241,8 @@ app/atlasclaw/
 |  \- hybrid_search.py           # Hybrid search
 |- models/
 |  |- providers.py               # ProviderConfig, ModelDefinition
-|  \- failover.py                # AuthProfile, ModelFailoverConfig
 |- hooks/
 |  \- system.py                  # HookSystem, HookPhase, HookDefinition
-|- workflow/
-|  |- engine.py                  # WorkflowEngine, WorkflowStep, StepStatus
-|  \- orchestrator.py            # Orchestration logic
-|- messages/
-|  |- handler.py                 # InboundMessage, OutboundMessage, MessageType
-|  \- command.py                 # CommandParser, ParsedCommand, CommandDefinition
-|- media/
-|  |- link_extractor.py          # URL extraction from text
-|  |- tts.py                     # Text-to-speech
-|  \- understanding.py           # Media content understanding
 
 app/frontend/
 |- index.html                     # Main chat interface
@@ -263,7 +251,6 @@ app/frontend/
 |- scripts/
 |  |- main.js                     # Application entry point
 |  |- api-client.js               # HTTP client wrapper
-|  |- channel-manager.js          # Channel connection management
 |  |- chat-ui.js                  # Chat UI components
 |  |- config.js                   # Frontend configuration
 |  |- i18n.js                     # Internationalization

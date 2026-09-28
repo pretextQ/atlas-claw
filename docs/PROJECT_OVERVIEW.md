@@ -89,8 +89,7 @@ AtlasClaw-Core/
 │       ├── providers/         # Built-in providers
 │       ├── session/           # Session management
 │       ├── skills/            # Skills system
-│       ├── tools/             # Built-in tools
-│       └── workflow/          # Workflow engine
+│       └── tools/             # Built-in tools
 ├── providers/                 # External providers (default: ../providers)
 ├── skills/                    # Standalone skills (default: ../skills)
 ├── channels/                  # System-level channel configs (default: ../channels)

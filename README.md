@@ -116,7 +116,7 @@ The core runtime in this repository centers on:
 - `Session & Memory`: conversation context, persistence, and retrieval
 - `Tools & Skills`: reusable execution units exposed to the agent
 - `Provider Registry`: registration and discovery of enterprise integrations
-- `Execution Context`: dependency injection for auth, tenant, and runtime-scoped data
+- `Execution Context`: dependency injection for auth and runtime-scoped data
 
 ## Repository Layout
 
@@ -130,7 +130,6 @@ project-root/
 ├── app/atlasclaw/session/     # Session context, queue, and manager
 ├── app/atlasclaw/skills/      # Skill loading and registry
 ├── app/atlasclaw/tools/       # Built-in tools and tool catalog
-├── app/atlasclaw/workflow/    # Workflow engine and orchestrator
 ├── docs/                      # Concepts, tools, channels, and design notes
 └── tests/                     # Pytest test suite
 ```
@@ -269,7 +268,7 @@ npm test
 
 - Entry point: `app/atlasclaw/main.py` - FastAPI application with lifespan management
 - The API surface lives under `app/atlasclaw/api/`
-- Core orchestration logic lives under `app/atlasclaw/agent/`, `app/atlasclaw/workflow/`, and `app/atlasclaw/tools/`
+- Core orchestration logic lives under `app/atlasclaw/agent/` and `app/atlasclaw/tools/`
 - Provider integrations are loaded from `providers_root` (schema default: `../providers`; common sibling-repo layout: `../atlasclaw-providers/providers`)
 
 If you are integrating AtlasClaw into a host service, start by wiring the API layer, execution context, provider registry, and session manager together in your application bootstrap.

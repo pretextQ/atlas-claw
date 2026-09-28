@@ -97,15 +97,12 @@ AtlasClaw-Core/
 |     |- channels/                 # Channel adapters
 |     |- core/                     # Core infrastructure
 |     |- hooks/                    # Hook system
-|     |- media/                    # Media processing
 |     |- memory/                   # Memory system
-|     |- messages/                 # Message processing
 |     |- models/                   # Model management
 |     |- providers/                # Built-in providers
 |     |- session/                  # Session management
 |     |- skills/                   # Skills system
 |     |- tools/                    # Built-in tools
-|     \- workflow/                # Workflow engine
 |- tests/
 |  |- conftest.py                  # pytest configuration
 |  |- atlasclaw.test.json          # Test configuration
@@ -644,11 +641,11 @@ Use `ToolPolicy` to restrict tool access per agent:
 - Deny takes priority over allow
 - Supports wildcards: `sessions_*`, `*_search`
 
-### 6.4 Tenant Isolation
+### 6.4 Workspace Isolation
 
-- Session keys, memory paths, and storage paths are prefixed with `tenant_id`
-- Use `TenantIsolation` static methods for path construction
-- Never allow cross-tenant data access
+- Session keys, memory paths, and storage paths are scoped per user under the workspace
+- Resolve paths through the workspace helpers instead of concatenating strings
+- Never allow cross-user data access
 
 ### 6.5 Secrets Management
 
@@ -1775,7 +1772,7 @@ Before approving any change, verify:
 - [ ] Permission inheritance maintained -no internal RBAC bypass
 - [ ] No hardcoded secrets (API keys, passwords, tokens)
 - [ ] User tokens propagated via `SkillDeps.user_token` for upstream calls
-- [ ] Tenant isolation maintained (no cross-tenant data access)
+- [ ] Workspace isolation maintained (no cross-user data access)
 - [ ] Tool filtering via `ToolPolicy` respected
 - [ ] External input validated at system boundaries
 

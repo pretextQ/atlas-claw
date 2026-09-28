@@ -21,11 +21,10 @@
 8. [Memory Module](#8-memory-module)
 9. [Skills Module](#9-skills-module)
 10. [Hooks Module](#10-hooks-module)
-11. [Models Module](#11-models-module)
-12. [Messages Module](#12-messages-module)
-13. [Workflow Module](#13-workflow-module)
-14. [Media Module](#14-media-module)
-15. [Frontend](#15-frontend)
+10A. [Heartbeat Module](#10a-heartbeat-module)
+11. [Database Module](#11-database-module)
+12. [Models Module](#12-models-module)
+13. [Frontend](#13-frontend)
 
 ---
 
@@ -33,7 +32,7 @@
 
 **Path**: `app/atlasclaw/core/`
 
-Provides configuration management, request-scoped dependency injection, workspace initialization, service provider registry, provider scanning, multi-tenant isolation, token pool management, and encryption services for sensitive data.
+Provides configuration management, request-scoped dependency injection, workspace initialization, service provider registry, provider scanning, token pool management, and encryption services for sensitive data.
 
 ### 1.1 ConfigManager (`core/config.py`)
 
@@ -384,56 +383,11 @@ Instance wrapper logic: when a skill is invoked, if the provider has a single in
 - `PUT /provider-configs/{id}` -Update
 - `DELETE /provider-configs/{id}` -Delete (returns 204)
 
-### 1.6 Tenant Management (`core/tenant.py`)
-
-**Dataclass: `TenantConfig`**
-
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `id` | `str` | -| Tenant identifier |
-| `name` | `str` | -| Display name |
-| `enabled` | `bool` | `True` | Whether tenant is active |
-| `max_sessions` | `int` | `100` | Max sessions quota |
-| `max_agents` | `int` | `10` | Max agents quota |
-| `max_memory_entries` | `int` | `1000` | Max memory entries quota |
-| `max_concurrent_runs` | `int` | `4` | Max concurrent agent runs |
-| `features` | `dict[str, bool]` | `{}` | Feature flags |
-| `allowed_models` | `list[str]` | `[]` | Model whitelist |
-| `default_model` | `str` | `""` | Default model |
-| `storage_prefix` | `str` | `""` | Storage path prefix |
-| `metadata` | `dict[str, Any]` | `{}` | Additional metadata |
-
-**Dataclass: `TenantUsage`** -Tracks `session_count`, `agent_count`, `memory_entry_count`, `active_runs`, `total_tokens_used`, `total_runs`.
-
-**Class: `TenantManager`**
-
-| Method | Signature | Description |
-|---|---|---|
-| `register` | `(config: TenantConfig) -> None` | Register new tenant |
-| `unregister` | `(tenant_id: str) -> bool` | Remove tenant |
-| `get` | `(tenant_id: str) -> Optional[TenantConfig]` | Get tenant config |
-| `get_or_default` | `(tenant_id) -> TenantConfig` | Get tenant or default config |
-| `check_quota` | `(tenant_id: str) -> tuple[bool, str]` | Validate quota compliance |
-| `resolve_tenant` | `(session_key, user_id, request_headers) -> str` | Resolve tenant from request |
-
-**Class: `TenantIsolation`** (static methods)
-
-| Method | Description |
-|---|---|
-| `get_session_prefix(tenant_id)` | Session key prefix for isolation |
-| `get_memory_path(tenant_id)` | Tenant-specific memory path |
-| `get_session_path(tenant_id)` | Tenant-specific session path |
-| `get_auth_path(tenant_id)` | Tenant-specific auth path |
-| `isolate_session_key(key, tenant_id)` | Prepend tenant ID to session key |
-| `extract_tenant_id(session_key)` | Extract tenant ID from session key |
-
----
-
 ## 2. Auth Module
 
 **Path**: `app/atlasclaw/auth/`
 
-Implements the authentication pipeline: credential extraction ->provider authentication ->DB user resolution ->UserInfo injection.
+Implements the authentication pipeline: credential extraction -> provider authentication -> DB user resolution -> UserInfo injection.
 
 ### 2.1 Data Models (`auth/models.py`)
 
@@ -1815,9 +1769,9 @@ Request/response schemas for API validation:
 
 **Path**: `app/atlasclaw/models/`
 
-LLM provider configuration and failover/retry logic.
+LLM provider metadata, presets, and OpenAI-compatible payload helpers.
 
-### 11.1 Provider Configuration (`models/providers.py`)
+### 12.1 Provider Configuration (`models/providers.py`)
 
 **Dataclass: `ModelDefinition`**
 
@@ -1835,117 +1789,9 @@ LLM provider configuration and failover/retry logic.
 - `resolve_env(value: str) -> str` -Resolve `${VAR}` or `${VAR:default}` patterns
 - `mask_api_key(key: str) -> str` -Mask to `***abc`
 
-### 11.2 Failover & Retry (`models/failover.py`)
-
-**Enum: `CredentialType`** -`API_KEY`, `OAUTH`, `ACCESS_KEY`
-
-**Dataclass: `AuthProfile`** -`profile_id`, `provider`, `credential_type`, `credential`, `cooldown_until`, `cooldown_count`, `disabled_until`
-
-**Dataclass: `ModelFailoverConfig`** -`primary_model`, `fallbacks: list[str]`, `cooldown_sequence: list[timedelta]`, `billing_initial_cooldown`, `billing_max_cooldown`
-
 ---
 
-## 12. Messages Module
-
-**Path**: `app/atlasclaw/messages/`
-
-Inbound/outbound message normalization and slash command parsing.
-
-### 12.1 Message Handling (`messages/handler.py`)
-
-**Enum: `MessageType`** -`TEXT`, `MEDIA`, `ATTACHMENT`, `COMMAND`, `SYSTEM`
-
-**Enum: `ChatType`** -`DM`, `GROUP`, `THREAD`
-
-**Dataclass: `InboundMessage`**
-
-| Field | Type | Description |
-|---|---|---|
-| `message_id` | `str` | Unique message ID |
-| `channel` | `str` | Source channel |
-| `account_id` | `str` | Account identifier |
-| `peer_id` | `str` | Peer identifier |
-| `chat_type` | `ChatType` | Conversation type |
-| `body` | `str` | Normalized message text |
-| `raw_body` | `str` | Original content |
-| `command` | `Optional[ParsedCommand]` | Parsed command if applicable |
-| `sender_name` | `str` | Sender display name |
-| `media_path` | `str` | Media file path |
-| `media_type` | `str` | Media MIME type |
-| `reply_to_id` | `str` | Reply-to message ID |
-| `timestamp` | `datetime` | Message timestamp |
-| `metadata` | `dict` | Additional metadata |
-
-Properties: `is_group_chat`, `is_command`, `has_media`
-
-**Dataclass: `OutboundMessage`** -`body`, `channel`, `account_id`, `peer_id`, `reply_to_id`, `is_chunk`, `chunk_index`, `is_final`, `metadata`
-
-### 12.2 Command Parsing (`messages/command.py`)
-
-**Pattern**: `^/([a-zA-Z][a-zA-Z0-9_-]*)(?:\s+(.*))?$`
-
-**Enum: `CommandCategory`** -`SESSION_CONTROL`, `MODE_SWITCH`, `INFO_QUERY`, `SESSION_MANAGEMENT`, `DEBUG`
-
-**Dataclass: `CommandDefinition`** -`name`, `category`, `description`, `aliases: list[str]`, `requires_llm: bool`, `bypass_debounce: bool`, `strip_from_message: bool`, `handler: Optional[Callable]`
-
-**Dataclass: `ParsedCommand`** -`command`, `name`, `args: list[str]`, `kwargs: dict`, `remaining_text`, `is_standalone`, `definition`
-
-**Class: `CommandParser`**
-
-| Method | Signature | Description |
-|---|---|---|
-| `register` | `(definition: CommandDefinition) -> None` | Register command |
-| `parse` | `(text: str) -> ParsedCommand` | Parse text for slash commands |
-
----
-
-## 13. Workflow Module
-
-**Path**: `app/atlasclaw/workflow/`
-
-DAG-based workflow engine with conditional branching.
-
-### 13.1 Workflow Engine (`workflow/engine.py`)
-
-**Enum: `StepStatus`** -`PENDING`, `RUNNING`, `COMPLETED`, `SKIPPED`, `FAILED`
-
-**Dataclass: `WorkflowStep`**
-
-| Field | Type | Description |
-|---|---|---|
-| `name` | `str` | Step identifier |
-| `handler` | `StepHandler` | Async step function |
-| `after` | `list[str]` | Dependency step names |
-| `router` | `Optional[RouterFunc]` | Conditional branching function |
-| `status` | `StepStatus` | Current status |
-| `result` | `Optional[Any]` | Step result |
-| `error` | `Optional[str]` | Error message |
-
-**Class: `WorkflowEngine[T]`** (generic over state type)
-
-| Method | Signature | Description |
-|---|---|---|
-| `step` | `(after: list[str]) -> Decorator` | Register a workflow step |
-| `router` | `(after: list[str]) -> Decorator` | Register a conditional router |
-| `run` | `(initial_state: T) -> T` | Execute the workflow DAG |
-
----
-
-## 14. Media Module
-
-**Path**: `app/atlasclaw/media/`
-
-Media processing utilities.
-
-| File | Purpose |
-|---|---|
-| `link_extractor.py` | Extract URLs from text content |
-| `tts.py` | Text-to-speech integration |
-| `understanding.py` | Media content understanding (image/audio analysis) |
-
----
-
-## 15. Frontend
+## 13. Frontend
 
 **Path**: `app/frontend/`
 
