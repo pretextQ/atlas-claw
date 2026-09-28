@@ -191,26 +191,45 @@ def register_core_routers(
 
 
 def setup_auth_middleware_from_config(app: FastAPI) -> None:
-    """Install auth middleware from active config with graceful fallback."""
+    """Install auth middleware from active config.
+
+    A broken auth configuration must fail startup: silently continuing
+    without the middleware would run every route anonymously.
+    """
+    import logging
+
+    logger = logging.getLogger(__name__)
+
     try:
-        from app.atlasclaw.auth.config import AuthConfig
-        from app.atlasclaw.auth.middleware import setup_auth_middleware
         from app.atlasclaw.core.config import get_config
 
         config = get_config()
-        auth = config.auth if config else None
-        if isinstance(auth, dict):
-            auth = AuthConfig(**auth)
-        if auth is not None and not auth.enabled:
-            auth = None
-
-        auth_workspace_path = str(Path(config.workspace.path).resolve())
-        setup_auth_middleware(app, auth, workspace_path=auth_workspace_path)
-
-        app.state.config = config
-        if auth is not None and isinstance(auth, AuthConfig):
-            app.state.config.auth = auth
     except Exception as exc:
-        import logging
+        raise RuntimeError(
+            f"Failed to load AtlasClaw config during auth setup: {exc}"
+        ) from exc
 
-        logging.getLogger(__name__).warning(f"Config setup warning: {exc}")
+    from app.atlasclaw.auth.config import AuthConfig
+    from app.atlasclaw.auth.middleware import setup_auth_middleware
+
+    auth = config.auth if config else None
+    if isinstance(auth, dict):
+        try:
+            auth = AuthConfig(**auth)
+        except Exception as exc:
+            raise RuntimeError(f"Invalid auth configuration: {exc}") from exc
+    if auth is not None and not auth.enabled:
+        auth = None
+
+    auth_workspace_path = str(Path(config.workspace.path).resolve())
+    # Raises on invalid provider config or the built-in development JWT
+    # secret (see AuthConfig.validate_provider_config).
+    setup_auth_middleware(app, auth, workspace_path=auth_workspace_path)
+    logger.info(
+        "Auth middleware installed: provider=%s",
+        getattr(auth, "provider", "anonymous"),
+    )
+
+    app.state.config = config
+    if auth is not None and isinstance(auth, AuthConfig):
+        app.state.config.auth = auth
