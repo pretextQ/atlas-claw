@@ -1,25 +1,7 @@
 # -*- coding: utf-8 -*-
 # Copyright 2026  Qianyun, Inc., www.cloudchef.io, All rights reserved.
 
+"""Model provider metadata and OpenAI-compatible payload helpers.
+
+Concrete modules: ``providers``, ``provider_presets``, ``openai_chat_compat``.
 """
-
-modelmanage
-
-Includes:
-- failover:Model-Failover model
-- retry:RetryStrategy Retry strategy
-"""
-
-from app.atlasclaw.models.failover import (
-    AuthProfile,
-    ModelFailoverConfig,
-    ModelFailover,
-)
-from app.atlasclaw.models.retry import RetryStrategy
-
-__all__ = [
-    "AuthProfile",
-    "ModelFailoverConfig",
-    "ModelFailover",
-    "RetryStrategy",
-]

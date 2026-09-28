@@ -20,7 +20,7 @@ from app.atlasclaw.api.service_provider_schemas import (
     register_provider_schema_definition,
 )
 from app.atlasclaw.channels import ChannelConnection, ChannelRegistry
-from app.atlasclaw.channels.handlers import WebSocketHandler
+from tests.atlasclaw.channel_test_stubs import StubChannelHandler
 from app.atlasclaw.channels.models import (
     ConnectionStatus,
     InboundMessage,
@@ -48,7 +48,7 @@ class TestChannelManager:
         ChannelRegistry._connections.clear()
         
         # Register test handler
-        ChannelRegistry.register("websocket", WebSocketHandler)
+        ChannelRegistry.register("websocket", StubChannelHandler)
 
     @pytest.mark.asyncio
     async def test_initialize_connection(self):
@@ -80,14 +80,11 @@ class TestChannelManager:
             }
             
             # Initialize connection
-            # Note: WebSocketHandler base connect() returns False
-            # In production, Feishu/Slack handlers would override connect() to return True
             result = await self.manager.initialize_connection("user-123", "websocket", "conn-123")
-            
-            # Base WebSocketHandler.connect() returns False, so initialization fails
-            # This is expected - real implementations would override connect()
-            assert result is False
-            assert self.manager.get_connection_runtime_status("conn-123") == "error"
+
+            assert result is True
+            assert self.manager.get_connection_runtime_status("conn-123") == "connected"
+            assert "user-123:websocket:conn-123" in self.manager._active_connections
 
     @pytest.mark.asyncio
     async def test_initialize_connection_not_found(self):
@@ -107,7 +104,7 @@ class TestChannelManager:
     async def test_stop_connection(self):
         """Test stopping a connection."""
         # Manually add a handler to test stop_connection
-        handler = WebSocketHandler({})
+        handler = StubChannelHandler({})
         instance_key = "user-123:websocket:conn-123"
         self.manager._active_connections[instance_key] = handler
         
@@ -130,7 +127,7 @@ class TestChannelManager:
     async def test_route_inbound_message(self):
         """Test routing inbound message."""
         # Manually create and register handler
-        handler = WebSocketHandler({})
+        handler = StubChannelHandler({})
         instance_key = "user-123:websocket:conn-123"
         ChannelRegistry.create_instance(instance_key, "websocket", {})
         self.manager._active_connections[instance_key] = handler
@@ -170,7 +167,7 @@ class TestChannelManager:
         )
         manager = ChannelManager(self.temp_dir)
         manager.set_session_manager_router(ctx.session_manager_router)
-        handler = WebSocketHandler({})
+        handler = StubChannelHandler({})
         handler.send_message = AsyncMock(return_value=SendResult(success=True))
         manager._active_connections["user-123:websocket:conn-123"] = handler
 
@@ -204,7 +201,7 @@ class TestChannelManager:
     def test_get_user_connections(self):
         """Test getting user connections (sync version)."""
         # Manually add handlers to active connections
-        handler = WebSocketHandler({})
+        handler = StubChannelHandler({})
         self.manager._active_connections["user-123:websocket:conn-1"] = handler
         self.manager._active_connections["user-123:websocket:conn-2"] = handler
         
@@ -215,7 +212,7 @@ class TestChannelManager:
 
     def test_get_user_connections_with_filter(self):
         """Test getting user connections with channel type filter."""
-        handler = WebSocketHandler({})
+        handler = StubChannelHandler({})
         self.manager._active_connections["user-123:websocket:conn-1"] = handler
         
         connections = self.manager.get_user_connections("user-123", "websocket")
@@ -225,7 +222,7 @@ class TestChannelManager:
 
     @pytest.mark.asyncio
     async def test_probe_connection_reports_health_and_status(self):
-        handler = WebSocketHandler({})
+        handler = StubChannelHandler({})
         handler._status = ConnectionStatus.CONNECTED
         handler.health_check = AsyncMock(return_value=True)
         instance_key = "user-123:websocket:conn-123"
@@ -238,7 +235,7 @@ class TestChannelManager:
 
     @pytest.mark.asyncio
     async def test_reconnect_connection_delegates_to_handler(self):
-        handler = WebSocketHandler({})
+        handler = StubChannelHandler({})
         handler._status = ConnectionStatus.ERROR
         handler.reconnect = AsyncMock(return_value=True)
         instance_key = "user-123:websocket:conn-123"
@@ -267,7 +264,7 @@ class TestChannelManager:
         assert self.manager.get_connection_runtime_status("conn-123") == "connecting"
 
     def test_list_active_connection_descriptors(self):
-        handler = WebSocketHandler({})
+        handler = StubChannelHandler({})
         self.manager._active_connections["user-123:websocket:conn-1"] = handler
         self.manager._active_connections["user-123:websocket:conn-2"] = handler
 
@@ -326,7 +323,7 @@ class TestChannelManager:
     async def test_disable_connection(self):
         """Test disabling a connection."""
         # Manually add handler since initialize_connection fails
-        handler = WebSocketHandler({})
+        handler = StubChannelHandler({})
         instance_key = "user-123:websocket:conn-123"
         self.manager._active_connections[instance_key] = handler
         
@@ -454,7 +451,7 @@ class TestChannelManager:
             )
             manager = ChannelManager(self.temp_dir)
             manager.set_session_manager_router(ctx.session_manager_router)
-            handler = WebSocketHandler({})
+            handler = StubChannelHandler({})
             handler.send_message = AsyncMock(return_value=SendResult(success=True))
             manager._active_connections["user-123:websocket:conn-123"] = handler
 
@@ -510,7 +507,7 @@ class TestChannelManager:
         )
         manager = ChannelManager(self.temp_dir)
         manager.set_session_manager_router(ctx.session_manager_router)
-        handler = WebSocketHandler({"provider_binding": "smartcmp/default"})
+        handler = StubChannelHandler({"provider_binding": "smartcmp/default"})
         handler.send_message = AsyncMock(return_value=SendResult(success=True))
         manager._active_connections["user-123:websocket:conn-123"] = handler
 
@@ -554,7 +551,7 @@ class TestChannelManager:
         )
         manager = ChannelManager(self.temp_dir)
         manager.set_session_manager_router(ctx.session_manager_router)
-        handler = WebSocketHandler({})
+        handler = StubChannelHandler({})
         order = []
 
         async def _acknowledge(_message):
@@ -600,7 +597,7 @@ class TestChannelManager:
         )
         manager = ChannelManager(self.temp_dir)
         manager.set_session_manager_router(ctx.session_manager_router)
-        handler = WebSocketHandler({})
+        handler = StubChannelHandler({})
         handler.acknowledge_message = AsyncMock(side_effect=RuntimeError("ack failed"))
         handler.send_message = AsyncMock(return_value=SendResult(success=True))
         manager._active_connections["user-123:websocket:conn-123"] = handler
@@ -638,7 +635,7 @@ class TestChannelManager:
         )
         manager = ChannelManager(self.temp_dir)
         manager.set_session_manager_router(ctx.session_manager_router)
-        handler = WebSocketHandler({})
+        handler = StubChannelHandler({})
 
         async def _raise_timeout(awaitable, *, timeout):
             del timeout
@@ -678,7 +675,7 @@ class TestChannelManager:
         handler.send_message.assert_awaited_once()
 
 
-class _TrackingHandler(WebSocketHandler):
+class _TrackingHandler(StubChannelHandler):
     """Handler double that records lifecycle calls and can block in setup."""
 
     channel_type = "tracking"
@@ -861,7 +858,7 @@ async def test_stop_all_stops_every_active_connection():
     manager = ChannelManager(tempfile.mkdtemp())
     stopped: list[str] = []
 
-    class _StoppableHandler(WebSocketHandler):
+    class _StoppableHandler(StubChannelHandler):
         async def stop(self):
             stopped.append("stop")
             return True

@@ -25,9 +25,9 @@ from app.atlasclaw.channels.handlers import (
     DingTalkHandler,
     FeishuHandler,
     WeComHandler,
-    WebSocketHandler,
 )
 from app.atlasclaw.channels.manager import ChannelManager
+from tests.atlasclaw.channel_test_stubs import StubChannelHandler
 from app.atlasclaw.channels.qr_provisioning import (
     ChannelProvisioningConnection,
     ChannelProvisioningRequest,
@@ -137,7 +137,7 @@ def channel_manager(temp_workspace):
     ChannelRegistry._connections.clear()
     
     # Register test handler
-    ChannelRegistry.register("websocket", WebSocketHandler)
+    ChannelRegistry.register("websocket", StubChannelHandler)
     
     # Create manager
     manager = ChannelManager(temp_workspace)
@@ -146,7 +146,7 @@ def channel_manager(temp_workspace):
     return manager
 
 
-class ProvisioningWebSocketHandler(WebSocketHandler):
+class ProvisioningStubChannelHandler(StubChannelHandler):
     """Test channel handler that supports QR provisioning."""
 
     channel_type = "provisioning_websocket"
@@ -173,7 +173,7 @@ class ProvisioningWebSocketHandler(WebSocketHandler):
         )
 
 
-class PollingProvisioningWebSocketHandler(ProvisioningWebSocketHandler):
+class PollingProvisioningStubChannelHandler(ProvisioningStubChannelHandler):
     """Test handler that completes provisioning via platform polling."""
 
     channel_type = "polling_provisioning_websocket"
@@ -222,10 +222,10 @@ class TestChannelTypesAPI:
         assert isinstance(data, list)
         assert len(data) >= 1
         
-        # Find websocket channel
+        # Find the registered test channel type
         ws_channel = next((c for c in data if c["type"] == "websocket"), None)
         assert ws_channel is not None
-        assert ws_channel["name"] == "WebSocket"
+        assert ws_channel["name"] == StubChannelHandler.channel_name
         assert ws_channel["connection_count"] == 0
 
     def test_list_channel_types_with_connections(self, client, channel_manager):
@@ -248,7 +248,7 @@ class TestChannelTypesAPI:
 
     def test_list_channel_types_exposes_provisioning_metadata(self, client, channel_manager):
         """Channel catalog exposes one-click provisioning capability metadata."""
-        ChannelRegistry.register("provisioning_websocket", ProvisioningWebSocketHandler)
+        ChannelRegistry.register("provisioning_websocket", ProvisioningStubChannelHandler)
 
         response = client.get(
             "/api/channels",
@@ -378,7 +378,7 @@ class TestChannelProvisioningAPI:
 
     def test_create_provisioning_session(self, client, channel_manager):
         """Creating a provisioning session returns QR state without exposing secrets."""
-        ChannelRegistry.register("provisioning_websocket", ProvisioningWebSocketHandler)
+        ChannelRegistry.register("provisioning_websocket", ProvisioningStubChannelHandler)
 
         response = client.post(
             "/api/channels/provisioning_websocket/provisioning-sessions",
@@ -408,7 +408,7 @@ class TestChannelProvisioningAPI:
 
     def test_provisioning_session_complete_routes_are_not_available(self, client, channel_manager):
         """QR provisioning does not expose unauthenticated completion callback routes."""
-        ChannelRegistry.register("provisioning_websocket", ProvisioningWebSocketHandler)
+        ChannelRegistry.register("provisioning_websocket", ProvisioningStubChannelHandler)
         headers = {"X-Test-Channel-Type": "provisioning_websocket"}
 
         create_response = client.post(
@@ -434,7 +434,7 @@ class TestChannelProvisioningAPI:
 
     def test_provisioning_session_refresh_rotates_qr_state(self, client, channel_manager):
         """Refreshing a pending provisioning session rotates the embedded state token."""
-        ChannelRegistry.register("provisioning_websocket", ProvisioningWebSocketHandler)
+        ChannelRegistry.register("provisioning_websocket", ProvisioningStubChannelHandler)
         headers = {"X-Test-Channel-Type": "provisioning_websocket"}
 
         create_response = client.post(
@@ -465,7 +465,7 @@ class TestChannelProvisioningAPI:
         """POST poll can advance a platform-owned registration flow and save credentials."""
         ChannelRegistry.register(
             "polling_provisioning_websocket",
-            PollingProvisioningWebSocketHandler,
+            PollingProvisioningStubChannelHandler,
         )
         headers = {"X-Test-Channel-Type": "polling_provisioning_websocket"}
 
@@ -505,7 +505,7 @@ class TestChannelProvisioningAPI:
         """GET session reports state without polling or creating a connection."""
         ChannelRegistry.register(
             "polling_provisioning_websocket",
-            PollingProvisioningWebSocketHandler,
+            PollingProvisioningStubChannelHandler,
         )
         headers = {"X-Test-Channel-Type": "polling_provisioning_websocket"}
 
@@ -532,7 +532,7 @@ class TestChannelProvisioningAPI:
         """Repeated polls after completion do not create duplicate connections."""
         ChannelRegistry.register(
             "polling_provisioning_websocket",
-            PollingProvisioningWebSocketHandler,
+            PollingProvisioningStubChannelHandler,
         )
         headers = {"X-Test-Channel-Type": "polling_provisioning_websocket"}
 
@@ -569,7 +569,7 @@ class TestChannelProvisioningAPI:
 
     def test_provisioning_routes_require_channel_type_permission(self, client, channel_manager):
         """Owned provisioning routes enforce channel allowlist permissions."""
-        ChannelRegistry.register("provisioning_websocket", ProvisioningWebSocketHandler)
+        ChannelRegistry.register("provisioning_websocket", ProvisioningStubChannelHandler)
 
         response = client.post(
             "/api/channels/provisioning_websocket/provisioning-sessions",
@@ -832,7 +832,7 @@ class TestConnectionEnableDisableAPI:
             f"/api/channels/websocket/connections/{connection_id}/enable"
         )
         
-        # Note: WebSocketHandler.connect() returns False, so enable may fail
+        # Note: StubChannelHandler.connect() returns False, so enable may fail
         # This tests the API endpoint works
         assert response.status_code in [200, 500]
 

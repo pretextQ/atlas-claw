@@ -22,7 +22,6 @@ from app.atlasclaw.api.routes import APIContext, create_router, set_api_context
 from app.atlasclaw.auth.config import AuthConfig
 from app.atlasclaw.auth.middleware import setup_auth_middleware
 from app.atlasclaw.channels import ChannelRegistry
-from app.atlasclaw.channels.handlers import WebSocketHandler
 from app.atlasclaw.db import get_db_session
 from app.atlasclaw.db.database import DatabaseConfig, DatabaseManager, init_database
 from app.atlasclaw.db.models import RoleModel
@@ -132,7 +131,7 @@ def _registered_test_channels(*channel_types: str):
     ChannelRegistry._instances.clear()
     ChannelRegistry._connections.clear()
     for channel_type in channel_types:
-        ChannelRegistry.register(channel_type, WebSocketHandler)
+        ChannelRegistry.register(channel_type, StubChannelHandler)
 
     try:
         yield
@@ -168,7 +167,7 @@ def _login_as(client: TestClient, username: str, password: str) -> str:
     response = client.post('/api/auth/local/login', json={'username': username, 'password': password})
     assert response.status_code == 200, f'Login failed: {response.json()}'
     return response.json()['token']
-
+from tests.atlasclaw.channel_test_stubs import StubChannelHandler
 
 class TestRoleCRUDAPI:
     """Tests for role management endpoints."""

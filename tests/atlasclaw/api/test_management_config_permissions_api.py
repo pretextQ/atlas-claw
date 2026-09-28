@@ -21,7 +21,6 @@ from app.atlasclaw.api.routes import APIContext, create_router, set_api_context
 from app.atlasclaw.auth.config import AuthConfig
 from app.atlasclaw.auth.middleware import setup_auth_middleware
 from app.atlasclaw.channels import ChannelRegistry
-from app.atlasclaw.channels.handlers import WebSocketHandler
 from app.atlasclaw.channels.manager import ChannelManager
 from app.atlasclaw.db import get_db_session
 from app.atlasclaw.db.database import DatabaseConfig, DatabaseManager, init_database
@@ -65,7 +64,7 @@ def _build_client(tmp_path: Path, auth_config: AuthConfig) -> TestClient:
     ChannelRegistry._handlers.clear()
     ChannelRegistry._instances.clear()
     ChannelRegistry._connections.clear()
-    ChannelRegistry.register("websocket", WebSocketHandler)
+    ChannelRegistry.register("websocket", StubChannelHandler)
     set_channel_manager(ChannelManager(tmp_path))
 
     app = FastAPI()
@@ -126,7 +125,7 @@ def _login_as(client: TestClient, username: str, password: str) -> str:
     response = client.post("/api/auth/local/login", json={"username": username, "password": password})
     assert response.status_code == 200, f"Login failed: {response.json()}"
     return response.json()["token"]
-
+from tests.atlasclaw.channel_test_stubs import StubChannelHandler
 
 class TestManagementConfigPermissionsAPI:
     """Permission tests for token/provider/model/channel management APIs."""

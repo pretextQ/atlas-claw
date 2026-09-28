@@ -33,8 +33,6 @@ GROUP_TOOLS: dict[str, list[str]] = {
         "sessions_list",
         "sessions_history",
         "sessions_send",
-        "sessions_spawn",
-        "subagents",
         "session_status",
     ],
     GROUP_PROVIDERS: ["list_provider_instances", "select_provider_instance"],

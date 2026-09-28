@@ -292,27 +292,6 @@ class ChannelConfigService:
         return True
 
     @staticmethod
-    async def deactivate_by_user(session: AsyncSession, user_id: str) -> int:
-        """Deactivate all channels for a user (when user is deleted).
-
-        Args:
-            session: Database session
-            user_id: User ID
-
-        Returns:
-            Number of channels deactivated
-        """
-        channels = await ChannelConfigService.list_by_user(session, user_id)
-        count = 0
-        for channel in channels:
-            channel.is_active = False
-            channel.user_id = None  # Clear user association
-            count += 1
-        await session.flush()
-        logger.info(f"Deactivated {count} channels for user {user_id}")
-        return count
-
-    @staticmethod
     def to_channel_config(channel: ChannelModel) -> Dict[str, Any]:
         """Convert Channel model to config format for runtime use.
         

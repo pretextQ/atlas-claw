@@ -1,15 +1,17 @@
 # -*- coding: utf-8 -*-
 # Copyright 2026  Qianyun, Inc., www.cloudchef.io, All rights reserved.
 
-"""Built-in channel handlers."""
+"""Built-in channel handlers.
+
+Only the enterprise messaging handlers are shipped: the previous in-process
+WebSocket/SSE/REST channel handlers were never registered by the runtime and
+have been removed.
+"""
 
 from __future__ import annotations
 
-from .websocket import WebSocketHandler
-from .sse import SSEHandler
-from .rest import RESTHandler
-from .feishu import FeishuHandler
 from .dingtalk import DingTalkHandler
+from .feishu import FeishuHandler
 from .wecom import WeComHandler
 
-__all__ = ["WebSocketHandler", "SSEHandler", "RESTHandler", "FeishuHandler", "DingTalkHandler", "WeComHandler"]
+__all__ = ["FeishuHandler", "DingTalkHandler", "WeComHandler"]

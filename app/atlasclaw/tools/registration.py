@@ -213,28 +213,6 @@ _TOOL_REGISTRY: dict[str, tuple[ToolMetadata, str, str]] = {
         "app.atlasclaw.tools.sessions.send_tool",
         "sessions_send_tool",
     ),
-    "sessions_spawn": (
-        ToolMetadata(
-            name="sessions_spawn",
-            description="Spawn isolated sub-agent",
-            group="sessions",
-            capability_class="session",
-            routing_visibility="contextual",
-        ),
-        "app.atlasclaw.tools.sessions.spawn_tool",
-        "sessions_spawn_tool",
-    ),
-    "subagents": (
-        ToolMetadata(
-            name="subagents",
-            description="Manage running sub-agents",
-            group="sessions",
-            capability_class="session",
-            routing_visibility="contextual",
-        ),
-        "app.atlasclaw.tools.sessions.subagents_tool",
-        "subagents_tool",
-    ),
     "session_status": (
         ToolMetadata(
             name="session_status",

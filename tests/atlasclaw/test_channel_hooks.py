@@ -18,7 +18,7 @@ from app.atlasclaw.api import channels as channels_api
 from app.atlasclaw.api.channel_hooks import router as channel_hooks_router
 from app.atlasclaw.api.deps_context import APIContext
 from app.atlasclaw.channels import ChannelRegistry
-from app.atlasclaw.channels.handlers import WebSocketHandler
+from tests.atlasclaw.channel_test_stubs import StubChannelHandler
 from app.atlasclaw.channels.manager import ChannelManager
 from app.atlasclaw.channels.models import SendResult
 from app.atlasclaw.session.manager import SessionManager
@@ -45,13 +45,13 @@ def channel_env():
 
     ChannelRegistry._handlers.clear()
     ChannelRegistry._instances.clear()
-    ChannelRegistry.register("websocket", WebSocketHandler)
+    ChannelRegistry.register("websocket", StubChannelHandler)
 
     workspace = tempfile.mkdtemp()
     manager = ChannelManager(workspace)
     runner = RecordingAgentRunner()
     manager.set_agent_runner(runner)
-    handler = WebSocketHandler({})
+    handler = StubChannelHandler({})
     handler.send_message = AsyncMock(return_value=SendResult(success=True))
     manager._active_connections["user-1:websocket:conn-123"] = handler
 
