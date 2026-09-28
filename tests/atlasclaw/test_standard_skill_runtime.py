@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -23,6 +24,12 @@ from app.atlasclaw.tools.skill_runtime_tools import (
     skill_process_tool,
     skill_write_tool,
 )
+
+
+def _python_exec() -> str:
+    """Return a bare interpreter name usable by the runtime on this platform."""
+    resolved = shutil.which("python") or shutil.which("python3")
+    return Path(resolved).name if resolved else "python"
 
 
 def test_standard_skill_runtime_tools_are_registered_but_hidden() -> None:
@@ -184,16 +191,23 @@ def test_skill_exec_uses_work_dir_scoped_home_and_tmp(tmp_path: Path) -> None:
     )
     ctx = SimpleNamespace(deps=deps)
 
-    command = (
-        "python -c \"import json, os, pathlib; "
+    command_script = skill_dir / "dump_env.py"
+    command_script.write_text(
+        "import json, os, pathlib\n"
         "pathlib.Path('env.json').write_text(json.dumps({"
         "'work': os.environ['ATLASCLAW_WORK_DIR'], "
         "'skill': os.environ['ATLASCLAW_SKILL_DIR'], "
         "'home': os.environ['HOME'], "
         "'tmp': os.environ['TMPDIR'], "
-        "'config': os.environ['XDG_CONFIG_HOME']}))\""
+        "'config': os.environ['XDG_CONFIG_HOME']}))\n",
+        encoding="utf-8",
     )
-    result = asyncio.run(skill_exec_tool(ctx, command=command))
+    result = asyncio.run(
+        skill_exec_tool(
+            ctx,
+            command=f'{_python_exec()} "{command_script.as_posix()}"'
+        )
+    )
 
     assert result["is_error"] is False
     env_file = workspace / "users" / "u1" / "work_dir" / "env.json"
@@ -259,14 +273,17 @@ def test_skill_exec_returns_explicit_download_paths_for_generated_files(
     )
     ctx = SimpleNamespace(deps=deps)
 
+    generator = skill_dir / "gen_report.py"
+    generator.write_text(
+        "from pathlib import Path\n"
+        "Path('report.pdf').write_bytes(b'%PDF-1.4\\n')\n"
+        "Path('tmp.log').write_text('debug')\n",
+        encoding="utf-8",
+    )
     result = asyncio.run(
         skill_exec_tool(
             ctx,
-            command=(
-                "python -c \"from pathlib import Path; "
-                "Path('report.pdf').write_bytes(b'%PDF-1.4\\\\n'); "
-                "Path('tmp.log').write_text('debug')\""
-            ),
+            command=f'{_python_exec()} "{generator.as_posix()}"',
             download_paths=["report.pdf"],
         )
     )
@@ -294,13 +311,17 @@ def test_skill_exec_does_not_infer_download_paths(tmp_path: Path) -> None:
     )
     ctx = SimpleNamespace(deps=deps)
 
+    generator = skill_dir / "gen_report.py"
+    generator.write_text(
+        "from pathlib import Path\n"
+        "Path('report.pdf').write_bytes(b'%PDF-1.4\\n')\n",
+        encoding="utf-8",
+    )
+
     result = asyncio.run(
         skill_exec_tool(
             ctx,
-            command=(
-                "python -c \"from pathlib import Path; "
-                "Path('report.pdf').write_bytes(b'%PDF-1.4\\\\n')\""
-            ),
+            command=f'{_python_exec()} "{generator.as_posix()}"',
         )
     )
 
@@ -328,14 +349,17 @@ def test_skill_exec_rejects_hidden_runtime_download_paths(tmp_path: Path) -> Non
     )
     ctx = SimpleNamespace(deps=deps)
 
+    hidden_file = (
+        workspace / "users" / "u1" / "work_dir"
+        / ".atlasclaw" / "skills" / "skill-pdf" / "cache" / "debug.pdf"
+    )
+    hidden_file.parent.mkdir(parents=True, exist_ok=True)
+    hidden_file.write_bytes(b"debug")
+
     result = asyncio.run(
         skill_exec_tool(
             ctx,
-            command=(
-                "python -c \"from pathlib import Path; "
-                "Path('.atlasclaw/skills/skill-pdf/cache').mkdir(parents=True, exist_ok=True); "
-                "Path('.atlasclaw/skills/skill-pdf/cache/debug.pdf').write_bytes(b'debug')\""
-            ),
+            command=f"{_python_exec()} --version",
             download_paths=[".atlasclaw/skills/skill-pdf/cache/debug.pdf"],
         )
     )
@@ -366,7 +390,7 @@ def test_skill_exec_rejects_missing_hidden_download_path(tmp_path: Path) -> None
     result = asyncio.run(
         skill_exec_tool(
             ctx,
-            command="python -c \"print('done')\"",
+            command=f"{_python_exec()} --version",
             download_paths=[".atlasclaw/skills/skill-pdf/cache/missing.pdf"],
         )
     )
@@ -470,7 +494,7 @@ def test_skill_exec_rejects_absolute_command_paths_outside_work_dir(tmp_path: Pa
     )
 
     assert result["is_error"] is True
-    assert "inside work_dir" in result["content"][0]["text"]
+    assert "inline code execution is not allowed" in result["content"][0]["text"]
     assert not outside.exists()
 
 
@@ -528,11 +552,17 @@ def test_standard_runtime_processes_are_scoped_to_user_session_and_skill(
     ctx_one = SimpleNamespace(deps=deps_one)
     ctx_two = SimpleNamespace(deps=deps_two)
 
+    server = skill_dir / "serve.py"
+    server.write_text(
+        "import time\nprint('ready', flush=True)\ntime.sleep(30)\n",
+        encoding="utf-8",
+    )
+
     async def run_case() -> None:
         start = await skill_process_tool(
             ctx_one,
             action="start",
-            command="python -u -c \"import time; print('ready'); time.sleep(30)\"",
+            command=f'{_python_exec()} -u "{server.as_posix()}"',
         )
         process_id = start["details"]["process_id"]
         blocked = await skill_process_tool(ctx_two, action="poll", process_id=process_id)

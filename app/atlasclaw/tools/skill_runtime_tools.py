@@ -32,6 +32,42 @@ if TYPE_CHECKING:
 
 
 _ABSOLUTE_PATH_RE = re.compile(r"(?<![:\w])/(?:[^\s'\"`<>|\\]+)")
+_WINDOWS_PATH_RE = re.compile(r"(?:\\\\[^\s'\"]+|[A-Za-z]:[\\/][^\s'\"]*)")
+_URL_ARG_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*://")
+
+# Inline-code flags per interpreter: model-authored code must never run, only
+# scripts shipped inside the selected skill directory. Keys are executable
+# basenames (case-insensitive, without .exe).
+_INTERPRETER_INLINE_FLAGS = {
+    "sh": {"-c"},
+    "bash": {"-c"},
+    "dash": {"-c"},
+    "zsh": {"-c"},
+    "ksh": {"-c"},
+    "fish": {"-c"},
+    "python": {"-c", "-m"},
+    "python2": {"-c", "-m"},
+    "python3": {"-c", "-m"},
+    "pypy": {"-c", "-m"},
+    "pypy3": {"-c", "-m"},
+    "ipython": {"-c"},
+    "node": {"-e", "--eval"},
+    "nodejs": {"-e", "--eval"},
+    "deno": {"-e", "--eval"},
+    "bun": {"-e", "--eval"},
+    "perl": {"-e"},
+    "ruby": {"-e"},
+    "php": {"-r"},
+    "lua": {"-e"},
+    "luajit": {"-e"},
+    "julia": {"-e"},
+    "rscript": {"-e"},
+    "osascript": {"-e"},
+    "powershell": {"-c", "-command", "-encodedcommand"},
+    "pwsh": {"-c", "-command", "-encodedcommand"},
+    "cmd": {"/c", "-c"},
+}
+_COMMAND_WRAPPERS = {"env", "sudo", "nohup"}
 
 
 def _safe_skill_id(value: str) -> str:
@@ -149,6 +185,46 @@ def _is_relative_to(candidate: Path, root: Path) -> bool:
         return False
 
 
+def _assert_no_interpreter_inline_code(args: list[str]) -> None:
+    """Reject interpreter invocations that would run model-authored inline code.
+
+    The runtime boundary assumes executable logic ships with the selected skill
+    and the model only supplies data arguments. Inline-code flags such as
+    ``python -c`` or ``sh -c`` let the model author code at runtime that
+    constructs paths the argument guard never sees, so they are rejected;
+    skills should ship a script file inside the skill directory instead.
+    """
+    index = 0
+    saw_env = False
+    while index < len(args):
+        token = str(args[index] or "").strip().lower()
+        if token in _COMMAND_WRAPPERS:
+            saw_env = saw_env or token == "env"
+            index += 1
+            continue
+        if saw_env and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", str(args[index] or "")):
+            index += 1
+            continue
+        break
+    if index >= len(args):
+        return
+    executable = Path(str(args[index])).name.lower()
+    if executable.endswith(".exe"):
+        executable = executable[:-4]
+    inline_flags = _INTERPRETER_INLINE_FLAGS.get(executable)
+    if not inline_flags:
+        return
+    for arg in args[index + 1:]:
+        flag = str(arg or "").strip().lower()
+        if not flag.startswith("-") and not flag.startswith("/"):
+            break
+        if flag in inline_flags:
+            raise ValueError(
+                f"inline code execution is not allowed ({executable} {str(arg).strip()}); "
+                "run a script shipped inside the selected skill instead"
+            )
+
+
 def _validate_runtime_command_paths(
     ctx: "RunContext[SkillDeps]",
     command: str,
@@ -157,23 +233,35 @@ def _validate_runtime_command_paths(
     """Reject command path arguments that escape work_dir or the selected skill.
 
     Commands may execute binaries by name through PATH. Explicit absolute paths
-    are accepted only when they point at work_dir or the selected skill install
-    directory, which keeps model-generated file operations within the selected
-    runtime boundary.
+    (POSIX and Windows forms) are accepted only when they point at work_dir or
+    the selected skill install directory, URL-shaped arguments are skipped, and
+    interpreter inline-code invocations are rejected outright.
     """
     if contains_home_relative_path(str(command or "")):
         raise ValueError("command paths must be relative to work_dir; '~' is not allowed")
 
+    _assert_no_interpreter_inline_code(args)
+
     allowed_roots = [get_user_work_dir(ctx).resolve(), _skill_dir(ctx).resolve()]
     for index, arg in enumerate(args):
-        for match in _ABSOLUTE_PATH_RE.finditer(str(arg or "")):
-            path_text = match.group(0).rstrip(").,;:]}")
-            if not path_text or path_text == "/":
+        arg_text = str(arg or "")
+        if _URL_ARG_RE.match(arg_text.strip()):
+            continue
+        path_candidates = [
+            match.group(0).rstrip(").,;:]}")
+            for match in _ABSOLUTE_PATH_RE.finditer(arg_text)
+        ]
+        path_candidates += [
+            match.group(0).rstrip(").,;:]}")
+            for match in _WINDOWS_PATH_RE.finditer(arg_text)
+        ]
+        for path_text in path_candidates:
+            if not path_text or path_text in ("/", "\\"):
                 continue
             resolved = Path(path_text).expanduser().resolve()
             if any(_is_relative_to(resolved, root) for root in allowed_roots):
                 continue
-            if index == 0 and str(arg).strip() == path_text:
+            if index == 0 and arg_text.strip() == path_text:
                 continue
             raise ValueError("command paths must stay inside work_dir or the selected skill")
 
