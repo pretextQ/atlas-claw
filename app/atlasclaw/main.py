@@ -875,6 +875,12 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             pass
 
+    try:
+        from app.atlasclaw.tools.ui.browser_tool import cleanup_all_browser_managers
+        await cleanup_all_browser_managers()
+    except Exception as e:
+        print(f"[AtlasClaw] Browser cleanup skipped: {e}")
+
 
 def create_app() -> FastAPI:
     """Create and configure the FastAPI application."""
