@@ -111,18 +111,26 @@ class EncryptionService:
         """
         # Load default key - use hardcoded key, allow env override
         default_key_b64 = os.environ.get("ATLASCLAW_ENCRYPTION_KEY", DEFAULT_ENCRYPTION_KEY)
-        
+
         try:
             default_key = base64.b64decode(default_key_b64)
             self._validate_key(default_key)
             self._keys["default"] = default_key
             self._current_key_id = "default"
-            
+
             # Log if using custom key from environment
             if default_key_b64 != DEFAULT_ENCRYPTION_KEY:
                 logger.info("Using custom encryption key from ATLASCLAW_ENCRYPTION_KEY")
             else:
-                logger.debug("Using default hardcoded encryption key")
+                logger.warning(
+                    "AtlasClaw is encrypting secrets with the built-in default key, "
+                    "which ships in the repository and is publicly known. Anyone "
+                    "with a copy of the encrypted data can decrypt provider tokens "
+                    "and API keys. Set ATLASCLAW_ENCRYPTION_KEY to a 32-byte base64 "
+                    "key (e.g. secrets.token_urlsafe(32)) before storing production "
+                    "credentials. Existing data encrypted with the default key keeps "
+                    "decrypting; re-encrypt by rotating keys after switching."
+                )
         except Exception as e:
             raise EncryptionError(f"Failed to load default encryption key: {e}") from e
         
@@ -321,7 +329,15 @@ class EnvelopeEncryptionService:
             master_key_b64 = os.environ.get("ATLASCLAW_MASTER_KEY") or \
                            os.environ.get("ATLASCLAW_ENCRYPTION_KEY") or \
                            DEFAULT_ENCRYPTION_KEY
-            
+
+            if master_key_b64 == DEFAULT_ENCRYPTION_KEY:
+                logger.warning(
+                    "Envelope encryption is using the built-in default master key, "
+                    "which ships in the repository and is publicly known. Set "
+                    "ATLASCLAW_MASTER_KEY (or ATLASCLAW_ENCRYPTION_KEY) to a 32-byte "
+                    "base64 key before storing production credentials."
+                )
+
             try:
                 master_key = base64.b64decode(master_key_b64)
             except Exception as e:
