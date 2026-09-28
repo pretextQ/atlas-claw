@@ -111,6 +111,7 @@ def create_local_provider(config: AuthConfig) -> AuthProvider:
             display_name_cookie_name=host_cookie_config.display_name_cookie_name,
             user_id_cookie_name=host_cookie_config.user_id_cookie_name,
             tenant_id_cookie_name=host_cookie_config.tenant_id_cookie_name,
+            validate_url=host_cookie_config.validate_url,
         )
 
     if provider_type == "local":

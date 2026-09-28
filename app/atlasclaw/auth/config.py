@@ -95,6 +95,11 @@ class HostCookieAuthConfig(BaseModel):
     display_name_cookie_name: str = "username"
     user_id_cookie_name: str = "userId"
     tenant_id_cookie_name: str = "tenant_id"
+    # Optional host endpoint that validates the host token. When set, the
+    # provider forwards the request cookies to this URL and rejects the
+    # identity unless the host answers 2xx (and any subject it returns
+    # matches the subject cookie).
+    validate_url: str = ""
 
     def expanded(self) -> "HostCookieAuthConfig":
         return HostCookieAuthConfig(
@@ -104,6 +109,7 @@ class HostCookieAuthConfig(BaseModel):
             display_name_cookie_name=expand_env(self.display_name_cookie_name),
             user_id_cookie_name=expand_env(self.user_id_cookie_name),
             tenant_id_cookie_name=expand_env(self.tenant_id_cookie_name),
+            validate_url=expand_env(self.validate_url),
         )
 
 
