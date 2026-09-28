@@ -108,10 +108,19 @@ class RunnerExecutionFlowPostMixin:
             logger.warning("Background post-success side effect failed: %s", exc)
 
     async def _await_background_post_success_tasks(self) -> None:
-        background_tasks = list(getattr(self, "_background_post_success_tasks", set()) or [])
+        """Drain scheduled post-success side effects without cancelling them.
+
+        Uses ``asyncio.wait`` (not gather) so a timeout leaves the tasks
+        running instead of cancelling a transcript persist mid-rewrite.
+        """
+        background_tasks = [
+            task
+            for task in getattr(self, "_background_post_success_tasks", set()) or []
+            if not task.done()
+        ]
         if not background_tasks:
             return
-        await asyncio.gather(*background_tasks, return_exceptions=True)
+        await asyncio.wait(background_tasks, timeout=30.0)
 
     def _schedule_post_success_side_effects(
         self,

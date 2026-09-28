@@ -270,3 +270,12 @@ class RunnerExecutionLoopMixin(RunnerExecutionPreparePhaseMixin, RunnerExecution
                     self.token_interceptor.on_response(selected_token_id, headers)
             if release_slot is not None:
                 release_slot()
+            # Drain scheduled post-success side effects (transcript persist,
+            # hooks, auto-memory) so a cancelled or early-closed run cannot
+            # leave a transcript rewrite half-finished. Never cancels them.
+            try:
+                await self._await_background_post_success_tasks()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("run_step background_post_success drain failed")

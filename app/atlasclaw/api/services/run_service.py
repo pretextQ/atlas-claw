@@ -47,6 +47,31 @@ def build_provider_config(ctx: APIContext) -> dict[str, Any]:
     return {}
 
 
+# Finished runs (and their SSE replay buffers) stay queryable for status
+# polling and late-subscriber replay, but only for a bounded window; without
+# a sweep, every run leaks its message text and buffered events for the
+# process lifetime.
+FINISHED_RUN_RETENTION_SECONDS = 600.0
+
+
+def _sweep_finished_runs(ctx: APIContext) -> None:
+    """Drop terminal run records and their streams past the retention window."""
+    now = datetime.now(timezone.utc)
+    stale_ids: list[str] = []
+    for run_id, run_info in ctx.active_runs.items():
+        status_value = str(run_info.get("status") or "")
+        if status_value == "running":
+            continue
+        completed_at = run_info.get("completed_at")
+        if not isinstance(completed_at, datetime):
+            continue
+        if (now - completed_at).total_seconds() > FINISHED_RUN_RETENTION_SECONDS:
+            stale_ids.append(run_id)
+    for run_id in stale_ids:
+        ctx.active_runs.pop(run_id, None)
+        ctx.sse_manager.remove_stream(run_id)
+
+
 def init_run(
     ctx: APIContext,
     run_id: str,
@@ -55,6 +80,7 @@ def init_run(
     timeout_seconds: int,
 ) -> None:
     """Create active-run state and its SSE stream before execution starts."""
+    _sweep_finished_runs(ctx)
     ctx.active_runs[run_id] = {
         "status": "running",
         "session_key": session_key,
@@ -75,6 +101,7 @@ def normalize_user_message(message: str) -> str:
 
 def get_run_or_404(ctx: APIContext, run_id: str) -> dict[str, Any]:
     """Return active-run metadata or raise the API-level not-found error."""
+    _sweep_finished_runs(ctx)
     run_info = ctx.active_runs.get(run_id)
     if not run_info:
         raise HTTPException(
@@ -99,6 +126,7 @@ def abort_run(ctx: APIContext, run_id: str) -> str:
         ctx.sse_manager.push_lifecycle(run_id, "aborted")
         run_info["abort_lifecycle_sent"] = True
     ctx.sse_manager.close_stream(run_id)
+    run_info.pop("message", None)
     return "aborted"
 
 
@@ -181,6 +209,7 @@ async def complete_run_with_static_answer(
     if not _transition_running_run(run_info, "completed"):
         return
     run_info["tokens_used"] = 0
+    run_info.pop("message", None)
     ctx.sse_manager.push_lifecycle(run_id, "end")
     ctx.sse_manager.close_stream(run_id)
 
@@ -371,6 +400,12 @@ async def execute_agent_run(
 
     finally:
         ctx.sse_manager.close_stream(run_id)
+        run_info = ctx.active_runs.get(run_id)
+        if run_info is not None:
+            # Keep the record and its replay buffer for late subscribers and
+            # status polling; _sweep_finished_runs reclaims them after the
+            # retention window. Only the unbounded payload goes now.
+            run_info.pop("message", None)
 
 
 async def _refresh_embed_run_context(

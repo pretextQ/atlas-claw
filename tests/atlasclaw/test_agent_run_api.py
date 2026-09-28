@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi import FastAPI
@@ -33,7 +33,12 @@ from fastapi.testclient import TestClient
 from app.atlasclaw.agent.selected_capability import SELECTED_CAPABILITY_KEY
 from app.atlasclaw.agent.stream import StreamEvent
 from app.atlasclaw.api.routes import APIContext, create_router, set_api_context
-from app.atlasclaw.api.services.run_service import abort_run, execute_agent_run, init_run
+from app.atlasclaw.api.services.run_service import (
+    _sweep_finished_runs,
+    abort_run,
+    execute_agent_run,
+    init_run,
+)
 from app.atlasclaw.auth.models import UserInfo
 from app.atlasclaw.session.manager import SessionManager
 from app.atlasclaw.session.queue import SessionQueue
@@ -564,3 +569,35 @@ def test_agent_run_context_is_allowlisted_against_nested_injection(tmp_path):
         "context",
     ):
         assert smuggled not in context
+
+
+def test_finished_runs_and_streams_are_swept_after_retention(tmp_path):
+    """Terminal runs keep status/replay for a bounded window, then are reclaimed."""
+    runner = _RecordingRunner()
+    client, ctx = _build_client_and_context(tmp_path, runner, user_id="alice")
+    session = client.post("/api/sessions", json={})
+    assert session.status_code == 200
+    session_key = session.json()["session_key"]
+
+    run = client.post(
+        "/api/agent/run",
+        json={"session_key": session_key, "message": "hi", "timeout_seconds": 30},
+    )
+    assert run.status_code == 200
+    run_id = run.json()["run_id"]
+    assert runner.called is True
+    assert ctx.active_runs[run_id]["status"] == "completed"
+    # The unbounded message payload is dropped as soon as the run is terminal.
+    assert "message" not in ctx.active_runs[run_id]
+
+    # Status and replay stay available inside the retention window.
+    assert client.get(f"/api/agent/runs/{run_id}").status_code == 200
+    assert ctx.sse_manager.get_stream(run_id) is not None
+
+    ctx.active_runs[run_id]["completed_at"] = datetime.now(timezone.utc) - timedelta(
+        seconds=601
+    )
+    _sweep_finished_runs(ctx)
+
+    assert run_id not in ctx.active_runs
+    assert ctx.sse_manager.get_stream(run_id) is None
