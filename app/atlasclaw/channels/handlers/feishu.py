@@ -134,12 +134,32 @@ def _run_feishu_sdk_process(
             log_level=lark.LogLevel.INFO,
         )
         
-        # Use timer to send connected signal after delay
-        # If client.start() throws exception before timer fires, the signal won't be sent
-        timer = threading.Timer(3.0, send_connected_signal)
-        timer.daemon = True
-        timer.start()
-        
+        # Watch for a real WebSocket connection instead of signalling after a
+        # fixed delay: lark.ws.Client sets ``_conn`` once websockets.connect
+        # succeeds, so the parent only sees CONNECTED when the transport is up.
+        def watch_connection_established(feishu_client):
+            """Send the connected signal only once the WebSocket is live."""
+            nonlocal connection_signaled
+            deadline = time.time() + 30.0
+            while time.time() < deadline:
+                if getattr(feishu_client, "_conn", None) is not None:
+                    send_connected_signal()
+                    return
+                time.sleep(0.2)
+            if not connection_signaled:
+                connection_signaled = True
+                print("[Feishu SDK Process] WebSocket not established within 30s", flush=True)
+                try:
+                    control_queue.put(
+                        {"type": "error", "error": "WebSocket connection not established within 30s"},
+                        timeout=5,
+                    )
+                except Exception as exc:
+                    print(f"[Feishu SDK Process] Failed to put error signal: {exc}", flush=True)
+
+        watcher = threading.Thread(target=watch_connection_established, args=(client,), daemon=True)
+        watcher.start()
+
         # Start the client (blocking)
         print("[Feishu SDK Process] Connecting...", flush=True)
         client.start()
@@ -579,13 +599,9 @@ class FeishuHandler(ChannelHandler):
                         await self._cleanup_connect_failure()
                         return False
                 except queue.Empty:
-                    # Fallback: if process is still alive after 10 seconds,
-                    # consider it connected (Queue signal may not arrive on Windows)
-                    elapsed = time.time() - start_time
-                    if elapsed > 10.0 and self._process.is_alive():
-                        logger.info("Feishu process alive after 10s, assuming connected (Queue fallback)")
-                        self._status = ConnectionStatus.CONNECTED
-                        return True
+                    # Keep waiting: the subprocess signals "connected" only
+                    # after its WebSocket handshake actually succeeds, and the
+                    # overall connection_timeout below bounds the wait.
                     await asyncio.sleep(0.5)
                     continue
             
@@ -660,6 +676,26 @@ class FeishuHandler(ChannelHandler):
     async def stop(self) -> bool:
         """Stop handler."""
         await self.disconnect()
+        return True
+
+    async def health_check(self) -> bool:
+        """Report health only when the SDK subprocess is alive and connected.
+
+        The status flag alone stays CONNECTED after a crash, so liveness of
+        the SDK subprocess is part of the probe; a dead process flips the
+        status to ERROR so the supervisor can react.
+        """
+        if self._status != ConnectionStatus.CONNECTED:
+            return False
+        process = self._process
+        if process is not None:
+            try:
+                if not process.is_alive():
+                    self._status = ConnectionStatus.ERROR
+                    return False
+            except Exception:
+                self._status = ConnectionStatus.ERROR
+                return False
         return True
 
     async def acknowledge_message(

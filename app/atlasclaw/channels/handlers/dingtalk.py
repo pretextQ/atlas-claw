@@ -143,20 +143,37 @@ def _run_dingtalk_sdk_process(
     
     try:
         print(f"[DingTalk SDK Process] Connecting to DingTalk Stream...")
-        
+
         credential = dingtalk_stream.Credential(client_id, client_secret)
         client = dingtalk_stream.DingTalkStreamClient(credential)
         client.register_callback_handler(
             dingtalk_stream.chatbot.ChatbotMessage.TOPIC,
             MessageHandler(message_queue, proc_logger)
         )
-        
-        # Use timer to send connected signal after delay
-        # If start_forever() throws exception before timer fires, the signal won't be sent
-        timer = threading.Timer(5.0, send_connected_signal)
-        timer.daemon = True
-        timer.start()
-        
+
+        def watch_connection_established():
+            """Send the connected signal only once the SDK WebSocket is live.
+
+            DingTalkStreamClient.start() assigns ``client.websocket`` right
+            after the WebSocket handshake succeeds; polling it avoids falsely
+            reporting CONNECTED while credentials or the network are broken.
+            """
+            nonlocal connection_signaled
+            deadline = time.time() + 30.0
+            while time.time() < deadline:
+                if getattr(client, "websocket", None) is not None:
+                    send_connected_signal()
+                    return
+                time.sleep(0.2)
+            if not connection_signaled:
+                connection_signaled = True
+                print("[DingTalk SDK Process] WebSocket not established within 30s", flush=True)
+                control_queue.put({"type": "error", "error": "WebSocket connection not established within 30s"})
+
+        # Watch for a real connection instead of signalling after a fixed delay.
+        watcher = threading.Thread(target=watch_connection_established, daemon=True)
+        watcher.start()
+
         # start_forever runs the event loop
         client.start_forever()
         
@@ -627,7 +644,26 @@ class DingTalkHandler(ChannelHandler):
         """Stop DingTalk handler."""
         await self.disconnect()
         return True
-    
+
+    async def health_check(self) -> bool:
+        """Report health only when the SDK subprocess is alive and connected.
+
+        In webhook mode there is no long-connection transport to probe, so a
+        CONNECTED status is accepted as-is.
+        """
+        if self._status != ConnectionStatus.CONNECTED:
+            return False
+        process = self._process
+        if process is not None:
+            try:
+                if not process.is_alive():
+                    self._status = ConnectionStatus.ERROR
+                    return False
+            except Exception:
+                self._status = ConnectionStatus.ERROR
+                return False
+        return True
+
     async def handle_inbound(self, request: Any) -> Optional[InboundMessage]:
         """Handle incoming DingTalk message (webhook callback mode)."""
         try:

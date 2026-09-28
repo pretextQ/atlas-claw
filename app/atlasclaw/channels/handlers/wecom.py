@@ -535,6 +535,16 @@ class WeComHandler(ChannelHandler):
         """Stop WeCom handler."""
         await self.disconnect()
         return True
+
+    async def health_check(self) -> bool:
+        """Report health only when the underlying WebSocket is still connected."""
+        if self._status != ConnectionStatus.CONNECTED:
+            return False
+        ws_client = self._ws_client
+        if ws_client is not None and not getattr(ws_client, "is_connected", True):
+            self._status = ConnectionStatus.ERROR
+            return False
+        return True
     
     async def handle_inbound(self, request: Any) -> Optional[InboundMessage]:
         """Handle incoming WeCom message callback (for API mode).

@@ -290,7 +290,12 @@ class ChannelHandler(ABC):
     # Status methods
     async def health_check(self) -> bool:
         """Check if channel is healthy.
-        
+
+        The default implementation only inspects the cached status flag.
+        Handlers backed by a live transport (SDK subprocess, WebSocket, ...)
+        should override it to verify that transport and flip their status to
+        ERROR when it is gone, so heartbeat probing detects real outages.
+
         Returns:
             True if channel is healthy
         """
