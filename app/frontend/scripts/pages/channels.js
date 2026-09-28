@@ -1737,7 +1737,7 @@ function renderChannelTypes(channels) {
           <div class="ch-card-header">
             <div class="ch-card-icon">${CHANNEL_ICONS[channel.type] || CHANNEL_ICONS.default}</div>
             <div class="ch-card-info">
-              <span class="ch-card-name">${getChannelName(channel)}</span>
+              <span class="ch-card-name">${escapeHtml(getChannelName(channel))}</span>
               ${badge ? `<span class="ch-card-badge ${badge.className}">${badge.text}</span>` : ''}
             </div>
           </div>
@@ -1946,13 +1946,13 @@ function renderConnectionRow(conn) {
       <div class="ch-cell-name">
         <span class="ch-status-dot ${statusMeta.className}"></span>
         <div class="ch-cell-name-content">
-          <span class="ch-cell-name-text">${connectionName}</span>
+          <span class="ch-cell-name-text">${escapeHtml(connectionName)}</span>
         </div>
         <span class="ch-id-badge">${idLabel}:${idShort}</span>
       </div>
       <div class="ch-cell-type">
         ${CHANNEL_ICONS[conn.channel_type] || CHANNEL_ICONS.default}
-        <span>${channelLabel}</span>
+        <span>${escapeHtml(channelLabel)}</span>
       </div>
       <div class="ch-cell-status">
         <span class="ch-status-badge ${statusMeta.className}">${statusMeta.text}</span>
@@ -2453,8 +2453,8 @@ function renderConfigForm(schema, values = {}) {
   let html = `
     <div class="ch-form-group">
       <label class="ch-form-label">${t('channel.connectionName')} <span class="required">*</span></label>
-      <input type="text" class="ch-form-input" name="_name" value="${connectionNameValue}" 
-             placeholder="${connectionNamePlaceholder}" required>
+      <input type="text" class="ch-form-input" name="_name" value="${escapeHtml(connectionNameValue)}"
+             placeholder="${escapeHtml(connectionNamePlaceholder)}" required>
     </div>
   `
 

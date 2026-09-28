@@ -17,6 +17,16 @@ import { t, updateContainerTranslations } from '../i18n.js'
 import { showToast } from '../components/toast.js'
 import { buildAssetUrl } from '../config.js'
 
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, char => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;'
+  })[char])
+}
+
 // ========== Module State ==========
 let mounted = false
 let containerRef = null
@@ -710,24 +720,24 @@ function renderModelConfigs(configs) {
   // Render table row for each model
   const renderModelRow = (config) => {
     return `
-    <tr class="model-row" data-id="${config.id}">
+    <tr class="model-row" data-id="${escapeHtml(config.id)}">
       <td class="model-identity-cell">
-        <span class="model-badge">${getBadgeText(config)}</span>
+        <span class="model-badge">${escapeHtml(getBadgeText(config))}</span>
         <div class="model-identity-info">
-          <span class="model-identity-name">${config.display_name || config.name}</span>
-          <span class="model-identity-sub">${config.model_id}</span>
+          <span class="model-identity-name">${escapeHtml(config.display_name || config.name)}</span>
+          <span class="model-identity-sub">${escapeHtml(config.model_id)}</span>
         </div>
       </td>
       <td>
         <span class="status-dot ${config.is_active ? 'status-active' : 'status-inactive'}"></span>
         ${config.is_active ? (t('model.active') || 'Active') : (t('model.inactive') || 'Inactive')}
       </td>
-      <td>${t('model.providers.' + config.provider) || config.provider}</td>
+      <td>${escapeHtml(t('model.providers.' + config.provider) || config.provider)}</td>
       <td>${(config.context_window || 128000).toLocaleString()}</td>
       <td>${(config.max_tokens || 4096).toLocaleString()}</td>
       <td class="model-actions-cell">
-        <a class="action-link action-configure" data-action="edit" data-id="${config.id}">${t('model.configure') || 'Configure'}</a>
-        <button class="action-btn action-delete" data-action="delete" data-id="${config.id}" title="${t('model.delete') || 'Delete'}">
+        <a class="action-link action-configure" data-action="edit" data-id="${escapeHtml(config.id)}">${t('model.configure') || 'Configure'}</a>
+        <button class="action-btn action-delete" data-action="delete" data-id="${escapeHtml(config.id)}" title="${t('model.delete') || 'Delete'}">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18"/><path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
         </button>
       </td>
