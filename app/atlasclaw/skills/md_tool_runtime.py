@@ -255,18 +255,20 @@ def create_script_wrapper(
         if user_id:
             env.setdefault("ATLASCLAW_USER_ID", user_id)
 
-        if deps is not None and hasattr(deps, "cookies"):
-            cookies = deps.cookies
-            if cookies:
-                try:
-                    env["ATLASCLAW_COOKIES"] = json.dumps(cookies)
-                    if user_info:
-                        print(
-                            f"[DEBUG] Set ATLASCLAW_COOKIES for user={user_id}, "
-                            f"cookies={list(cookies.keys())}"
-                        )
-                except (TypeError, ValueError) as exc:
-                    print(f"[WARNING] Failed to serialize cookies: {exc}")
+        # Only provider-scoped request cookies are exported (deps.extra
+        # "_provider_request_cookies", built by build_scoped_deps without
+        # AtlasClaw's own JWT/session cookies). The raw request jar in
+        # deps.cookies must never reach a subprocess.
+        provider_cookies = (
+            extra.get("_provider_request_cookies")
+            if isinstance(extra, dict)
+            else None
+        )
+        if isinstance(provider_cookies, dict) and provider_cookies:
+            try:
+                env["ATLASCLAW_COOKIES"] = json.dumps(provider_cookies)
+            except (TypeError, ValueError):
+                pass
 
         if deps is not None and hasattr(deps, "extra"):
             extra = deps.extra

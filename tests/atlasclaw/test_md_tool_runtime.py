@@ -1108,8 +1108,13 @@ def test_request_cookie_only_wrapper_excludes_shared_credentials(
     monkeypatch.setenv("EXAMPLE_ACCESS_TOKEN", "must-not-cross-resolver-boundary")
 
     class _Deps:
-        cookies = {"CloudChef-Authenticate": "request-cookie"}
+        cookies = {
+            "AtlasClaw-Authenticate": "atlas-jwt",
+            "atlasclaw_session": "atlas-session",
+            "CloudChef-Authenticate": "request-cookie",
+        }
         extra = {
+            "_provider_request_cookies": {"CloudChef-Authenticate": "request-cookie"},
             "provider_instances": provider_config,
             "provider_type": "smartcmp",
             "provider_instance_name": "cmp",

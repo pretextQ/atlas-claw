@@ -120,6 +120,42 @@ def _extract_provider_cookie_token(request_cookies: Optional[dict[str, str]]) ->
     return ""
 
 
+# Cookies that belong to AtlasClaw itself and must never be forwarded to
+# provider/skill subprocesses: the JWT cookie (name configurable), the web
+# session cookie, and the SSO login flow cookies.
+_ATLASCLAW_SESSION_COOKIE_NAMES = (
+    "atlasclaw_session",
+    "sso_state",
+    "pkce_verifier",
+    "oidc_id_token",
+)
+
+
+def _extract_provider_request_cookies(request_cookies: Optional[dict[str, str]]) -> dict[str, str]:
+    """Return request cookies safe for provider subprocesses.
+
+    Drops every AtlasClaw-owned cookie (its JWT and session cookies) and keeps
+    external host cookies such as ``CloudChef-Authenticate`` that cookie-auth
+    providers legitimately need.
+    """
+    if not isinstance(request_cookies, dict):
+        return {}
+
+    atlas_owned = set(_get_atlas_auth_cookie_names())
+    atlas_owned.update(
+        _normalize_cookie_name(name) for name in _ATLASCLAW_SESSION_COOKIE_NAMES
+    )
+    atlas_owned.discard("")
+    filtered: dict[str, str] = {}
+    for cookie_name, cookie_value in request_cookies.items():
+        if _normalize_cookie_name(cookie_name) in atlas_owned:
+            continue
+        value = str(cookie_value or "").strip()
+        if value:
+            filtered[str(cookie_name)] = value
+    return filtered
+
+
 def _get_provider_permissions_from_extra(extra: dict[str, Any]) -> list[dict[str, Any]] | None:
     """Read request-scoped provider rules from either direct or nested context."""
     raw_permissions = extra.get("_provider_permissions")
@@ -842,5 +878,7 @@ def build_scoped_deps(
         session_manager=scoped_session_mgr,
         memory_manager=scoped_memory_mgr,
         cookies=request_cookies or {},
-        extra=deps_extra,
+        # Skill subprocesses must never see AtlasClaw's own JWT/session
+        # cookies; deps.cookies stays the raw jar for server-side use only.
+        extra={**deps_extra, "_provider_request_cookies": _extract_provider_request_cookies(request_cookies)},
     )
