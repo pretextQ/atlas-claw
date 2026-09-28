@@ -23,7 +23,12 @@ import pytest_asyncio
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.atlasclaw.db.database import DatabaseConfig, DatabaseManager, init_database
+from app.atlasclaw.db.database import (
+    DatabaseConfig,
+    DatabaseManager,
+    init_database,
+    resolve_configured_database_url,
+)
 from app.atlasclaw.db.models import AgentModel, TokenModel, UserModel, ChannelModel
 from app.atlasclaw.db.orm import (
     AgentConfigService,
@@ -730,3 +735,94 @@ class TestChannelConfigService:
         
         found = await ChannelConfigService.get_by_id(session, channel_id)
         assert found is None
+
+
+class TestMysqlDsnCredentials:
+    """MySQL DSNs must percent-encode credentials and honor the tls flag."""
+
+    def test_password_special_characters_are_encoded(self):
+        """A password with URL delimiters must not corrupt the DSN."""
+        url = resolve_configured_database_url(
+            {
+                "type": "mysql",
+                "mysql": {
+                    "user": "app",
+                    "password": "p/a%b#c@d:e",
+                    "host": "db.internal",
+                    "port": 3307,
+                    "database": "atlasclaw",
+                    "charset": "utf8mb4",
+                },
+            }
+        )
+
+        assert url.startswith("mysql+aiomysql://app:p%2Fa%25b%23c%40d%3Ae@db.internal:3307/atlasclaw")
+        # The host and port survive parsing, confirming nothing leaked out of
+        # the credential section.
+        from urllib.parse import urlsplit
+
+        parsed = urlsplit(url)
+        assert parsed.hostname == "db.internal"
+        assert parsed.port == 3307
+
+    def test_model_config_also_encodes_credentials(self):
+        """The pydantic config path uses the same encoder."""
+        from app.atlasclaw.core.config_schema import DatabaseConfig as SchemaDatabaseConfig
+
+        schema_config = SchemaDatabaseConfig(
+            type="mysql",
+            mysql={
+                "host": "db.internal",
+                "port": 3306,
+                "database": "atlasclaw",
+                "user": "app",
+                "password": "secret/with/slashes",
+            },
+        )
+
+        url = resolve_configured_database_url(schema_config)
+
+        assert "secret%2Fwith%2Fslashes" in url
+
+    def test_database_name_is_path_encoded(self):
+        url = resolve_configured_database_url(
+            {
+                "type": "mysql",
+                "mysql": {
+                    "user": "app",
+                    "password": "pw",
+                    "host": "h",
+                    "database": "db/name",
+                },
+            }
+        )
+
+        assert url.endswith("/db%2Fname?charset=utf8mb4")
+
+    def test_mysql_tls_flag_is_accepted_by_config_schema(self):
+        """database.mysql.tls must be a real schema field, not silently dropped."""
+        from app.atlasclaw.core.config_schema import DatabaseConfig as SchemaDatabaseConfig
+
+        schema_config = SchemaDatabaseConfig(
+            type="mysql",
+            mysql={"host": "h", "database": "d", "user": "u", "password": "p", "tls": False},
+        )
+
+        assert schema_config.mysql is not None
+        assert schema_config.mysql.tls is False
+
+        resolved = DatabaseConfig.from_config(
+            {
+                "database": {
+                    "type": "mysql",
+                    "mysql": {
+                        "host": "h",
+                        "database": "d",
+                        "user": "u",
+                        "password": "p",
+                        "tls": False,
+                    },
+                }
+            }
+        )
+        assert resolved.mysql_tls is False

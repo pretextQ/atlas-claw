@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+from urllib.parse import quote, quote_plus
 import ssl
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -81,10 +82,13 @@ def resolve_configured_database_url(db_config: object) -> str:
             return f"sqlite+aiosqlite:///{path}"
         elif db_type == "mysql":
             mysql = db_config.get("mysql", {})
-            return (
-                f"mysql+aiomysql://{mysql.get('user')}:{mysql.get('password')}"
-                f"@{mysql.get('host')}:{mysql.get('port', 3306)}/{mysql.get('database')}"
-                f"?charset={mysql.get('charset', 'utf8mb4')}"
+            return _build_mysql_url(
+                user=mysql.get("user"),
+                password=mysql.get("password"),
+                host=mysql.get("host"),
+                port=mysql.get("port", 3306),
+                database=mysql.get("database"),
+                charset=mysql.get("charset", "utf8mb4"),
             )
         raise ValueError(f"Unsupported database type in atlasclaw.json: {db_type!r}")
 
@@ -99,12 +103,45 @@ def resolve_configured_database_url(db_config: object) -> str:
         mysql_cfg = getattr(db_config, "mysql", None)
         if mysql_cfg is None:
             raise ValueError("MySQL config section is missing in atlasclaw.json")
-        return (
-            f"mysql+aiomysql://{mysql_cfg.user}:{mysql_cfg.password}"
-            f"@{mysql_cfg.host}:{mysql_cfg.port}/{mysql_cfg.database}"
-            f"?charset={mysql_cfg.charset}"
+        return _build_mysql_url(
+            user=mysql_cfg.user,
+            password=mysql_cfg.password,
+            host=mysql_cfg.host,
+            port=mysql_cfg.port,
+            database=mysql_cfg.database,
+            charset=mysql_cfg.charset,
         )
     raise ValueError(f"Unsupported database type in atlasclaw.json: {db_type!r}")
+
+
+def _build_mysql_url(
+    *,
+    user: Any,
+    password: Any,
+    host: Any,
+    port: Any,
+    database: Any,
+    charset: Any,
+) -> str:
+    """Build a MySQL SQLAlchemy URL with percent-encoded credentials.
+
+    Credentials are percent-encoded because characters such as ``/``, ``%``,
+    ``#``, ``@``, or ``:`` in a password would otherwise be parsed as URL
+    structure and produce a broken or misdirected connection string.
+    """
+    safe_user = quote_plus(str(user or ""))
+    safe_password = quote_plus(str(password or ""))
+    safe_host = str(host or "localhost")
+    safe_database = quote(str(database or ""), safe="")
+    try:
+        safe_port = int(port)
+    except (TypeError, ValueError):
+        safe_port = 3306
+    return (
+        f"mysql+aiomysql://{safe_user}:{safe_password}"
+        f"@{safe_host}:{safe_port}/{safe_database}"
+        f"?charset={charset}"
+    )
 
 
 class DatabaseConfig:

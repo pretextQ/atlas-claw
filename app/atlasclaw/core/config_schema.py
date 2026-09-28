@@ -456,6 +456,10 @@ class MySqlDatabaseConfig(BaseModel):
     user: str = Field(default="root", description="Database user")
     password: str = Field(default="", description="Database password")
     charset: str = Field(default="utf8mb4", description="Character set")
+    tls: bool = Field(
+        default=True,
+        description="Negotiate TLS for MySQL connections (MYSQL_TLS env var overrides)",
+    )
 
 
 class DatabaseConfig(BaseModel):

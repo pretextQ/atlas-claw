@@ -237,6 +237,7 @@ async def lifespan(app: FastAPI):
                         "user": config.database.mysql.user,
                         "password": config.database.mysql.password,
                         "charset": config.database.mysql.charset,
+                        "tls": config.database.mysql.tls,
                     } if config.database.mysql else {},
                     "pool_size": config.database.pool_size,
                     "max_overflow": config.database.max_overflow,
