@@ -234,6 +234,12 @@ driver and deployment are known to support SQLAlchemy pre-ping reliably.
 }
 ```
 
+> `auth.jwt.secret_key` is mandatory whenever `auth.provider` is not `none`.
+> Startup fails with a validation error when the secret is missing or still the
+> built-in development default. Provide it through the `JWT_SECRET_KEY`
+> environment variable (or `ATLASCLAW_JWT_SECRET` when referenced as
+> `${ATLASCLAW_JWT_SECRET}`).
+
 **OIDC JWT (API Bearer Tokens):**
 ```json
 {

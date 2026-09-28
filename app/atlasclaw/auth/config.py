@@ -209,3 +209,26 @@ class AuthConfig(BaseModel):
                 raise ValueError(
                     "auth.dingtalk.app_secret is required when auth.provider='dingtalk'"
                 )
+        self._validate_jwt_secret()
+
+    def _validate_jwt_secret(self) -> None:
+        """Refuse to issue tokens with the built-in development JWT secret.
+
+        The default secret is public (it ships in the repository), so any token
+        forged with it would be accepted by `verify_atlas_token`. Providers in
+        {none, ""} never mint AtlasClaw JWTs and keep working without a secret
+        so anonymous/dev mode stays usable.
+        """
+        if not self.enabled:
+            return
+        if self.provider.lower() in ("", "none"):
+            return
+        resolved_secret = self.jwt.expanded().secret_key
+        if not resolved_secret or resolved_secret == DEFAULT_JWT_SECRET:
+            raise ValueError(
+                "auth.jwt.secret_key must be set to a strong value when "
+                f"auth.provider='{self.provider}'. Set 'auth.jwt.secret_key' in "
+                "atlasclaw.json (${VAR} expansion is supported) or export "
+                "ATLASCLAW_JWT_SECRET; the built-in default secret must not be "
+                "used to sign tokens."
+            )
