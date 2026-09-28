@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timedelta, timezone
 import sys
+import time
 from types import ModuleType
 from urllib.parse import parse_qs, urlparse
 
@@ -208,7 +209,7 @@ class TestWeComHandler:
             "headers": {"req_id": "req-1"},
             "body": {"chatid": "chat-1"},
         }
-        handler._pending_frames["req-1"] = frame
+        handler._pending_frames["req-1"] = (frame, time.time())
         ws_client = AsyncMock()
         ws_client.is_connected = True
         handler._ws_client = ws_client
@@ -226,7 +227,7 @@ class TestWeComHandler:
 
         assert ack_result.supported is True
         assert ack_result.success is True
-        assert handler._pending_frames["req-1"] is frame
+        assert handler._pending_frames["req-1"][0] is frame
         assert handler._reply_stream_ids["req-1"] == "stream-123"
         ws_client.reply_stream.assert_awaited_once_with(
             frame,
@@ -614,3 +615,108 @@ class TestWeComHandler:
         assert inbound.sender_id == "user-789"
         assert inbound.content == "Hello WeCom"
         assert inbound.channel_type == "wecom"
+
+
+class TestWeComFrameBookkeeping:
+    """WeCom reply-frame maps must stay bounded and never strand placeholders."""
+
+    @pytest.mark.asyncio
+    async def test_stale_pending_frame_is_finished_on_next_message(self, monkeypatch):
+        """A frame whose agent turn never replied is closed, not leaked."""
+        handler = WeComHandler()
+        ws_client = AsyncMock()
+        ws_client.is_connected = True
+        handler._ws_client = ws_client
+
+        stale_frame = {"headers": {"req_id": "req-stale"}, "body": {}}
+        expired_at = time.time() - handler.PENDING_FRAME_TTL_SECONDS - 1
+        handler._pending_frames["req-stale"] = (stale_frame, expired_at)
+        handler._reply_stream_ids["req-stale"] = "stream-stale"
+
+        fresh_frame = {"headers": {"req_id": "req-fresh"}, "body": {}}
+        await handler._handle_message(fresh_frame, "text")
+
+        assert "req-stale" not in handler._pending_frames
+        assert "req-stale" not in handler._reply_stream_ids
+        assert "req-fresh" in handler._pending_frames
+        ws_client.reply_stream.assert_awaited_once_with(
+            stale_frame,
+            "stream-stale",
+            handler.STREAM_TIMEOUT_PLACEHOLDER,
+            finish=True,
+        )
+
+    @pytest.mark.asyncio
+    async def test_pending_frames_are_capped(self):
+        """The pending-frame map must not grow without bound."""
+        handler = WeComHandler()
+        handler._ws_client = None
+        handler.PENDING_FRAME_TTL_SECONDS = 3600.0
+        handler.MAX_PENDING_FRAMES = 5
+
+        base = time.time()
+        for index in range(12):
+            handler._pending_frames[f"req-{index}"] = (
+                {"headers": {"req_id": f"req-{index}"}},
+                base + index,
+            )
+
+        await handler._prune_stale_pending_frames()
+
+        assert len(handler._pending_frames) == 5
+        # Oldest entries are dropped first.
+        assert "req-0" not in handler._pending_frames
+        assert "req-11" in handler._pending_frames
+
+    @pytest.mark.asyncio
+    async def test_disconnect_clears_frame_bookkeeping(self):
+        """Disconnect drops frames and stream ids so a reconnect starts clean."""
+        handler = WeComHandler()
+        handler._pending_frames["req-1"] = ({"headers": {}}, time.time())
+        handler._reply_stream_ids["req-1"] = "stream-1"
+
+        await handler.disconnect()
+
+        assert handler._pending_frames == {}
+        assert handler._reply_stream_ids == {}
+
+    @pytest.mark.asyncio
+    async def test_failed_reply_finishes_acknowledged_stream(self, monkeypatch):
+        """A reply failure must still close the placeholder stream."""
+        utils_module = ModuleType("wecom_aibot_sdk.utils")
+        utils_module.generate_random_string = lambda length: "stream-xyz"
+        sdk_module = ModuleType("wecom_aibot_sdk")
+        sdk_module.utils = utils_module
+        monkeypatch.setitem(sys.modules, "wecom_aibot_sdk", sdk_module)
+        monkeypatch.setitem(sys.modules, "wecom_aibot_sdk.utils", utils_module)
+
+        handler = WeComHandler()
+        frame = {"headers": {"req_id": "req-1"}, "body": {}}
+        handler._pending_frames["req-1"] = (frame, time.time())
+        handler._reply_stream_ids["req-1"] = "stream-acked"
+
+        ws_client = AsyncMock()
+        ws_client.is_connected = True
+        first_attempt = {"done": False}
+
+        async def _reply_stream(frame_arg, stream_id, text, *, finish):
+            if not first_attempt["done"]:
+                first_attempt["done"] = True
+                raise RuntimeError("send failed")
+
+        ws_client.reply_stream.side_effect = _reply_stream
+        handler._ws_client = ws_client
+
+        outbound = OutboundMessage(
+            chat_id="chat-1",
+            content="final answer",
+            metadata={"req_id": "req-1"},
+        )
+        result = await handler.send_message(outbound)
+
+        assert result.success is False
+        assert "req-1" not in handler._pending_frames
+        assert "req-1" not in handler._reply_stream_ids
+        # Second call closes the acknowledged placeholder stream.
+        assert ws_client.reply_stream.await_args_list[-1].args[1] == "stream-acked"
+        assert ws_client.reply_stream.await_args_list[-1].kwargs == {"finish": True}

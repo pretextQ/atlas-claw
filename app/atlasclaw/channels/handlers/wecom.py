@@ -85,6 +85,11 @@ class WeComHandler(ChannelHandler):
     OPENCLAW_QR_SOURCE = "wecom-cli"
     OPENCLAW_QR_TIMEOUT_SECONDS = 8
     ACK_PLACEHOLDER = "已收到，正在处理..."
+    STREAM_TIMEOUT_PLACEHOLDER = "处理超时，请稍后重试"
+    # Bounds for the reply bookkeeping maps; entries older than the TTL are
+    # closed (finish=True) and dropped so maps cannot grow without limit.
+    MAX_PENDING_FRAMES = 200
+    PENDING_FRAME_TTL_SECONDS = 600.0
     
     def __init__(self, config: Dict[str, Any] = None):
         super().__init__(config)
@@ -94,8 +99,8 @@ class WeComHandler(ChannelHandler):
         self._message_callback: Optional[Callable[[InboundMessage], None]] = None
         self._connection_task: Optional[asyncio.Task] = None
         self._running = False
-        # Store frame for reply lookup
-        self._pending_frames: Dict[str, Any] = {}
+        # Store frame for reply lookup: req_id -> (frame, stored_at epoch)
+        self._pending_frames: Dict[str, tuple] = {}
         # Store stream IDs opened by native acknowledgement so final replies can
         # finish the same platform-visible stream instead of creating a new one.
         self._reply_stream_ids: Dict[str, str] = {}
@@ -484,7 +489,8 @@ class WeComHandler(ChannelHandler):
             # Store frame for reply
             req_id = headers.get("req_id", "")
             if req_id:
-                self._pending_frames[req_id] = frame
+                await self._prune_stale_pending_frames()
+                self._pending_frames[req_id] = (frame, time.time())
             
             # Create InboundMessage
             inbound = InboundMessage(
@@ -513,7 +519,76 @@ class WeComHandler(ChannelHandler):
                 
         except Exception as e:
             logger.error(f"[WeCom] Error handling message: {e}")
-    
+
+    async def _prune_stale_pending_frames(self) -> None:
+        """Drop stale pending frames and close their placeholder streams.
+
+        Frames are stored when a message arrives and removed when the Agent
+        reply is sent. Without a bound, a turn that never produces a reply
+        (or a WebSocket drop) leaves both the frame and the platform-side
+        "processing" placeholder alive forever, so entries older than
+        ``PENDING_FRAME_TTL_SECONDS`` are finished with an explicit timeout
+        text and the map is trimmed to ``MAX_PENDING_FRAMES``.
+        """
+        now = time.time()
+        stale_req_ids = [
+            req_id
+            for req_id, entry in self._pending_frames.items()
+            if now - float(entry[1]) > self.PENDING_FRAME_TTL_SECONDS
+        ]
+        for req_id in stale_req_ids:
+            entry = self._pending_frames.pop(req_id, None)
+            if entry is None:
+                continue
+            stream_id = self._reply_stream_ids.pop(req_id, None)
+            if stream_id:
+                await self._finish_reply_stream_quietly(
+                    entry[0],
+                    stream_id,
+                    text=self.STREAM_TIMEOUT_PLACEHOLDER,
+                )
+            logger.warning("[WeCom] Discarded stale pending frame: %s", req_id)
+
+        overflow = len(self._pending_frames) - self.MAX_PENDING_FRAMES
+        if overflow <= 0:
+            return
+        oldest = sorted(self._pending_frames.items(), key=lambda item: item[1][1])[:overflow]
+        for req_id, entry in oldest:
+            self._pending_frames.pop(req_id, None)
+            stream_id = self._reply_stream_ids.pop(req_id, None)
+            if stream_id:
+                await self._finish_reply_stream_quietly(
+                    entry[0],
+                    stream_id,
+                    text=self.STREAM_TIMEOUT_PLACEHOLDER,
+                )
+            logger.warning("[WeCom] Dropped pending frame over capacity: %s", req_id)
+
+    async def _finish_reply_stream_quietly(
+        self,
+        frame: Any,
+        stream_id: str,
+        *,
+        text: Optional[str] = None,
+    ) -> None:
+        """Close a platform-side reply stream, ignoring transport failures.
+
+        The placeholder opened by native acknowledgement must always be
+        finished, including on error paths, or the user's client stays on the
+        "processing" bubble.
+        """
+        if not self._ws_client or not getattr(self._ws_client, "is_connected", False):
+            return
+        try:
+            await self._ws_client.reply_stream(
+                frame,
+                stream_id,
+                text if text is not None else "",
+                finish=True,
+            )
+        except Exception as exc:
+            logger.warning("[WeCom] Failed to finish reply stream %s: %s", stream_id, exc)
+
     async def disconnect(self) -> bool:
         """Disconnect from WeCom."""
         try:
@@ -525,6 +600,13 @@ class WeComHandler(ChannelHandler):
                 logger.info("[WeCom] WebSocket disconnected")
             
             self._access_token = None
+            # The platform-side placeholders can no longer be reached once the
+            # WebSocket is gone; drop the bookkeeping so a reconnect starts clean.
+            dropped = len(self._pending_frames)
+            self._pending_frames.clear()
+            self._reply_stream_ids.clear()
+            if dropped:
+                logger.info("[WeCom] Cleared %s pending reply frames on disconnect", dropped)
             self._status = ConnectionStatus.DISCONNECTED
             return True
         except Exception as e:
@@ -607,7 +689,8 @@ class WeComHandler(ChannelHandler):
                 success=False,
                 error="WeCom native acknowledgement requires a request ID",
             )
-        frame = self._pending_frames.get(req_id)
+        entry = self._pending_frames.get(req_id)
+        frame = entry[0] if entry else None
         if not frame:
             return MessageAcknowledgementResult(
                 supported=False,
@@ -685,22 +768,33 @@ class WeComHandler(ChannelHandler):
             
             # Check if this is a reply to a pending message
             req_id = outbound.metadata.get("req_id") if outbound.metadata else None
-            frame = self._pending_frames.pop(req_id, None) if req_id else None
-            
+            entry = self._pending_frames.pop(req_id, None) if req_id else None
+            frame = entry[0] if entry else None
+
             if frame:
                 # Reply to the original message with stream
-                stream_id = self._reply_stream_ids.pop(req_id, None)
-                if not stream_id:
+                acked_stream_id = self._reply_stream_ids.pop(req_id, None)
+                if acked_stream_id:
+                    stream_id = acked_stream_id
+                else:
                     from wecom_aibot_sdk.utils import generate_random_string
 
                     stream_id = generate_random_string(16)
-                
-                await self._ws_client.reply_stream(
-                    frame,
-                    stream_id,
-                    outbound.content,
-                    finish=True,
-                )
+
+                try:
+                    await self._ws_client.reply_stream(
+                        frame,
+                        stream_id,
+                        outbound.content,
+                        finish=True,
+                    )
+                except Exception:
+                    if acked_stream_id:
+                        # The acknowledgement opened a placeholder stream on the
+                        # platform; always close it or the user stays on the
+                        # "processing" bubble forever.
+                        await self._finish_reply_stream_quietly(frame, acked_stream_id)
+                    raise
                 logger.info(f"[WeCom] Replied via WebSocket stream")
                 return SendResult(success=True)
             else:
