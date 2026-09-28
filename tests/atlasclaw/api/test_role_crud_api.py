@@ -1679,3 +1679,144 @@ class TestRoleCRUDAPI:
         assert assign_runtime_role_resp.json()['roles'] == {'runtime_access_all': True}
 
         _cleanup_manager(manager)
+
+
+class TestRolePermissionSelfEscalation:
+    """A delegated role governor must not escalate through its own role."""
+
+    def _create_governor_role(self, client, admin_token: str) -> str:
+        response = client.post(
+            '/api/roles',
+            json={
+                'name': 'Role Governor',
+                'identifier': 'role-governor',
+                'description': 'May govern role permissions',
+                'permissions': {
+                    'roles': {
+                        'view': True,
+                        'manage_permissions': True,
+                    },
+                },
+                'is_active': True,
+            },
+            headers={'AtlasClaw-Authenticate': admin_token},
+        )
+        assert response.status_code == 201
+        return response.json()['id']
+
+    def _assign_role(self, role_identifier: str, username: str) -> None:
+        async def _assign():
+            async with _test_db_manager.get_session() as session:
+                user = await UserService.get_by_username(session, username)
+                await UserService.update(
+                    session,
+                    user.id,
+                    UserUpdate(roles={role_identifier: True}),
+                )
+
+        asyncio.run(_assign())
+
+    def test_governor_cannot_edit_own_role_permissions(self, tmp_path):
+        manager = _init_database_sync(tmp_path)
+        client = _build_client(tmp_path, _get_auth_config())
+        admin_token = _login_as(client, 'admin', 'adminpass123')
+
+        role_id = self._create_governor_role(client, admin_token)
+        self._assign_role('role-governor', 'regularuser')
+        governor_token = _login_as(client, 'regularuser', 'userpass123')
+
+        response = client.put(
+            f'/api/roles/{role_id}',
+            json={
+                'permissions': {
+                    'roles': {
+                        'view': True,
+                        'manage_permissions': True,
+                    },
+                    'users': {
+                        'view': True,
+                        'edit': True,
+                        'manage_permissions': True,
+                    },
+                },
+            },
+            headers={'AtlasClaw-Authenticate': governor_token},
+        )
+
+        assert response.status_code == 403
+        assert 'role they hold' in response.json()['detail']
+
+        # The stored permissions are unchanged.
+        after = client.get(
+            f'/api/roles/{role_id}',
+            headers={'AtlasClaw-Authenticate': admin_token},
+        )
+        assert after.status_code == 200
+        assert 'users' not in after.json()['permissions'] or not after.json()[
+            'permissions'
+        ]['users'].get('edit')
+
+        _cleanup_manager(manager)
+
+    def test_governor_can_still_edit_permissions_of_roles_it_does_not_hold(self, tmp_path):
+        manager = _init_database_sync(tmp_path)
+        client = _build_client(tmp_path, _get_auth_config())
+        admin_token = _login_as(client, 'admin', 'adminpass123')
+
+        self._create_governor_role(client, admin_token)
+        self._assign_role('role-governor', 'regularuser')
+        governor_token = _login_as(client, 'regularuser', 'userpass123')
+
+        other_response = client.post(
+            '/api/roles',
+            json={
+                'name': 'Reporting',
+                'identifier': 'reporting',
+                'description': 'Reporting role',
+                'permissions': {
+                    'tokens': {'view': True},
+                },
+                'is_active': True,
+            },
+            headers={'AtlasClaw-Authenticate': admin_token},
+        )
+        assert other_response.status_code == 201
+        other_role_id = other_response.json()['id']
+
+        updated = client.put(
+            f'/api/roles/{other_role_id}',
+            json={
+                'permissions': {
+                    'tokens': {'view': True, 'manage_permissions': True},
+                },
+            },
+            headers={'AtlasClaw-Authenticate': governor_token},
+        )
+
+        assert updated.status_code == 200
+
+        _cleanup_manager(manager)
+
+    def test_admin_can_edit_own_role_permissions(self, tmp_path):
+        manager = _init_database_sync(tmp_path)
+        client = _build_client(tmp_path, _get_auth_config())
+        admin_token = _login_as(client, 'admin', 'adminpass123')
+
+        roles = client.get(
+            '/api/roles?page=1&page_size=20',
+            headers={'AtlasClaw-Authenticate': admin_token},
+        )
+        assert roles.status_code == 200
+        admin_role = next(
+            role for role in roles.json()['roles'] if role['identifier'] == 'admin'
+        )
+
+        updated = client.put(
+            f"/api/roles/{admin_role['id']}",
+            json={'permissions': admin_role['permissions']},
+            headers={'AtlasClaw-Authenticate': admin_token},
+        )
+
+        assert updated.status_code == 200
+
+        _cleanup_manager(manager)

@@ -1180,6 +1180,7 @@ async def update_role(
             authz,
             role_data.permissions,
             existing_permissions=old_role.permissions,
+            target_role_identifier=str(getattr(old_role, "identifier", "") or ""),
         )
 
     if role_data.name and role_data.name != old_role.name:

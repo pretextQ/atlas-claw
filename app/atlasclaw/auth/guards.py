@@ -513,8 +513,22 @@ def ensure_can_manage_permission_modules(
     requested_permissions: Optional[dict[str, Any]],
     *,
     existing_permissions: Optional[dict[str, Any]] = None,
+    target_role_identifier: Optional[str] = None,
 ) -> None:
-    """Validate permission-matrix edits against module governance permissions."""
+    """Validate permission-matrix edits against module governance permissions.
+
+    Non-administrators may not change the permissions of a role they currently
+    hold, even when they govern the module being edited: a delegated
+    ``roles.manage_permissions`` holder could otherwise grant itself anything
+    that governance allows. Administrators are unrestricted.
+
+    Args:
+        authz: Caller's authorization context.
+        requested_permissions: Permission matrix being written.
+        existing_permissions: Permission matrix being replaced, if any.
+        target_role_identifier: Identifier of the role being edited, when the
+            edit targets an existing role.
+    """
     normalized_existing = RoleService.normalize_permissions(existing_permissions)
     normalized_requested = RoleService.normalize_permissions(requested_permissions)
     changed_modules = sorted({
@@ -525,6 +539,20 @@ def ensure_can_manage_permission_modules(
 
     if not changed_modules:
         return
+
+    if not getattr(authz, "is_admin", False) and target_role_identifier:
+        own_role_identifiers = {
+            str(identifier or "").strip().lower()
+            for identifier in (authz.role_identifiers or [])
+        }
+        if str(target_role_identifier).strip().lower() in own_role_identifiers:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "Only administrators may change the permissions of a role "
+                    "they hold"
+                ),
+            )
 
     if has_permission(authz, "roles.manage_permissions"):
         return
