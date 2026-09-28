@@ -8,8 +8,9 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import secrets
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 
 from app.atlasclaw.core.token_pool import TokenEntry
 from app.atlasclaw.core.trace import create_traced_http_client
@@ -323,6 +324,19 @@ async def load_agent_config_from_db(session, agent_id: str):
     )
 
 
+def _resolve_bootstrap_admin_password(configured_password: str) -> Tuple[str, bool]:
+    """Return ``(password, was_generated)`` for the default local admin account.
+
+    The well-known "admin" default must never reach the database: when the
+    configured password is empty or still the development default, a random
+    one is generated and shown once at startup instead.
+    """
+    configured = (configured_password or "").strip()
+    if configured and configured != "admin":
+        return configured, False
+    return secrets.token_urlsafe(12), True
+
+
 async def ensure_default_local_admin(config) -> None:
     """Ensure default local admin account exists when local auth is enabled."""
     from app.atlasclaw.auth.config import AuthConfig
@@ -338,7 +352,9 @@ async def ensure_default_local_admin(config) -> None:
         return
 
     username = auth_cfg.local.default_admin_username or "admin"
-    password = auth_cfg.local.default_admin_password or "admin"
+    password, generated_password = _resolve_bootstrap_admin_password(
+        auth_cfg.local.default_admin_password
+    )
 
     async with get_db_manager().get_session() as session:
         existing = await UserService.get_by_username(
@@ -362,3 +378,8 @@ async def ensure_default_local_admin(config) -> None:
         )
 
     print(f"[AtlasClaw] Created default local admin user: {username}")
+    if generated_password:
+        print(
+            "[AtlasClaw] Admin password generated for first login (shown once, "
+            f"change it after signing in): {password}"
+        )
