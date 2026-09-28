@@ -74,9 +74,9 @@ class StreamState:
     """
 
 Stream state
-    
+
     , used for resume-from-breakpoint.
-    
+
 """
     run_id: str
     last_event_id: str = ""
@@ -84,7 +84,7 @@ Stream state
     started_at: float = field(default_factory=time.time)
     events: list[SSEEvent] = field(default_factory=list)
     closed: bool = False
-    
+
     def add_event(self, event: SSEEvent) -> None:
         """"""
         self.event_count += 1
@@ -94,6 +94,73 @@ Stream state
         self.events.append(event)
         if len(self.events) > 100:
             self.events = self.events[-100:]
+
+
+class _StreamOverflow:
+    """Sentinel queued for a subscriber when live delivery overflowed.
+
+    Reaching this state means the client consumed events slower than the run
+    produced them; the generator turns it into an explicit error event and
+    closes the stream so the client can reconnect with Last-Event-ID and
+    replay the missed events from the stream buffer.
+    """
+
+
+class _SubscriberQueue:
+    """Per-subscriber delivery queue with explicit overflow signaling."""
+
+    def __init__(self, maxsize: int) -> None:
+        self._queue: asyncio.Queue = asyncio.Queue(maxsize=max(maxsize, 1))
+        self.broken = False
+
+    def put_event(self, event: SSEEvent) -> bool:
+        """Queue one event; on overflow mark the subscriber broken.
+
+        Args:
+            event: The event to deliver.
+
+        Returns:
+            True when the event was queued for delivery.
+        """
+        if self.broken:
+            return False
+        try:
+            self._queue.put_nowait(event)
+            return True
+        except asyncio.QueueFull:
+            # Make room for the overflow sentinel: one oldest queued event is
+            # dropped here, but it is still present in the stream buffer for
+            # replay after the client reconnects with Last-Event-ID.
+            self.broken = True
+            try:
+                self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            self._queue.put_nowait(_StreamOverflow())
+            return False
+
+    def put_stream_end(self) -> None:
+        """Queue the stream terminator, displacing one event if full."""
+        self.broken = True
+        try:
+            self._queue.put_nowait(None)
+        except asyncio.QueueFull:
+            try:
+                self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            self._queue.put_nowait(None)
+
+    async def get(self, timeout: float):
+        """Await the next item from the queue with a timeout."""
+        return await asyncio.wait_for(self._queue.get(), timeout=timeout)
+
+    def remove_self_from(self, subscribers: list) -> None:
+        """Detach this subscriber from the run's subscriber list."""
+        try:
+            subscribers.remove(self)
+        except ValueError:
+            pass
 
 
 class SSEManager:
@@ -154,9 +221,9 @@ initialize SSE manager
         
         # Stream state
         self._streams: dict[str, StreamState] = {}
-        
-        # 
-        self._subscribers: dict[str, list[asyncio.Queue[Optional[SSEEvent]]]] = {}
+
+        #
+        self._subscribers: dict[str, list[_SubscriberQueue]] = {}
         
     def create_stream(self, run_id: str) -> StreamState:
         """
@@ -198,16 +265,15 @@ to
             
         # to-Stream state
         stream.add_event(event)
-        
-        # 
+
+        #
         queues = self._subscribers.get(run_id, [])
+        notified = 0
         for queue in queues:
-            try:
-                queue.put_nowait(event)
-            except asyncio.QueueFull:
-                pass
-                
-        return len(queues)
+            if queue.put_event(event):
+                notified += 1
+
+        return notified
         
     def close_stream(self, run_id: str) -> None:
         """
@@ -223,13 +289,10 @@ to
             return
         stream.closed = True
 
-        # 
+        #
         queues = self._subscribers.get(run_id, [])
         for queue in queues:
-            try:
-                queue.put_nowait(None)  # None
-            except asyncio.QueueFull:
-                pass
+            queue.put_stream_end()  # None
                 
         # (used for resume-from-breakpoint)
         # 
@@ -296,8 +359,8 @@ create SSE
             return
             
         # create
-        queue: asyncio.Queue[Optional[SSEEvent]] = asyncio.Queue(maxsize=100)
-        
+        queue = _SubscriberQueue(maxsize=self._max_events_buffer)
+
         if run_id not in self._subscribers:
             self._subscribers[run_id] = []
         self._subscribers[run_id].append(queue)
@@ -356,11 +419,8 @@ create SSE
                     
                 try:
                     # etc., heartbeat
-                    event = await asyncio.wait_for(
-                        queue.get(),
-                        timeout=self._heartbeat_interval
-                    )
-                    
+                    event = await queue.get(timeout=self._heartbeat_interval)
+
                     if event is None:
                         # 
                         if not sent_terminal_lifecycle:
@@ -369,7 +429,24 @@ create SSE
                                 data={"phase": "end"}
                             ).to_sse_format()
                         break
-                        
+
+                    if isinstance(event, _StreamOverflow):
+                        # The subscriber consumed slower than the run produced;
+                        # signal the client explicitly and close so it can
+                        # reconnect with Last-Event-ID and replay the buffer.
+                        yield SSEEvent(
+                            event_type=SSEEventType.ERROR,
+                            data={
+                                "code": "stream_overflow",
+                                "message": (
+                                    "Live events were dropped because the client "
+                                    "consumed too slowly; reconnect with Last-Event-ID "
+                                    "to replay missed events."
+                                ),
+                            },
+                        ).to_sse_format()
+                        break
+
                     yield event.to_sse_format()
                     sent_terminal_lifecycle = (
                         sent_terminal_lifecycle or _is_terminal_lifecycle(event)
