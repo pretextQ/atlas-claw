@@ -161,3 +161,112 @@ class TestAuthStrategy:
             assert user.password is None
 
         await manager.close()
+
+
+class _DbBackedProvider(AuthProvider):
+    """Provider whose results carry a database user id (as the local provider does)."""
+
+    def __init__(self, user_id: str, call_count: list | None = None):
+        self._user_id = user_id
+        self.call_count = call_count if call_count is not None else []
+
+    def provider_name(self) -> str:
+        return "oidc_jwt"
+
+    async def authenticate(self, credential: str) -> AuthResult:
+        self.call_count.append(credential)
+        return AuthResult(
+            subject=self._user_id,
+            display_name="Db User",
+            raw_token=credential,
+            extra={"db_user_id": self._user_id, "auth_type": "oidc"},
+        )
+
+
+class TestAuthCacheInvalidation:
+    """Cached credentials must not outlive an account deactivation."""
+
+    async def _seed_user(self, tmp_path, *, username: str, is_active: bool) -> str:
+        manager = await init_database(
+            DatabaseConfig(db_type="sqlite", sqlite_path=str(tmp_path / "auth.db"))
+        )
+        await manager.create_tables()
+        from app.atlasclaw.db.database import get_db_manager
+        from app.atlasclaw.db.schemas import UserCreate
+
+        async with get_db_manager().get_session() as session:
+            user = await UserService.create(
+                session,
+                UserCreate(
+                    username=username,
+                    display_name=username,
+                    auth_type="oidc",
+                    is_active=is_active,
+                ),
+            )
+            return user.id
+
+    @pytest.mark.asyncio
+    async def test_deactivated_user_is_rejected_on_cache_hit(self, tmp_path):
+        user_id = await self._seed_user(tmp_path, username="cached-user", is_active=True)
+        calls: list[str] = []
+        provider = _DbBackedProvider(user_id=user_id, call_count=calls)
+        strategy = AuthStrategy(
+            providers=[provider],
+            workspace_path=str(tmp_path),
+            cache_ttl_seconds=600,
+        )
+
+        first = await strategy.resolve_user("token-1")
+        # The cached identity carries the database user id that revalidation
+        # checks against.
+        assert first.extra["db_user_id"] == user_id
+        assert calls == ["token-1"]
+
+        # The account is deactivated while the credential is still cached.
+        from app.atlasclaw.db.database import get_db_manager
+        from app.atlasclaw.db.schemas import UserUpdate
+
+        async with get_db_manager().get_session() as session:
+            await UserService.update(session, user_id, UserUpdate(is_active=False))
+
+        with pytest.raises(Exception) as excinfo:
+            await strategy.resolve_user("token-1")
+        assert "inactive" in str(excinfo.value).lower()
+        # The stale entry is gone, so a retry re-authenticates.
+        assert "token-1" not in strategy._cache
+
+    @pytest.mark.asyncio
+    async def test_active_user_keeps_serving_from_cache(self, tmp_path):
+        user_id = await self._seed_user(tmp_path, username="active-user", is_active=True)
+        calls: list[str] = []
+        provider = _DbBackedProvider(user_id=user_id, call_count=calls)
+        strategy = AuthStrategy(
+            providers=[provider],
+            workspace_path=str(tmp_path),
+            cache_ttl_seconds=600,
+        )
+
+        await strategy.resolve_user("token-2")
+        await strategy.resolve_user("token-2")
+
+        # One authentication only: the second call was served from the cache.
+        assert calls == ["token-2"]
+
+    @pytest.mark.asyncio
+    async def test_cache_is_bounded(self, tmp_path):
+        provider = _MockProvider(subject="bounded-user")
+        strategy = AuthStrategy(
+            providers=[provider],
+            workspace_path=str(tmp_path),
+            cache_ttl_seconds=600,
+            cache_max_entries=3,
+        )
+
+        for index in range(6):
+            await strategy.resolve_user(f"token-{index}")
+
+        assert len(strategy._cache) == 3
+        # Least recently used credentials were evicted first.
+        assert "token-0" not in strategy._cache
+        assert "token-5" in strategy._cache

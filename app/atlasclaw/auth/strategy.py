@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections import OrderedDict
 from typing import Optional
 
 from app.atlasclaw.auth.config import AuthConfig
@@ -37,23 +38,30 @@ class AuthStrategy:
     remote calls for the same token.
     """
 
+    # Upper bound for cached credentials; the cache is keyed by raw
+    # credential, so an unbounded map would keep every token seen.
+    CACHE_MAX_ENTRIES = 1024
+
     def __init__(
         self,
         providers: list[AuthProvider],
         workspace_path: str = ".",
         cache_ttl_seconds: int = 300,
+        cache_max_entries: int = CACHE_MAX_ENTRIES,
     ) -> None:
         """
         Args:
             providers: List of providers to try in order
             workspace_path: Workspace root for per-user runtime directories
             cache_ttl_seconds: Cache TTL in seconds
+            cache_max_entries: Maximum cached credentials (LRU eviction)
         """
         self._providers = providers
         self._workspace_path = workspace_path
         self._cache_ttl = cache_ttl_seconds
-        # token -> (UserInfo, expiry_monotonic_ts)
-        self._cache: dict[str, tuple[UserInfo, float]] = {}
+        self._cache_max_entries = max(1, int(cache_max_entries))
+        # token -> (UserInfo, expiry_monotonic_ts), ordered least-recently-used first
+        self._cache: "OrderedDict[str, tuple[UserInfo, float]]" = OrderedDict()
 
     @property
     def providers(self) -> list[AuthProvider]:
@@ -64,6 +72,46 @@ class AuthStrategy:
     def primary_provider(self) -> AuthProvider | None:
         """Get the first (primary) provider."""
         return self._providers[0] if self._providers else None
+
+    async def _cached_user_still_active(self, user_info: UserInfo) -> bool:
+        """Verify a cached identity is still allowed to authenticate.
+
+        The cache exists to avoid repeated remote calls, but account state
+        lives in the database: a user deactivated after being cached would
+        keep authenticating until the TTL expired. Entries backed by a
+        database user are re-checked on every hit, and a deactivated account
+        raises like a failed authentication so callers treat it as logged out.
+        """
+        db_user_id = str((user_info.extra or {}).get("db_user_id", "") or "").strip()
+        if not db_user_id:
+            return True
+
+        try:
+            from app.atlasclaw.db.database import get_db_manager
+            from app.atlasclaw.db.orm.user import UserService
+        except Exception:  # pragma: no cover - import guard
+            return True
+
+        try:
+            manager = get_db_manager()
+        except Exception:  # pragma: no cover - defensive
+            return True
+        if manager is None or not getattr(manager, "is_initialized", False):
+            return True
+
+        try:
+            async with manager.get_session() as session:
+                db_user = await UserService.get_by_id(session, db_user_id)
+        except Exception as exc:  # pragma: no cover - fail open on DB errors
+            logger.warning("Auth cache revalidation failed open: %s", exc)
+            return True
+
+        if db_user is None:
+            return False
+        if not getattr(db_user, "is_active", True):
+            logger.info("Cached credential rejected: user account is inactive")
+            raise AuthenticationError("User account is inactive")
+        return True
 
     def _ensure_user_workspace(self, user_id: str) -> None:
         user_initializer = UserWorkspaceInitializer(
@@ -111,13 +159,23 @@ class AuthStrategy:
             AuthenticationError: If all providers fail
         """
         # --- TTL cache hit -------------------------------------------
-        if credential in self._cache:
-            user_info, expiry = self._cache[credential]
+        cached = self._cache.get(credential)
+        if cached is not None:
+            user_info, expiry = cached
             if time.monotonic() < expiry:
-                self._ensure_user_workspace(user_info.user_id)
-                logger.debug("Auth cache hit")
-                return user_info
-            del self._cache[credential]
+                try:
+                    still_active = await self._cached_user_still_active(user_info)
+                except AuthenticationError:
+                    # Drop the stale entry before surfacing the rejection.
+                    self._cache.pop(credential, None)
+                    raise
+                if still_active:
+                    self._cache.move_to_end(credential)
+                    self._ensure_user_workspace(user_info.user_id)
+                    logger.debug("Auth cache hit")
+                    return user_info
+            # Expired, or the account was deactivated since it was cached.
+            self._cache.pop(credential, None)
 
         # --- Try providers in sequence -------------------------------
         last_error: AuthenticationError | None = None
@@ -161,6 +219,9 @@ class AuthStrategy:
                         user_info,
                         time.monotonic() + self._cache_ttl,
                     )
+                    self._cache.move_to_end(credential)
+                    while len(self._cache) > self._cache_max_entries:
+                        self._cache.popitem(last=False)
 
                 logger.info(
                     f"Authentication succeeded: provider={provider_name}, "
