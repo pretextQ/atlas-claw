@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import shutil
 import uuid
@@ -42,6 +43,9 @@ from app.atlasclaw.session.context import (
     SessionScope,
 )
 from app.atlasclaw.core.config_schema import ResetMode
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -122,6 +126,7 @@ manager = SessionManager(agents_dir="/path/to/legacy-agents")
         self._io_retry_backoff_seconds = 0.05
         self._archive_budget_bytes = 200 * 1024 * 1024
         self._loaded = False
+        self._metadata_load_failed = False
     
     async def _ensure_dir(self) -> None:
         """Ensure the session and archive directories exist, migrating legacy data if needed."""
@@ -182,18 +187,34 @@ manager = SessionManager(agents_dir="/path/to/legacy-agents")
         return ""
 
     async def _read_transcript_entries_with_retry(self, transcript_path: Path) -> list[TranscriptEntry]:
-        """Read transcript JSONL content with retry and parse into entries."""
+        """Read transcript JSONL content with retry and parse into entries.
+
+        Malformed lines are skipped with a warning so a single corrupt line
+        (for example from an interrupted append) cannot turn the whole history
+        into an empty list, which a later full rewrite would persist.
+        """
         max_attempts = max(1, int(self._io_retry_attempts))
         for attempt in range(max_attempts):
             try:
                 entries: list[TranscriptEntry] = []
+                line_number = 0
                 async with aiofiles.open(transcript_path, "r", encoding="utf-8") as f:
                     async for line in f:
+                        line_number += 1
                         normalized = line.strip()
                         if not normalized:
                             continue
-                        data = json.loads(normalized)
-                        entries.append(TranscriptEntry.from_dict(data))
+                        try:
+                            data = json.loads(normalized)
+                            entries.append(TranscriptEntry.from_dict(data))
+                        except Exception as exc:
+                            logger.warning(
+                                "[SessionManager] Skipping malformed transcript "
+                                "line %s in %s: %s",
+                                line_number,
+                                transcript_path.name,
+                                exc,
+                            )
                 return entries
             except Exception:
                 if attempt + 1 >= max_attempts:
@@ -255,10 +276,10 @@ manager = SessionManager(agents_dir="/path/to/legacy-agents")
         """Load session metadata from disk into the in-memory cache."""
         if self._loaded:
             return
-        
+
         await self._ensure_dir()
         metadata_path = self.sessions_dir / self.METADATA_FILE
-        
+
         if metadata_path.exists():
             try:
                 content = await self._read_text_with_retry(metadata_path)
@@ -268,13 +289,28 @@ manager = SessionManager(agents_dir="/path/to/legacy-agents")
                 data = json.loads(content)
                 for key, value in data.items():
                     self._metadata_cache[key] = SessionMetadata.from_dict(value)
-            except Exception as e:
-                print(f"[SessionManager] Failed to load metadata: {e}")
-        
+            except Exception:
+                # Refuse to persist over an index we could not read: a save
+                # here would replace sessions.json with only the sessions
+                # cached in this process, orphaning every other session.
+                logger.exception(
+                    "[SessionManager] Failed to load session metadata from %s; "
+                    "metadata writes are disabled until restart",
+                    metadata_path,
+                )
+                self._metadata_load_failed = True
+
         self._loaded = True
-    
+
     async def _save_metadata(self) -> None:
         """Persist the in-memory metadata cache to disk."""
+        if self._metadata_load_failed:
+            logger.error(
+                "[SessionManager] Skipping metadata save because the session "
+                "index could not be loaded; fix or remove %s and restart",
+                self.sessions_dir / self.METADATA_FILE,
+            )
+            return
         await self._ensure_dir()
         metadata_path = self.sessions_dir / self.METADATA_FILE
         tmp_path = self._build_metadata_tmp_path(metadata_path)
@@ -434,7 +470,7 @@ manager = SessionManager(agents_dir="/path/to/legacy-agents")
             )
             return entries
         except Exception as e:
-            print(f"[SessionManager] Failed to load transcript: {e}")
+            logger.exception("[SessionManager] Failed to load transcript: %s", e)
             return []
     
     async def append_transcript(
@@ -491,8 +527,11 @@ manager = SessionManager(agents_dir="/path/to/legacy-agents")
         """
         session = await self.get_or_create(session_key)
         transcript_path = self._get_transcript_path(session)
-        
-        async with aiofiles.open(transcript_path, "w", encoding="utf-8") as f:
+
+        # Write through a temp file and atomically replace so a crash or
+        # cancellation mid-rewrite cannot truncate the existing transcript.
+        tmp_path = self._build_metadata_tmp_path(transcript_path)
+        async with aiofiles.open(tmp_path, "w", encoding="utf-8") as f:
             for msg in messages:
                 entry = TranscriptEntry(
                     role=msg.get("role", "user"),
@@ -508,6 +547,7 @@ manager = SessionManager(agents_dir="/path/to/legacy-agents")
                     if encoded:
                         entry.metadata["encoded_input"] = True
                 await f.write(json.dumps(entry.to_dict(), ensure_ascii=False) + "\n")
+        await self._replace_file_with_retry(tmp_path, transcript_path)
         self._invalidate_transcript_cache(session_key)
         
         session.updated_at = datetime.now()
