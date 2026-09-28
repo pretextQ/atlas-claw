@@ -99,14 +99,26 @@ class ChannelRegistry:
     @classmethod
     def get_instance(cls, channel_id: str) -> Optional[ChannelHandler]:
         """Get cached channel handler instance.
-        
+
         Args:
             channel_id: Instance identifier
-            
+
         Returns:
             Handler instance or None if not found
         """
         return cls._instances.get(channel_id)
+
+    @classmethod
+    def remove_instance(cls, channel_id: str) -> Optional[ChannelHandler]:
+        """Drop a cached handler instance.
+
+        Args:
+            channel_id: Instance identifier
+
+        Returns:
+            The removed handler instance, or None when nothing was cached.
+        """
+        return cls._instances.pop(channel_id, None)
     
     @classmethod
     def register_connection(cls, connection: ChannelConnection) -> None:

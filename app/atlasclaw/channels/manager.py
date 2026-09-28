@@ -43,6 +43,9 @@ class ChannelManager:
         self._session_manager_router: Optional["SessionManagerRouter"] = None
         self._event_loop: Optional[asyncio.AbstractEventLoop] = None
         self._background_tasks: set = set()
+        # In-flight connection initializations keyed by instance key; shared so
+        # concurrent enable/create requests cannot start two handlers.
+        self._initializing: Dict[str, asyncio.Task] = {}
 
     def _set_connection_runtime_status(
         self,
@@ -91,6 +94,11 @@ class ChannelManager:
         For long-connection channels, this will establish the persistent connection.
         For webhook channels, this will register the webhook handler.
 
+        Initialization is idempotent for a given connection: concurrent calls
+        share one attempt, and an already-running handler for the same
+        connection is stopped first so a re-init cannot leave two SDK
+        subprocesses serving the same account.
+
         Args:
             user_id: User identifier
             channel_type: Channel type
@@ -99,6 +107,55 @@ class ChannelManager:
         Returns:
             True if initialized successfully
         """
+        instance_key = f"{user_id}:{channel_type}:{connection_id}"
+
+        in_flight = self._initializing.get(instance_key)
+        if in_flight is not None and not in_flight.done():
+            logger.info(f"Connection initialization already in progress: {instance_key}")
+            return await self._await_initialization(in_flight)
+
+        task = asyncio.ensure_future(
+            self._initialize_connection_impl(user_id, channel_type, connection_id)
+        )
+        self._initializing[instance_key] = task
+        task.add_done_callback(lambda _finished, key=instance_key: self._initializing.pop(key, None))
+        return await self._await_initialization(task)
+
+    @staticmethod
+    async def _await_initialization(task: "asyncio.Task") -> bool:
+        """Await a shared initialization task without cancelling it on abort."""
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Connection initialization task failed")
+            return False
+
+    async def _stop_existing_handler(self, instance_key: str) -> None:
+        """Stop and unregister any handler already serving a connection."""
+        handler = self._active_connections.pop(instance_key, None)
+        if handler is not None:
+            try:
+                if getattr(handler, "supports_long_connection", False):
+                    await handler.disconnect()
+            except Exception:
+                logger.warning(f"Failed to disconnect previous handler: {instance_key}", exc_info=True)
+            try:
+                await handler.stop()
+            except Exception:
+                logger.warning(f"Failed to stop previous handler: {instance_key}", exc_info=True)
+            logger.info(f"Stopped previous handler before re-initialization: {instance_key}")
+
+        ChannelRegistry.remove_instance(instance_key)
+
+    async def _initialize_connection_impl(
+        self,
+        user_id: str,
+        channel_type: str,
+        connection_id: str
+    ) -> bool:
+        """Start a channel connection (single attempt; see initialize_connection)."""
         self._set_connection_runtime_status(connection_id, ConnectionStatus.CONNECTING)
 
         try:
@@ -123,6 +180,11 @@ class ChannelManager:
 
             # Create instance
             instance_key = f"{user_id}:{channel_type}:{connection_id}"
+
+            # A previous handler for this connection must be torn down before
+            # its replacement starts, otherwise the old SDK subprocess keeps
+            # running and messages are handled twice.
+            await self._stop_existing_handler(instance_key)
 
             handler = ChannelRegistry.create_instance(
                 instance_key,
@@ -632,8 +694,35 @@ class ChannelManager:
 
         # Step 2: Initialize connection in background (async, don't block API response)
         self._set_connection_runtime_status(connection_id, ConnectionStatus.CONNECTING)
-        asyncio.create_task(self._background_initialize(user_id, channel_type, connection_id))
+        self.schedule_background_initialize(user_id, channel_type, connection_id)
         return True
+
+    def schedule_background_initialize(
+        self,
+        user_id: str,
+        channel_type: str,
+        connection_id: str,
+    ) -> "asyncio.Task":
+        """Schedule background connection initialization.
+
+        Call this only after the connection row is committed, so the
+        initialization cannot read a stale row. The task is kept referenced so
+        it cannot be garbage collected mid-flight.
+
+        Args:
+            user_id: User identifier
+            channel_type: Channel type
+            connection_id: Connection identifier
+
+        Returns:
+            The scheduled initialization task.
+        """
+        task = asyncio.create_task(
+            self._background_initialize(user_id, channel_type, connection_id)
+        )
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
 
     async def _background_initialize(
         self,

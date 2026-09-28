@@ -310,9 +310,10 @@ async def _save_provisioned_connection(
         ),
     )
     logger.info("Auto-starting provisioned connection: %s/%s/%s", provision_session.user_id, channel_type, channel.id)
-    asyncio.create_task(
-        manager._background_initialize(provision_session.user_id, channel_type, channel.id)
-    )
+    # Commit before scheduling: background initialization reads the connection
+    # row, and the request-scoped session only commits on dependency teardown.
+    await db_session.commit()
+    manager.schedule_background_initialize(provision_session.user_id, channel_type, channel.id)
     provision_session = await ChannelProvisioningSessionService.complete(
         db_session,
         provision_session,
@@ -712,9 +713,11 @@ async def create_connection(
     # Auto-start connection if enabled
     if channel.is_active:
         logger.info(f"Auto-starting new connection: {user_id}/{channel_type}/{channel.id}")
-        asyncio.create_task(
-            manager._background_initialize(user_id, channel_type, channel.id)
-        )
+        # Commit before scheduling: background initialization reads the
+        # connection row, and the request-scoped session only commits on
+        # dependency teardown (after the response is sent).
+        await session.commit()
+        manager.schedule_background_initialize(user_id, channel_type, channel.id)
 
     return ConnectionResponse(
         id=channel.id,

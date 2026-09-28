@@ -676,3 +676,180 @@ class TestChannelManager:
 
         handler.acknowledge_message.assert_called_once_with(message)
         handler.send_message.assert_awaited_once()
+
+
+class _TrackingHandler(WebSocketHandler):
+    """Handler double that records lifecycle calls and can block in setup."""
+
+    channel_type = "tracking"
+
+    def __init__(self, config=None):
+        super().__init__(config)
+        self.setup_calls = 0
+        self.start_calls = 0
+        self.stop_calls = 0
+        self.disconnect_calls = 0
+        self.setup_gate: Optional[asyncio.Event] = None
+        self.started = asyncio.Event()
+
+    async def setup(self, connection_config):
+        del connection_config
+        self.setup_calls += 1
+        if self.setup_gate is not None:
+            await self.setup_gate.wait()
+        return True
+
+    async def start(self, context):
+        del context
+        self.start_calls += 1
+        self._status = ConnectionStatus.CONNECTED
+        self.started.set()
+        return True
+
+    async def stop(self):
+        self.stop_calls += 1
+        self._status = ConnectionStatus.DISCONNECTED
+        return True
+
+    async def disconnect(self):
+        self.disconnect_calls += 1
+        return True
+
+    supports_long_connection = True
+
+    async def connect(self):
+        return True
+
+
+class TestChannelManagerInitialization:
+    """Initialization must be idempotent and must not leak old handlers."""
+
+    def setup_method(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.manager = ChannelManager(self.temp_dir)
+        ChannelRegistry._handlers.clear()
+        ChannelRegistry._instances.clear()
+        ChannelRegistry._connections.clear()
+
+    @pytest.mark.asyncio
+    async def test_concurrent_initialization_shares_one_attempt(self):
+        """Two concurrent inits for one connection must not start two handlers."""
+        created: list[_TrackingHandler] = []
+        gate = asyncio.Event()
+
+        def _factory(instance_key, channel_type, config):
+            del instance_key, channel_type
+            handler = _TrackingHandler(config)
+            # Park every handler inside setup() until the test releases it, so
+            # the first attempt is still in flight when the second call starts.
+            handler.setup_gate = gate
+            created.append(handler)
+            return handler
+
+        ChannelRegistry.register("tracking", _TrackingHandler)
+
+        mock_channel = MagicMock()
+        mock_channel.id = "conn-1"
+        mock_channel.name = "Tracked"
+        mock_channel.type = "tracking"
+        mock_channel.config = {}
+        mock_channel.is_active = True
+        mock_channel.is_default = False
+        mock_channel.user_id = "user-1"
+
+        with patch("app.atlasclaw.db.get_db_manager") as mock_db_manager, \
+             patch("app.atlasclaw.channels.manager.ChannelConfigService") as mock_service, \
+             patch.object(ChannelRegistry, "create_instance", side_effect=_factory):
+            mock_session_instance = AsyncMock()
+            mock_db_manager.return_value.get_session.return_value.__aenter__.return_value = mock_session_instance
+            mock_service.get_by_id = AsyncMock(return_value=mock_channel)
+            mock_service.to_channel_config.return_value = {
+                "id": "conn-1",
+                "name": "Tracked",
+                "channel_type": "tracking",
+                "config": {},
+                "enabled": True,
+            }
+
+            first = asyncio.create_task(
+                self.manager.initialize_connection("user-1", "tracking", "conn-1")
+            )
+            await asyncio.sleep(0.05)
+            # first is parked in setup(); the second call must join it instead
+            # of creating a competing handler.
+            second = asyncio.create_task(
+                self.manager.initialize_connection("user-1", "tracking", "conn-1")
+            )
+            await asyncio.sleep(0.05)
+            gate.set()
+
+            results = await asyncio.gather(first, second)
+
+        assert results == [True, True]
+        assert len(created) == 1
+        assert created[0].setup_calls == 1
+        assert created[0].start_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_reinitialization_stops_previous_handler(self):
+        """A new init for a live connection stops the old handler first."""
+        ChannelRegistry.register("tracking", _TrackingHandler)
+        old_handler = _TrackingHandler({})
+        old_handler._status = ConnectionStatus.CONNECTED
+        instance_key = "user-1:tracking:conn-1"
+        self.manager._active_connections[instance_key] = old_handler
+        ChannelRegistry._instances[instance_key] = old_handler
+
+        mock_channel = MagicMock()
+        mock_channel.id = "conn-1"
+        mock_channel.name = "Tracked"
+        mock_channel.type = "tracking"
+        mock_channel.config = {}
+        mock_channel.is_active = True
+        mock_channel.is_default = False
+        mock_channel.user_id = "user-1"
+
+        with patch("app.atlasclaw.db.get_db_manager") as mock_db_manager, \
+             patch("app.atlasclaw.channels.manager.ChannelConfigService") as mock_service:
+            mock_session_instance = AsyncMock()
+            mock_db_manager.return_value.get_session.return_value.__aenter__.return_value = mock_session_instance
+            mock_service.get_by_id = AsyncMock(return_value=mock_channel)
+            mock_service.to_channel_config.return_value = {
+                "id": "conn-1",
+                "name": "Tracked",
+                "channel_type": "tracking",
+                "config": {},
+                "enabled": True,
+            }
+
+            result = await self.manager.initialize_connection("user-1", "tracking", "conn-1")
+
+        assert result is True
+        assert old_handler.disconnect_calls == 1
+        assert old_handler.stop_calls == 1
+        # Exactly one live handler remains, and it is not the old one.
+        assert self.manager._active_connections[instance_key] is not old_handler
+        assert len(self.manager._active_connections) == 1
+        assert ChannelRegistry.get_instance(instance_key) is self.manager._active_connections[instance_key]
+
+    @pytest.mark.asyncio
+    async def test_schedule_background_initialize_keeps_task_referenced(self):
+        """Scheduled initialization tasks stay referenced until completion."""
+        started = asyncio.Event()
+        finished = asyncio.Event()
+
+        async def _fake_initialize(user_id, channel_type, connection_id):
+            del user_id, channel_type, connection_id
+            started.set()
+            await finished.wait()
+            return True
+
+        with patch.object(self.manager, "_background_initialize", _fake_initialize):
+            task = self.manager.schedule_background_initialize("user-1", "tracking", "conn-1")
+            await started.wait()
+            assert task in self.manager._background_tasks
+            finished.set()
+            await task
+
+        await asyncio.sleep(0)
+        assert task not in self.manager._background_tasks
