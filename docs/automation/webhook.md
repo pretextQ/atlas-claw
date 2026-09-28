@@ -33,36 +33,40 @@ Webhook systems are configured in `atlasclaw.json`:
 - `ATLASCLAW_WEBHOOK_SK_EXTERNAL_REVIEW`: legacy environment variable name; webhook startup reads that env var.
 - `SK_AtlasClawExample`: direct shared secret value for deployments that cannot provide environment variables.
 
-```json
-{
-  "webhook": {
-    "systems": [
-      {
-        "system_id": "external-review",
-        "sk_env": "SK_AtlasClawExample",
-        "allowed_skills": ["example_provider:backend-agent"]
-      }
-    ]
-  }
-}
-```
+Values shaped like environment variable names (`UPPER_SNAKE_CASE`, for example
+`ATLASCLAW_WEBHOOK_SK`) are always treated strictly as environment references.
+When the variable is unset, startup fails with an error instead of silently
+falling back to using the variable name itself as the secret. Direct secret
+values must therefore contain at least one lowercase or non name-like
+character (as in `SK_AtlasClawExample`).
 
 ## Dispatch Request
 
 Send a request to `POST /api/webhook/dispatch` with the configured secret
-header:
+header plus a signed timestamp. The signature covers the raw request body and
+the timestamp, so captured requests cannot be replayed later:
+
+1. `X-AtlasClaw-SK` (or the configured `header_name`): the shared secret.
+2. `X-Webhook-Timestamp`: current unix epoch seconds.
+3. `X-Webhook-Signature`: hex `HMAC-SHA256(secret, "{timestamp}." + raw_body)`.
+
+Timestamps that drift more than 300 seconds from the server clock are
+rejected.
 
 ```bash
+TIMESTAMP=$(date +%s)
+BODY='{
+  "skill": "cmp.preapproval-agent",
+  "args": {"provider_instance": "default", "request_id": "REQ-10001"}
+}'
+SIGNATURE=$(printf '%s.%s' "$TIMESTAMP" "$BODY" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" -hex | cut -d' ' -f2)
+
 curl -X POST "$ATLASCLAW_URL/api/webhook/dispatch" \
   -H "Content-Type: application/json" \
   -H "X-AtlasClaw-SK: $WEBHOOK_SECRET" \
-  -d '{
-    "skill": "example_provider:backend-agent",
-    "args": {
-      "provider_instance": "default",
-      "request_id": "REQ-10001"
-    }
-  }'
+  -H "X-Webhook-Timestamp: $TIMESTAMP" \
+  -H "X-Webhook-Signature: $SIGNATURE" \
+  -d "$BODY"
 ```
 
 The route accepts the task and runs it asynchronously. The target skill must be
@@ -166,6 +170,8 @@ password, and cookie-like fields.
 
 - Prefer environment variables for webhook secrets and robot credentials when
   the deployment environment supports them.
+- The dispatch endpoint requires a signed timestamp on every request; keep
+  caller clocks within the 300-second tolerance window (NTP-synced callers).
 - Allow only provider-qualified backend skills in webhook `allowed_skills`.
 - Keep each robot profile allowlist as small as possible.
 - Use a provider-native robot credential whose upstream audit identity is

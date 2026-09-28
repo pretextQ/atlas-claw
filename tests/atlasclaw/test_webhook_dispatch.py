@@ -22,6 +22,8 @@
 
 from __future__ import annotations
 
+import json
+import time
 from pathlib import Path
 
 import pytest
@@ -33,7 +35,12 @@ from app.atlasclaw.api.service_provider_schemas import (
     clear_provider_schema_definitions,
     register_provider_schema_definition,
 )
-from app.atlasclaw.api.webhook_dispatch import WebhookDispatchManager
+from app.atlasclaw.api.webhook_dispatch import (
+    SIGNATURE_MAX_AGE_SECONDS,
+    WebhookDispatchManager,
+    compute_webhook_signature,
+    verify_webhook_signature,
+)
 from app.atlasclaw.core.config_schema import (
     WebhookConfig,
     WebhookSystemConfig,
@@ -98,6 +105,40 @@ def _smartcmp_provider_instances() -> dict:
     }
 
 
+def _signed_authenticate(manager: WebhookDispatchManager, secret: str, body: bytes = b""):
+    """Authenticate through the manager with a freshly signed timestamp."""
+    timestamp = str(int(time.time()))
+    signature = compute_webhook_signature(secret, timestamp, body)
+    return manager.authenticate(secret, timestamp=timestamp, signature=signature, body=body)
+
+
+class _SignedWebhookClient(TestClient):
+    """TestClient that signs /api/webhook/dispatch JSON posts automatically."""
+
+    def __init__(self, *args, secret: str = "secret-1", **kwargs):
+        super().__init__(*args, **kwargs)
+        self._webhook_secret = secret
+
+    def request(self, method, url, **kwargs):
+        if (
+            method.upper() == "POST"
+            and str(url).endswith("/api/webhook/dispatch")
+            and kwargs.get("json") is not None
+        ):
+            payload = kwargs.pop("json")
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            timestamp = str(int(time.time()))
+            signature = compute_webhook_signature(self._webhook_secret, timestamp, body)
+            headers = dict(kwargs.pop("headers", None) or {})
+            headers.setdefault("Content-Type", "application/json")
+            headers.setdefault("X-AtlasClaw-SK", self._webhook_secret)
+            headers["X-Webhook-Timestamp"] = timestamp
+            headers["X-Webhook-Signature"] = signature
+            kwargs["content"] = body
+            kwargs["headers"] = headers
+        return super().request(method, url, **kwargs)
+
+
 def _build_client(
     tmp_path: Path,
     monkeypatch,
@@ -159,7 +200,7 @@ def _build_client(
 
     app = FastAPI()
     app.include_router(create_router())
-    return TestClient(app), runner
+    return _SignedWebhookClient(app), runner
 
 
 class TestWebhookDispatchManager:
@@ -193,7 +234,7 @@ class TestWebhookDispatchManager:
         )
 
         manager.validate_startup()
-        identity = manager.authenticate("sk-direct-secret")
+        identity = _signed_authenticate(manager, "sk-direct-secret")
 
         assert identity is not None
         assert identity.system_id == "smartcmp-preapproval"
@@ -263,7 +304,7 @@ class TestWebhookDispatchManager:
         )
 
         manager.validate_startup()
-        assert manager.authenticate("SK_AtlasClawDirect") is not None
+        assert _signed_authenticate(manager, "SK_AtlasClawDirect") is not None
 
     def test_validate_startup_prefers_env_value_when_sk_env_name_exists(self, tmp_path, monkeypatch):
         registry = SkillRegistry()
@@ -295,7 +336,7 @@ class TestWebhookDispatchManager:
         )
 
         manager.validate_startup()
-        assert manager.authenticate("env-secret-value") is not None
+        assert _signed_authenticate(manager, "env-secret-value") is not None
         assert manager.authenticate("SECRET") is None
 
     def test_validate_startup_requires_non_blank_sk_env(self, tmp_path):
@@ -369,8 +410,67 @@ class TestWebhookDispatchManager:
         try:
             manager.validate_startup()
         except RuntimeError as exc:
-            raise AssertionError("validate_startup should accept literal sk_env secret") from exc
-        assert manager.authenticate("SECRET") is not None
+            assert "unset environment variable" in str(exc)
+        else:
+            raise AssertionError(
+                "validate_startup should reject env-shaped sk_env when the variable is unset"
+            )
+        assert _signed_authenticate(manager, "SECRET") is None
+
+
+class TestWebhookSignature:
+    def test_verify_accepts_fresh_signature(self):
+        timestamp = str(int(time.time()))
+        signature = compute_webhook_signature("secret-1", timestamp, b'{"a":1}')
+
+        assert verify_webhook_signature(
+            "secret-1", timestamp=timestamp, signature=signature, body=b'{"a":1}'
+        )
+
+    def test_verify_rejects_missing_headers(self):
+        timestamp = str(int(time.time()))
+        signature = compute_webhook_signature("secret-1", timestamp, b"body")
+
+        assert not verify_webhook_signature(
+            "secret-1", timestamp="", signature=signature, body=b"body"
+        )
+        assert not verify_webhook_signature(
+            "secret-1", timestamp=timestamp, signature="", body=b"body"
+        )
+
+    def test_verify_rejects_stale_timestamp(self):
+        stale = str(int(time.time()) - SIGNATURE_MAX_AGE_SECONDS - 10)
+        signature = compute_webhook_signature("secret-1", stale, b"body")
+
+        assert not verify_webhook_signature(
+            "secret-1", timestamp=stale, signature=signature, body=b"body"
+        )
+
+    def test_verify_rejects_future_timestamp(self):
+        future = str(int(time.time()) + SIGNATURE_MAX_AGE_SECONDS + 10)
+        signature = compute_webhook_signature("secret-1", future, b"body")
+
+        assert not verify_webhook_signature(
+            "secret-1", timestamp=future, signature=signature, body=b"body"
+        )
+
+    def test_verify_rejects_wrong_secret_or_body(self):
+        timestamp = str(int(time.time()))
+        signature = compute_webhook_signature("secret-1", timestamp, b"body")
+
+        assert not verify_webhook_signature(
+            "secret-2", timestamp=timestamp, signature=signature, body=b"body"
+        )
+        assert not verify_webhook_signature(
+            "secret-1", timestamp=timestamp, signature=signature, body=b"other"
+        )
+
+    def test_verify_rejects_non_numeric_timestamp(self):
+        signature = compute_webhook_signature("secret-1", "not-a-number", b"body")
+
+        assert not verify_webhook_signature(
+            "secret-1", timestamp="not-a-number", signature=signature, body=b"body"
+        )
 
 
 class TestWebhookDispatchAPI:
@@ -827,3 +927,63 @@ class TestWebhookDispatchAPI:
         )
 
         assert resp.status_code == 400
+
+    def test_dispatch_rejects_missing_signature_headers(self, tmp_path, monkeypatch):
+        """Replay protection: secret alone without signed timestamp is rejected."""
+        client, _runner = _build_client(
+            tmp_path,
+            monkeypatch,
+            allowed_skills=["cmp.preapproval-agent"],
+        )
+
+        resp = client.post(
+            "/api/webhook/dispatch",
+            content=json.dumps({"skill": "cmp.preapproval-agent", "args": {}}).encode("utf-8"),
+            headers={"X-AtlasClaw-SK": "secret-1", "Content-Type": "application/json"},
+        )
+
+        assert resp.status_code == 401
+
+    def test_dispatch_rejects_stale_timestamp(self, tmp_path, monkeypatch):
+        """Captured requests signed in the past must not be replayed."""
+        client, _runner = _build_client(
+            tmp_path,
+            monkeypatch,
+            allowed_skills=["cmp.preapproval-agent"],
+        )
+        body = json.dumps({"skill": "cmp.preapproval-agent", "args": {}}).encode("utf-8")
+        stale = str(int(time.time()) - SIGNATURE_MAX_AGE_SECONDS - 10)
+
+        resp = client.post(
+            "/api/webhook/dispatch",
+            content=body,
+            headers={
+                "X-AtlasClaw-SK": "secret-1",
+                "Content-Type": "application/json",
+                "X-Webhook-Timestamp": stale,
+                "X-Webhook-Signature": compute_webhook_signature("secret-1", stale, body),
+            },
+        )
+
+        assert resp.status_code == 401
+
+    def test_dispatch_rejects_bad_signature(self, tmp_path, monkeypatch):
+        client, _runner = _build_client(
+            tmp_path,
+            monkeypatch,
+            allowed_skills=["cmp.preapproval-agent"],
+        )
+        timestamp = str(int(time.time()))
+
+        resp = client.post(
+            "/api/webhook/dispatch",
+            content=json.dumps({"skill": "cmp.preapproval-agent", "args": {}}).encode("utf-8"),
+            headers={
+                "X-AtlasClaw-SK": "secret-1",
+                "Content-Type": "application/json",
+                "X-Webhook-Timestamp": timestamp,
+                "X-Webhook-Signature": "0" * 64,
+            },
+        )
+
+        assert resp.status_code == 401

@@ -22,10 +22,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import json
 import os
 import re
+import time
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -47,6 +49,14 @@ from app.atlasclaw.skills.registry import MdSkillEntry, SkillRegistry
 _PROVIDER_SKILL_RE = re.compile(
     r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?\.[a-z0-9]([a-z0-9-]*[a-z0-9])?$"
 )
+# Values shaped like environment variable names never fall back to being used
+# as literal secrets; they must resolve from the process environment.
+_ENV_VAR_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
+_TIMESTAMP_HEADER = "X-Webhook-Timestamp"
+_SIGNATURE_HEADER = "X-Webhook-Signature"
+# Replay window: requests whose signed timestamp drifts more than this many
+# seconds from the server clock are rejected.
+SIGNATURE_MAX_AGE_SECONDS = 300
 _ROBOT_AUTH_KEY = "robot_auth"
 _ROBOT_PROFILE_KEY = "robot_profile"
 _PROVIDER_INSTANCE_KEY = "provider_instance"
@@ -160,15 +170,48 @@ class WebhookDispatchManager:
         for system in self._config.systems:
             if not system.enabled:
                 continue
+            configured = (system.sk_env or "").strip()
             if not _resolve_webhook_system_secret(system):
+                if configured and _ENV_VAR_NAME_RE.match(configured):
+                    raise RuntimeError(
+                        (
+                            f"Webhook system {system.system_id!r} sk_env references "
+                            f"unset environment variable {configured!r}"
+                        )
+                    )
                 raise RuntimeError(
                     f"Missing webhook secret for system {system.system_id!r} from sk_env"
                 )
             for skill_id in system.allowed_skills:
                 self._resolve_provider_skill_selection(skill_id)
 
-    def authenticate(self, secret: str) -> Optional[WebhookSystemIdentity]:
-        """Resolve the calling system from the shared secret."""
+    def authenticate(
+        self,
+        secret: str,
+        *,
+        timestamp: str = "",
+        signature: str = "",
+        body: bytes = b"",
+    ) -> Optional[WebhookSystemIdentity]:
+        """Resolve the calling system from the shared secret and request signature.
+
+        Callers must send the shared secret in the configured header plus a
+        signed timestamp: ``X-Webhook-Timestamp`` holds the unix epoch seconds
+        and ``X-Webhook-Signature`` holds
+        ``HMAC-SHA256(secret, "{timestamp}." + raw_body)`` as hex. Timestamps
+        drifting more than ``SIGNATURE_MAX_AGE_SECONDS`` from the server clock
+        are rejected so captured requests cannot be replayed later.
+
+        Args:
+            secret: Raw value of the configured secret header.
+            timestamp: Raw value of the timestamp header.
+            signature: Raw value of the signature header.
+            body: Raw request body bytes covered by the signature.
+
+        Returns:
+            The authenticated system identity, or None when authentication
+            fails.
+        """
         candidate = (secret or "").strip()
         if not candidate:
             return None
@@ -177,12 +220,20 @@ class WebhookDispatchManager:
             if not system.enabled:
                 continue
             expected = _resolve_webhook_system_secret(system)
-            if expected and hmac.compare_digest(expected, candidate):
-                return WebhookSystemIdentity(
-                    system_id=system.system_id,
-                    default_agent_id=system.default_agent_id,
-                    allowed_skills=tuple(system.allowed_skills),
-                )
+            if not expected or not hmac.compare_digest(expected, candidate):
+                continue
+            if not verify_webhook_signature(
+                expected,
+                timestamp=timestamp,
+                signature=signature,
+                body=body,
+            ):
+                return None
+            return WebhookSystemIdentity(
+                system_id=system.system_id,
+                default_agent_id=system.default_agent_id,
+                allowed_skills=tuple(system.allowed_skills),
+            )
         return None
 
     def resolve_allowed_skill(
@@ -239,7 +290,13 @@ class WebhookDispatchManager:
 
 
 def _resolve_webhook_system_secret(system: WebhookSystemConfig) -> str:
-    """Resolve sk_env as an env var name first, then as a direct secret."""
+    """Resolve sk_env as an env var name first, then as a direct secret.
+
+    Values shaped like environment variable names (``UPPER_SNAKE_CASE``) are
+    treated strictly as environment references: when the variable is unset the
+    resolution fails (empty string) so startup validation can fail fast
+    instead of silently using the variable name as the secret.
+    """
     configured = (system.sk_env or "").strip()
     if not configured:
         return ""
@@ -247,7 +304,49 @@ def _resolve_webhook_system_secret(system: WebhookSystemConfig) -> str:
     env_value = os.environ.get(configured)
     if env_value is not None:
         return env_value.strip()
+    if _ENV_VAR_NAME_RE.match(configured):
+        return ""
     return configured
+
+
+def compute_webhook_signature(secret: str, timestamp: str, body: bytes) -> str:
+    """Compute the hex HMAC-SHA256 signature over ``"{timestamp}." + body``."""
+    message = f"{timestamp}.".encode("utf-8") + body
+    return hmac.new(secret.encode("utf-8"), message, hashlib.sha256).hexdigest()
+
+
+def verify_webhook_signature(
+    secret: str,
+    *,
+    timestamp: str,
+    signature: str,
+    body: bytes,
+    max_age_seconds: int = SIGNATURE_MAX_AGE_SECONDS,
+) -> bool:
+    """Verify a signed webhook timestamp within the replay window.
+
+    Args:
+        secret: Resolved shared secret for the calling system.
+        timestamp: Raw timestamp header value (unix epoch seconds).
+        signature: Raw signature header value (hex HMAC-SHA256).
+        body: Raw request body bytes covered by the signature.
+        max_age_seconds: Allowed clock drift for the timestamp.
+
+    Returns:
+        True when the timestamp is fresh and the signature matches.
+    """
+    normalized_ts = (timestamp or "").strip()
+    normalized_sig = (signature or "").strip()
+    if not normalized_ts or not normalized_sig:
+        return False
+    try:
+        ts_value = int(normalized_ts)
+    except ValueError:
+        return False
+    if abs(int(time.time()) - ts_value) > max(0, int(max_age_seconds)):
+        return False
+    expected = compute_webhook_signature(secret, normalized_ts, body)
+    return hmac.compare_digest(expected, normalized_sig)
 
 
 def redact_webhook_payload(payload: dict[str, Any], *, provider_type: str = "") -> dict[str, Any]:

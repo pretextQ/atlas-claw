@@ -166,11 +166,17 @@ def register_webhook_routes(router: APIRouter) -> None:
             )
 
         secret = request_obj.headers.get(manager.header_name, "").strip()
-        system = manager.authenticate(secret)
+        raw_body = await request_obj.body()
+        system = manager.authenticate(
+            secret,
+            timestamp=request_obj.headers.get("X-Webhook-Timestamp", ""),
+            signature=request_obj.headers.get("X-Webhook-Signature", ""),
+            body=raw_body,
+        )
         if system is None:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid webhook secret",
+                detail="Invalid webhook secret or signature",
             )
 
         try:
