@@ -747,9 +747,9 @@ async def lifespan(app: FastAPI):
         async def _heartbeat_loop() -> None:
             while True:
                 for job in await _build_agent_heartbeat_jobs():
-                    _heartbeat_runtime.register_job(job)
+                    await _heartbeat_runtime.register_job(job)
                 for job in _build_channel_heartbeat_jobs():
-                    _heartbeat_runtime.register_job(job)
+                    await _heartbeat_runtime.register_job(job)
                 await _heartbeat_runtime.run_once()
                 await asyncio.sleep(config.heartbeat.runtime.tick_seconds)
 

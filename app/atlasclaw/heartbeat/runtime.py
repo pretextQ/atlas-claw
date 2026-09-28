@@ -46,10 +46,10 @@ class HeartbeatRuntime:
         self._loaded_users: set[str] = set()
         self._running_jobs: set[str] = set()
 
-    def register_job(self, job: HeartbeatJobDefinition) -> None:
-        self._ensure_user_state_loaded(job.owner_user_id)
+    async def register_job(self, job: HeartbeatJobDefinition) -> None:
+        await self._ensure_user_state_loaded(job.owner_user_id)
         self._jobs[job.job_id] = job
-        self._persist_jobs_for_user(job.owner_user_id)
+        await self._persist_jobs_for_user(job.owner_user_id)
 
     def get_job_state(self, job_id: str) -> Optional[HeartbeatJobStateSnapshot]:
         return self._state.get(job_id)
@@ -157,7 +157,7 @@ class HeartbeatRuntime:
                     },
                 )
                 self._state[job.job_id] = updated
-                self.context.store.save_state(job.owner_user_id, self._state_for_user(job.owner_user_id))
+                await self.context.store.async_save_state(job.owner_user_id, self._state_for_user(job.owner_user_id))
                 await self._emit_job_event(job, result, now)
                 for extra_event_type in getattr(result, "extra_event_types", []):
                     await self._emit_event(
@@ -191,7 +191,7 @@ class HeartbeatRuntime:
             payload=payload,
         )
         if self.context.persist_local_event_log:
-            self.context.store.append_event(job.owner_user_id, event)
+            await self.context.store.async_append_event(job.owner_user_id, event)
         if not self.context.emit_runtime_events or self.context.emit_event is None:
             return
         emitted = self.context.emit_event(event)
@@ -217,13 +217,13 @@ class HeartbeatRuntime:
             return start <= local_now <= end
         return local_now >= start or local_now <= end
 
-    def _persist_jobs_for_user(self, user_id: str) -> None:
-        self.context.store.save_jobs(user_id, self._jobs_for_user(user_id))
+    async def _persist_jobs_for_user(self, user_id: str) -> None:
+        await self.context.store.async_save_jobs(user_id, self._jobs_for_user(user_id))
 
-    def _ensure_user_state_loaded(self, user_id: str) -> None:
+    async def _ensure_user_state_loaded(self, user_id: str) -> None:
         if user_id in self._loaded_users:
             return
-        for snapshot in self.context.store.load_state(user_id):
+        for snapshot in await self.context.store.async_load_state(user_id):
             self._state.setdefault(snapshot.job_id, snapshot)
         self._loaded_users.add(user_id)
 

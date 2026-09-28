@@ -131,9 +131,13 @@ manager = SessionManager(agents_dir="/path/to/legacy-agents")
     async def _ensure_dir(self) -> None:
         """Ensure the session and archive directories exist, migrating legacy data if needed."""
         await self._migrate_legacy_sessions()
+        await asyncio.to_thread(self._ensure_dir_sync)
+
+    def _ensure_dir_sync(self) -> None:
+        """Create the session and archive directories (blocking; run in a worker)."""
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
         (self.sessions_dir / self.ARCHIVE_DIR).mkdir(exist_ok=True)
-    
+
     async def _migrate_legacy_sessions(self) -> None:
         """Migrate legacy session data (no user_id sub-dir) to sessions/default/."""
         # Only run migration in legacy mode
@@ -144,19 +148,27 @@ manager = SessionManager(agents_dir="/path/to/legacy-agents")
         legacy_base = self.agents_dir / self.agent_id / "sessions"
         default_dir = legacy_base / "default"
         legacy_metadata = legacy_base / self.METADATA_FILE
-        
-        if legacy_metadata.exists() and not (default_dir / self.METADATA_FILE).exists():
-            default_dir.mkdir(parents=True, exist_ok=True)
-            (default_dir / self.ARCHIVE_DIR).mkdir(exist_ok=True)
-            shutil.move(str(legacy_metadata), str(default_dir / self.METADATA_FILE))
-            # Move all JSONL transcript files
-            for jsonl_file in legacy_base.glob("*.jsonl"):
-                shutil.move(str(jsonl_file), str(default_dir / jsonl_file.name))
-            # Move archived transcripts
-            legacy_archive = legacy_base / self.ARCHIVE_DIR
-            if legacy_archive.exists():
-                for archived in legacy_archive.glob("*.jsonl"):
-                    shutil.move(str(archived), str(default_dir / self.ARCHIVE_DIR / archived.name))
+
+        needs_migration = await asyncio.to_thread(
+            lambda: legacy_metadata.exists()
+            and not (default_dir / self.METADATA_FILE).exists()
+        )
+        if needs_migration:
+            await asyncio.to_thread(self._migrate_legacy_sessions_sync, legacy_base, default_dir)
+
+    def _migrate_legacy_sessions_sync(self, legacy_base: Path, default_dir: Path) -> None:
+        """Move legacy session files into the per-user layout (blocking; run in a worker)."""
+        default_dir.mkdir(parents=True, exist_ok=True)
+        (default_dir / self.ARCHIVE_DIR).mkdir(exist_ok=True)
+        shutil.move(str(legacy_base / self.METADATA_FILE), str(default_dir / self.METADATA_FILE))
+        # Move all JSONL transcript files
+        for jsonl_file in legacy_base.glob("*.jsonl"):
+            shutil.move(str(jsonl_file), str(default_dir / jsonl_file.name))
+        # Move archived transcripts
+        legacy_archive = legacy_base / self.ARCHIVE_DIR
+        if legacy_archive.exists():
+            for archived in legacy_archive.glob("*.jsonl"):
+                shutil.move(str(archived), str(default_dir / self.ARCHIVE_DIR / archived.name))
     
     async def _get_lock(self, session_key: str) -> asyncio.Lock:
         """Return the lock associated with a session key."""

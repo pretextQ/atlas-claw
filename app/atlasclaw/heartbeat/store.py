@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -15,7 +16,11 @@ from app.atlasclaw.heartbeat.models import (
 
 
 class HeartbeatStateStore:
-    """Persist heartbeat jobs, state snapshots, and emitted events per user."""
+    """Persist heartbeat jobs, state snapshots, and emitted events per user.
+
+    All methods run blocking filesystem work; the async variants offload it
+    to a worker thread so callers on the event loop are not stalled.
+    """
 
     JOBS_FILE = "jobs.json"
     STATE_FILE = "state.json"
@@ -28,6 +33,9 @@ class HeartbeatStateStore:
         path = self._user_dir(user_id) / self.JOBS_FILE
         self._write_json(path, [job.to_dict() for job in jobs])
 
+    async def async_save_jobs(self, user_id: str, jobs: list[HeartbeatJobDefinition]) -> None:
+        await asyncio.to_thread(self.save_jobs, user_id, jobs)
+
     def load_jobs(self, user_id: str) -> list[HeartbeatJobDefinition]:
         path = self._user_dir(user_id) / self.JOBS_FILE
         rows = self._read_json(path, default=[])
@@ -37,16 +45,25 @@ class HeartbeatStateStore:
         path = self._user_dir(user_id) / self.STATE_FILE
         self._write_json(path, [item.to_dict() for item in snapshots])
 
+    async def async_save_state(self, user_id: str, snapshots: list[HeartbeatJobStateSnapshot]) -> None:
+        await asyncio.to_thread(self.save_state, user_id, snapshots)
+
     def load_state(self, user_id: str) -> list[HeartbeatJobStateSnapshot]:
         path = self._user_dir(user_id) / self.STATE_FILE
         rows = self._read_json(path, default=[])
         return [HeartbeatJobStateSnapshot.from_dict(row) for row in rows]
+
+    async def async_load_state(self, user_id: str) -> list[HeartbeatJobStateSnapshot]:
+        return await asyncio.to_thread(self.load_state, user_id)
 
     def append_event(self, user_id: str, event: HeartbeatEventEnvelope) -> None:
         path = self._user_dir(user_id) / self.EVENTS_FILE
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(event.to_dict(), ensure_ascii=False) + "\n")
+
+    async def async_append_event(self, user_id: str, event: HeartbeatEventEnvelope) -> None:
+        await asyncio.to_thread(self.append_event, user_id, event)
 
     def load_events(self, user_id: str) -> list[HeartbeatEventEnvelope]:
         path = self._user_dir(user_id) / self.EVENTS_FILE

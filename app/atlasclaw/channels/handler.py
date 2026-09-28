@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Dict, Optional
 
@@ -130,12 +131,33 @@ class ChannelHandler(ABC):
     
     async def reconnect(self) -> bool:
         """Reconnect to platform after connection loss.
-        
+
         Returns:
             True if reconnected successfully
         """
         await self.disconnect()
         return await self.connect()
+
+    async def _terminate_process_async(self, process: Any, timeout: float = 5.0) -> None:
+        """Terminate a child SDK process without blocking the event loop.
+
+        ``Process.join(timeout)`` blocks the calling thread, so it runs in a
+        worker thread; otherwise an unresponsive child stalls the whole loop
+        for the full timeout.
+
+        Args:
+            process: Multiprocessing process to terminate.
+            timeout: Seconds to wait for the child to exit.
+        """
+        if process is None:
+            return
+        try:
+            if not process.is_alive():
+                return
+        except Exception:
+            return
+        process.terminate()
+        await asyncio.to_thread(process.join, timeout)
     
     def set_message_callback(self, callback: Callable[[InboundMessage], None]) -> None:
         """Set callback for incoming messages in long-connection mode.

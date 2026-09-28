@@ -470,9 +470,7 @@ class DingTalkHandler(ChannelHandler):
     async def _cleanup_connect_failure(self) -> None:
         """Cleanup resources after connect failure."""
         self._running = False
-        if self._process and self._process.is_alive():
-            self._process.terminate()
-            self._process.join(timeout=5)
+        await self._terminate_process_async(self._process)
         self._process = None
         self._message_queue = None
         self._control_queue = None
@@ -619,10 +617,8 @@ class DingTalkHandler(ChannelHandler):
         """Disconnect from DingTalk."""
         self._running = False
         
-        if self._process and self._process.is_alive():
-            self._process.terminate()
-            self._process.join(timeout=5)
-            logger.info("[DingTalk] SDK process terminated")
+        await self._terminate_process_async(self._process)
+        logger.info("[DingTalk] SDK process terminated")
         
         self._status = ConnectionStatus.DISCONNECTED
         return True

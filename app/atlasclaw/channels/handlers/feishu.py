@@ -512,9 +512,7 @@ class FeishuHandler(ChannelHandler):
     async def _cleanup_connect_failure(self) -> None:
         """Cleanup resources after connect failure."""
         self._running = False
-        if self._process and self._process.is_alive():
-            self._process.terminate()
-            self._process.join(timeout=5)
+        await self._terminate_process_async(self._process)
         self._process = None
         self._message_queue = None
         self._control_queue = None
@@ -646,10 +644,8 @@ class FeishuHandler(ChannelHandler):
         try:
             self._running = False
             
-            if self._process and self._process.is_alive():
-                self._process.terminate()
-                self._process.join(timeout=5)
-                print("[Feishu] SDK process terminated")
+            await self._terminate_process_async(self._process)
+            print("[Feishu] SDK process terminated")
             
             self._process = None
             self._message_queue = None
