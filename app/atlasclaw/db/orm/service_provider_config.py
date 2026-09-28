@@ -129,7 +129,7 @@ class ServiceProviderConfigService:
         session: AsyncSession,
     ) -> dict[str, dict[str, dict[str, Any]]]:
         result = await session.execute(
-            select(ServiceProviderConfigModel).where(ServiceProviderConfigModel.is_active == True)
+            select(ServiceProviderConfigModel).where(ServiceProviderConfigModel.is_active.is_(True))
         )
         rows = result.scalars().all()
 

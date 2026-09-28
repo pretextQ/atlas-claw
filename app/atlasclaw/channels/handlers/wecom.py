@@ -795,7 +795,7 @@ class WeComHandler(ChannelHandler):
                         # "processing" bubble forever.
                         await self._finish_reply_stream_quietly(frame, acked_stream_id)
                     raise
-                logger.info(f"[WeCom] Replied via WebSocket stream")
+                logger.info("[WeCom] Replied via WebSocket stream")
                 return SendResult(success=True)
             else:
                 # Proactive message

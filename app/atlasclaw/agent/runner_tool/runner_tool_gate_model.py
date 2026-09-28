@@ -3,6 +3,11 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from app.atlasclaw.agent.runner import AgentRunner
+
 import asyncio
 from contextlib import nullcontext
 from datetime import datetime, timezone
@@ -10,7 +15,7 @@ import inspect
 import json
 import logging
 import re
-from typing import Any, Optional
+from typing import Any
 
 from app.atlasclaw.agent.runner_tool.runner_agent_override import resolve_override_tools
 from app.atlasclaw.agent.runner_tool.runner_tool_projection import (

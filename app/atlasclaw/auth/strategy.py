@@ -236,7 +236,7 @@ class AuthStrategy:
                 continue
         
         # All providers failed
-        logger.warning(f"All authentication providers failed for credential")
+        logger.warning("All authentication providers failed for credential")
         raise last_error or AuthenticationError("Authentication failed")
 
 

@@ -77,7 +77,7 @@ def _run_feishu_sdk_process(
                 try:
                     content_obj = json.loads(content)
                     text = content_obj.get("text", "")
-                except:
+                except (TypeError, ValueError):
                     text = content
             else:
                 text = content
@@ -885,7 +885,7 @@ class FeishuHandler(ChannelHandler):
                 try:
                     content_obj = json.loads(content)
                     text = content_obj.get("text", "")
-                except:
+                except (TypeError, ValueError):
                     text = content
             else:
                 text = str(content)

@@ -346,7 +346,6 @@ class BingHtmlFallbackProvider(BaseSearchProviderAdapter):
                 type(exc).__name__,
             )
 
-        using_direct = False
         attempted_direct = False
         should_retry_direct = self._should_retry_without_proxy() and (
             not html_results
@@ -380,7 +379,6 @@ class BingHtmlFallbackProvider(BaseSearchProviderAdapter):
                 if direct_html_results:
                     html_results = direct_html_results
                     inspection = direct_inspection
-                    using_direct = True
             except Exception as exc:
                 LOGGER.info(
                     "bing_page_fetch_failed stage=direct query=%r url=%s error=%s",
@@ -743,7 +741,6 @@ def _score_loose_candidate(
     anchor: object,
     container: object,
 ) -> float:
-    title = candidate["title"]
     snippet = candidate.get("snippet", "")
     score = _score_search_candidate(
         query_terms=query_terms,

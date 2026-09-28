@@ -5,9 +5,16 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from app.atlasclaw.auth.config import AuthConfig
 from app.atlasclaw.auth.models import AuthenticationError, AuthResult
 from app.atlasclaw.auth.providers.base import AuthProvider
+
+if TYPE_CHECKING:
+    from app.atlasclaw.auth.providers.dingtalk_sso import DingTalkSSOProvider
+    from app.atlasclaw.auth.providers.oidc_jwt import OIDCJWTProvider
+    from app.atlasclaw.auth.providers.oidc_login import OIDCLoginProvider
 
 
 # SSO provider types that use external IdP for authentication

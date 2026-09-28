@@ -326,10 +326,10 @@ class ProviderSchemaDefinition:
     def auth_field_names(self) -> frozenset[str]:
         """Return all fields that belong to any auth mode for this provider."""
         names: set[str] = set()
-        for field in self.fields:
-            if field.auth_types:
-                names.add(field.name.lower())
-                names.update(alias.lower() for alias in field.aliases)
+        for provider_field in self.fields:
+            if provider_field.auth_types:
+                names.add(provider_field.name.lower())
+                names.update(alias.lower() for alias in provider_field.aliases)
         for auth_mode in self.auth_modes.values():
             names.update(auth_mode.required_fields)
         return frozenset(names)
@@ -337,10 +337,10 @@ class ProviderSchemaDefinition:
     def sensitive_field_names(self) -> frozenset[str]:
         """Return canonical and alias field names that must be redacted."""
         names: set[str] = set(self.redaction_sensitive_fields)
-        for field in self.fields:
-            if field.sensitive or field.type == "password":
-                names.add(field.name.lower())
-                names.update(alias.lower() for alias in field.aliases)
+        for provider_field in self.fields:
+            if provider_field.sensitive or provider_field.type == "password":
+                names.add(provider_field.name.lower())
+                names.update(alias.lower() for alias in provider_field.aliases)
         return frozenset(names)
 
     def is_auth_mode_usable(
@@ -370,10 +370,10 @@ class ProviderSchemaDefinition:
         """Remove credentials for inactive auth modes before passing config to tools."""
         normalized_selected_auth_type = normalize_provider_auth_type_chain(selected_auth_type)[0]
         selected_fields = set(self.required_fields_for_auth_type(normalized_selected_auth_type))
-        for field in self.fields:
-            if normalized_selected_auth_type in field.auth_types:
-                selected_fields.add(field.name.lower())
-                selected_fields.update(alias.lower() for alias in field.aliases)
+        for provider_field in self.fields:
+            if normalized_selected_auth_type in provider_field.auth_types:
+                selected_fields.add(provider_field.name.lower())
+                selected_fields.update(alias.lower() for alias in provider_field.aliases)
         auth_field_names = self.auth_field_names()
         runtime_config: dict[str, Any] = {"auth_type": normalized_selected_auth_type}
 
@@ -652,9 +652,9 @@ def is_provider_config_field_sensitive(
         return True
 
     defaults = dict(field_defaults) if isinstance(field_defaults, Mapping) else None
-    for field in definition.resolve_fields(field_defaults=defaults, filter_by_auth_type=False):
-        if str(field.name or "").strip().lower() == normalized:
-            return bool(field.sensitive or field.type == "password")
+    for provider_field in definition.resolve_fields(field_defaults=defaults, filter_by_auth_type=False):
+        if str(provider_field.name or "").strip().lower() == normalized:
+            return bool(provider_field.sensitive or provider_field.type == "password")
     return False
 
 
@@ -662,17 +662,17 @@ def _apply_aliases(
     merged: dict[str, Any],
     resolved_fields: Iterable[ProviderSchemaField],
 ) -> None:
-    for field in resolved_fields:
+    for provider_field in resolved_fields:
         alias_to_apply = None
-        if not _is_blank(merged.get(field.name)):
+        if not _is_blank(merged.get(provider_field.name)):
             alias_to_apply = None
         else:
-            for alias in field.aliases:
+            for alias in provider_field.aliases:
                 if not _is_blank(merged.get(alias)):
                     alias_to_apply = alias
-                    merged[field.name] = merged[alias]
+                    merged[provider_field.name] = merged[alias]
                     break
-        for alias in field.aliases:
+        for alias in provider_field.aliases:
             if alias == alias_to_apply or alias in merged:
                 merged.pop(alias, None)
 
@@ -700,9 +700,9 @@ def normalize_provider_config(
     resolved_fields = definition.resolve_fields(merged)
     _apply_aliases(merged, resolved_fields)
 
-    for field in resolved_fields:
-        if field.default is not None and _is_blank(merged.get(field.name)):
-            merged[field.name] = field.default
+    for provider_field in resolved_fields:
+        if provider_field.default is not None and _is_blank(merged.get(provider_field.name)):
+            merged[provider_field.name] = provider_field.default
 
     required_fields = [
         field

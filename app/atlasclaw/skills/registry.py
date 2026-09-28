@@ -515,16 +515,16 @@ from count JSON Schema
             annotation = param.annotation
             param_type = "string"  # default
             
-            if annotation != inspect.Parameter.empty:
-                if annotation == int:
+            if annotation is not inspect.Parameter.empty:
+                if annotation is int:
                     param_type = "integer"
-                elif annotation == float:
+                elif annotation is float:
                     param_type = "number"
-                elif annotation == bool:
+                elif annotation is bool:
                     param_type = "boolean"
-                elif annotation == list:
+                elif annotation is list:
                     param_type = "array"
-                elif annotation == dict:
+                elif annotation is dict:
                     param_type = "object"
             
             properties[name] = {"type": param_type}

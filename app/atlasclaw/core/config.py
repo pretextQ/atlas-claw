@@ -301,7 +301,7 @@ get configuration
                                 import yaml
                                 return yaml.safe_load(f)
                             except ImportError:
-                                print(f"[ConfigManager] YAML support requires PyYAML installation")
+                                print("[ConfigManager] YAML support requires PyYAML installation")
                                 continue
                 except Exception as e:
                     print(f"[ConfigManager] Failed to read config file {path}: {e}")

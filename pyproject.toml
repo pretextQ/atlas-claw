@@ -1,0 +1,53 @@
+# -*- coding: utf-8 -*-
+# Copyright 2026  Qianyun, Inc., www.cloudchef.io, All rights reserved.
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "atlasclaw"
+version = "0.1.0"
+description = "AtlasClaw enterprise agent framework (core runtime)"
+requires-python = ">=3.11"
+dynamic = ["dependencies", "optional-dependencies"]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
+optional-dependencies = { dev = { file = ["requirements-dev.txt"] } }
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["app/frontend", "migrations", "build"]
+
+[tool.ruff.lint]
+# E4/E7/E9: pycodestyle errors, F: pyflakes. The wider rule families are not
+# enabled yet; the goal is a green gate over the existing codebase.
+select = ["E4", "E7", "E9", "F"]
+ignore = [
+    # main.py and several runtime modules deliberately execute code (dotenv
+    # loading, path bootstrap, sys.path setup) before importing app modules
+    # that read that state at import time.
+    "E402",
+    # Several modules import for side effects (provider/handler registration)
+    # or re-export names without __all__; ruff cannot tell those from dead
+    # imports. Auditing them is a separate, larger cleanup.
+    "F401",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["F841"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "strict"
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests as integration tests",
+    "e2e: marks tests as end-to-end tests requiring live services",
+    "llm: marks tests that require LLM API calls",
+]

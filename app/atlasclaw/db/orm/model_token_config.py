@@ -226,7 +226,7 @@ class ModelTokenConfigService:
         """
         result = await session.execute(
             select(TokenModel)
-            .where(TokenModel.is_active == True)
+            .where(TokenModel.is_active.is_(True))
             .order_by(TokenModel.priority.desc())
         )
         return list(result.scalars().all())

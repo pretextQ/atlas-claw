@@ -7,7 +7,7 @@ import hashlib
 import json
 import time
 from collections import OrderedDict
-from typing import Any
+from typing import Any, Optional
 
 from app.atlasclaw.core.deps import SkillDeps
 from app.atlasclaw.tools.policy_pipeline import ToolPolicyPipeline, build_ordered_policy_layers

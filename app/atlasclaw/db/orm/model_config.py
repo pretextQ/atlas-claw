@@ -5,6 +5,11 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from app.atlasclaw.db.schemas import ModelConfigCreate, ModelConfigUpdate
+
 import json
 import logging
 from datetime import datetime
@@ -156,7 +161,7 @@ class ModelConfigService:
         """
         result = await session.execute(
             select(ModelConfigModel)
-            .where(ModelConfigModel.is_active == True)
+            .where(ModelConfigModel.is_active.is_(True))
             .order_by(ModelConfigModel.priority.desc())
         )
         return list(result.scalars().all())

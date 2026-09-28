@@ -207,7 +207,7 @@ class ChannelConfigService:
         result = await session.execute(
             select(ChannelModel)
             .where(ChannelModel.type == channel_type)
-            .where(ChannelModel.is_active == True)
+            .where(ChannelModel.is_active.is_(True))
             .order_by(ChannelModel.created_at.desc())
         )
         return list(result.scalars().all())

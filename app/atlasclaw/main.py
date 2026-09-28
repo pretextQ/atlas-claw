@@ -268,12 +268,12 @@ async def lifespan(app: FastAPI):
 
     ChannelRegistry.register("dingtalk", DingTalkHandler)
     ChannelRegistry.register("wecom", WeComHandler)
-    print(f"[AtlasClaw] Registered built-in channel handlers")
+    print("[AtlasClaw] Registered built-in channel handlers")
     
     # Initialize ChannelManager
     _channel_manager = ChannelManager(workspace_path)
     set_channel_manager(_channel_manager)
-    print(f"[AtlasClaw] Channel manager initialized")
+    print("[AtlasClaw] Channel manager initialized")
     
     # Scan providers for auth extensions only.
     scan_results = ProviderScanner.scan_providers(providers_root)

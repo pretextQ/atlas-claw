@@ -142,7 +142,7 @@ def _run_dingtalk_sdk_process(
                 return AckMessage.STATUS_SYSTEM_EXCEPTION, str(e)
     
     try:
-        print(f"[DingTalk SDK Process] Connecting to DingTalk Stream...")
+        print("[DingTalk SDK Process] Connecting to DingTalk Stream...")
 
         credential = dingtalk_stream.Credential(client_id, client_secret)
         client = dingtalk_stream.DingTalkStreamClient(credential)
@@ -178,7 +178,7 @@ def _run_dingtalk_sdk_process(
         client.start_forever()
         
     except KeyboardInterrupt:
-        print(f"[DingTalk SDK Process] Interrupted")
+        print("[DingTalk SDK Process] Interrupted")
     except Exception as e:
         print(f"[DingTalk SDK Process] Connection error: {e}")
         proc_logger.exception("DingTalk SDK connection error")

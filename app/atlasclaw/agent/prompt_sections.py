@@ -247,7 +247,6 @@ def build_tooling(tools: list[dict]) -> str:
     lines.append("You can use the following tools to complete tasks:")
     lines.append("")
     for tool in tools:
-        name = tool.get("name", "unknown")
         description = tool.get("description", "")
         signature = _format_tool_signature(tool)
         lines.append(f"- **{signature}**: {description}")
