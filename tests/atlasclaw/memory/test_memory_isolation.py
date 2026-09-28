@@ -9,6 +9,8 @@ MemoryManager 路径隔离单元测试
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from pathlib import Path
 
@@ -81,3 +83,52 @@ class TestMemoryIsolation:
         new_user_dir = tmp_path / "users" / "u-alice" / "memory"
         assert not (new_user_dir / "MEMORY.md").exists()
         assert (legacy_user_dir / "MEMORY.md").exists()
+
+
+class TestConcurrentMemoryWrites:
+    """Per-request managers must share one write lock per memory file."""
+
+    def test_for_user_instances_share_the_write_lock(self, tmp_path: Path) -> None:
+        template = MemoryManager(workspace=str(tmp_path), user_id="default")
+        first = template.for_user("u1")
+        second = template.for_user("u1")
+
+        assert first._write_lock is second._write_lock
+        # Different users keep independent locks.
+        other_user = template.for_user("u2")
+        assert other_user._write_lock is not first._write_lock
+
+    def test_concurrent_writes_from_separate_managers_do_not_lose_entries(
+        self, tmp_path: Path
+    ) -> None:
+        """Every concurrent write must survive: no lost updates."""
+        template = MemoryManager(workspace=str(tmp_path), user_id="u1")
+
+        async def scenario() -> str:
+            managers = [template.for_user("u1") for _ in range(8)]
+            await asyncio.gather(
+                *(
+                    manager.write_long_term(
+                        f"concurrent fact {index}",
+                        source="test",
+                        section="General",
+                    )
+                    for index, manager in enumerate(managers)
+                )
+            )
+            return managers[0].long_term_path.read_text(encoding="utf-8")
+
+        content = asyncio.run(scenario())
+
+        for index in range(8):
+            assert f"concurrent fact {index}" in content
+
+    def test_atomic_write_leaves_no_temp_files(self, tmp_path: Path) -> None:
+        manager = MemoryManager(workspace=str(tmp_path), user_id="u1")
+
+        asyncio.run(manager.write_long_term("atomic fact", source="test"))
+
+        memory_dir = manager.long_term_path.parent
+        leftovers = list(memory_dir.glob("*.tmp"))
+        assert leftovers == []
+        assert manager.long_term_path.exists()

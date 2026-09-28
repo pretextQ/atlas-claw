@@ -14,7 +14,9 @@ Storage layout::
 
 import asyncio
 import hashlib
+import os
 import re
+import uuid
 from collections.abc import Callable, Hashable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -35,6 +37,21 @@ _HOOK_MEMORY_METADATA_PREFIXES = (
 )
 LONG_TERM_PREFERENCES_SECTION = "Preferences"
 LONG_TERM_USAGE_PROFILE_SECTION = "Usage Profile"
+
+# Per-file write locks shared by every manager instance. A lock owned by one
+# instance cannot serialize concurrent requests, because per-request managers
+# are created through ``MemoryManager.for_user``.
+_path_write_locks: dict[str, asyncio.Lock] = {}
+
+
+def _write_lock_for(path: Path) -> asyncio.Lock:
+    """Return the process-wide write lock guarding one memory file."""
+    key = str(path)
+    lock = _path_write_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _path_write_locks[key] = lock
+    return lock
 
 
 class MemoryType(Enum):
@@ -106,8 +123,9 @@ class MemoryManager:
         self._long_term_path = self._memory_dir / long_term_file
         self._encoding = encoding
 
-        # Serialize writes across concurrent tasks.
-        self._write_lock = asyncio.Lock()
+        # Serialize writes across concurrent tasks. The lock is shared per file
+        # so per-request managers (see ``for_user``) exclude each other too.
+        self._write_lock = _write_lock_for(self._long_term_path)
         
     @property
     def workspace_path(self) -> Path:
@@ -141,6 +159,28 @@ class MemoryManager:
     async def ensure_dirs(self) -> None:
         """Ensure the current user's long-term memory directory exists."""
         self._memory_dir.mkdir(parents=True, exist_ok=True)
+
+    async def _write_long_term_atomic(self, content: str) -> None:
+        """Write the long-term file via a temp file and atomic replace.
+
+        A plain truncating write leaves a half-written ``MEMORY.md`` visible
+        to concurrent readers (and on crash); ``os.replace`` swaps the whole
+        file into place atomically. Callers must hold the write lock.
+        """
+        self._long_term_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self._long_term_path.with_name(
+            f"{self._long_term_path.name}.{uuid.uuid4().hex}.tmp"
+        )
+        try:
+            async with aiofiles.open(tmp_path, 'w', encoding=self._encoding) as f:
+                await f.write(content)
+            await asyncio.to_thread(os.replace, tmp_path, self._long_term_path)
+        except BaseException:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
         
     async def write_long_term(
         self,
@@ -187,8 +227,7 @@ class MemoryManager:
                 existing_content, entry, section
             )
             
-            async with aiofiles.open(self._long_term_path, 'w', encoding=self._encoding) as f:
-                await f.write(updated_content)
+            await self._write_long_term_atomic(updated_content)
         
         return entry
 
@@ -246,8 +285,7 @@ class MemoryManager:
                 section,
             )
 
-            async with aiofiles.open(self._long_term_path, 'w', encoding=self._encoding) as f:
-                await f.write(updated_content)
+            await self._write_long_term_atomic(updated_content)
 
         return entries
 
@@ -332,8 +370,7 @@ class MemoryManager:
                 merged_lines,
                 normalized_section,
             )
-            async with aiofiles.open(self._long_term_path, 'w', encoding=self._encoding) as f:
-                await f.write(updated_content)
+            await self._write_long_term_atomic(updated_content)
 
         return added_entries
 
