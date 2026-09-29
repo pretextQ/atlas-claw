@@ -1360,6 +1360,15 @@ async def update_my_profile(
     session: AsyncSession = Depends(get_db_session),
 ) -> UserResponse:
     """Update the authenticated user's own profile."""
+    # Federated sessions must be rejected before any lookup or write: the
+    # JWT subject could collide with an existing local username, and the
+    # guard below used to run only on the not-found path (F-0026).
+    if not _is_local_auth_type(current_user.auth_type):
+        raise HTTPException(
+            status_code=400,
+            detail="Profile editing is not available for federated accounts",
+        )
+
     # Build update dict from non-None fields only
     update_fields = profile_data.model_dump(exclude_unset=True)
     if not update_fields:
@@ -1372,11 +1381,6 @@ async def update_my_profile(
         auth_type="local",
     )
     if not user:
-        if not _is_local_auth_type(current_user.auth_type):
-            raise HTTPException(
-                status_code=400,
-                detail="Profile editing is not available for federated accounts",
-            )
         raise HTTPException(status_code=404, detail="User not found")
 
     # If email is being changed, check uniqueness
@@ -1468,17 +1472,19 @@ async def upload_my_avatar(
     session: AsyncSession = Depends(get_db_session),
 ) -> UserResponse:
     """Upload avatar image for the authenticated user."""
+    # Federated guard runs before any lookup or write (F-0026).
+    if not _is_local_auth_type(current_user.auth_type):
+        raise HTTPException(
+            status_code=400,
+            detail="Avatar upload is not available for federated accounts",
+        )
+
     user = await UserService.get_by_username(
         session,
         current_user.user_id,
         auth_type="local",
     )
     if not user:
-        if not _is_local_auth_type(current_user.auth_type):
-            raise HTTPException(
-                status_code=400,
-                detail="Avatar upload is not available for federated accounts",
-            )
         raise HTTPException(status_code=404, detail="User not found")
 
     content_type = (avatar.content_type or "").lower()
@@ -1521,6 +1527,13 @@ async def change_my_password(
     session: AsyncSession = Depends(get_db_session),
 ):
     """Change the authenticated user's own password."""
+    # Federated guard runs before any lookup or write (F-0026).
+    if not _is_local_auth_type(current_user.auth_type):
+        raise HTTPException(
+            status_code=400,
+            detail="Password authentication not available for this account",
+        )
+
     # Get user record first by username
     user = await UserService.get_by_username(
         session,
@@ -1528,11 +1541,6 @@ async def change_my_password(
         auth_type="local",
     )
     if not user:
-        if not _is_local_auth_type(current_user.auth_type):
-            raise HTTPException(
-                status_code=400,
-                detail="Password authentication not available for this account",
-            )
         raise HTTPException(status_code=404, detail="User not found")
 
     # Verify current password

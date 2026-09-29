@@ -1089,3 +1089,84 @@ class TestUserProfileAPI:
         assert resp.status_code == 401
 
         _cleanup_manager(manager)
+
+
+class TestFederatedSessionProfileGuard:
+    """WP-04/F-0026: federated sessions must never update local accounts.
+
+    A federated JWT whose subject collides with a local username used to
+    pass the self-service endpoints because the auth-type guard only ran
+    on the not-found branch.
+    """
+
+    def _build_federated_client(self, tmp_path):
+        manager = _init_database_sync(tmp_path)
+        client = _build_client(tmp_path, _get_auth_config())
+
+        # Model a federated session whose JWT subject collides with the
+        # local username: the middleware sees a valid token, while the
+        # resolved identity is federated (auth_type != "local").
+        token = _login_as(client, "testuser", "testpass123")
+        self._auth_headers = {"AtlasClaw-Authenticate": token}
+
+        federated_user = UserInfo(
+            user_id="testuser",  # collides with the local username
+            display_name="Federated Claim",
+            auth_type="oidc:keycloak",
+        )
+        client.app.dependency_overrides[get_current_user] = lambda: federated_user
+        return manager, client
+
+    def _get_local_user(self, username: str = "testuser"):
+        async def _read():
+            async with _test_db_manager.get_session() as session:
+                return await UserService.get_by_username(session, username)
+
+        return asyncio.run(_read())
+
+    def test_federated_session_cannot_update_local_profile(self, tmp_path):
+        manager, client = self._build_federated_client(tmp_path)
+        try:
+            resp = client.put(
+                "/api/users/me/profile",
+                json={"display_name": "Hijacked", "email": "hijacked@test.com"},
+                headers=self._auth_headers,
+            )
+            assert resp.status_code == 400, resp.json()
+
+            user = self._get_local_user()
+            assert user.display_name == "Test User"
+            assert user.email == "testuser@test.com"
+        finally:
+            _cleanup_manager(manager)
+
+    def test_federated_session_cannot_change_local_password(self, tmp_path):
+        manager, client = self._build_federated_client(tmp_path)
+        try:
+            resp = client.put(
+                "/api/users/me/password",
+                json={"current_password": "testpass123", "new_password": "hijacked-pass-456"},
+                headers=self._auth_headers,
+            )
+            assert resp.status_code == 400, resp.json()
+
+            user = self._get_local_user()
+            from app.atlasclaw.db.orm.user import verify_password
+
+            assert verify_password("testpass123", user.password)
+        finally:
+            _cleanup_manager(manager)
+
+    def test_federated_session_cannot_upload_local_avatar(self, tmp_path):
+        manager, client = self._build_federated_client(tmp_path)
+        try:
+            resp = client.post(
+                "/api/users/me/avatar",
+                files={"avatar": ("avatar.png", b"\x89PNG fake bytes", "image/png")},
+            )
+            assert resp.status_code == 400, resp.json()
+
+            user = self._get_local_user()
+            assert not user.avatar_url
+        finally:
+            _cleanup_manager(manager)
