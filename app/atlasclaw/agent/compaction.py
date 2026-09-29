@@ -21,12 +21,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import logging
 from typing import Optional, Any, Callable, Awaitable
 
 from app.atlasclaw.agent.compaction_safeguard import (
     build_safeguarded_summary,
     load_workspace_critical_rules,
 )
+
+logger = logging.getLogger(__name__)
 
 BASE_CHUNK_RATIO = 0.4
 MIN_CHUNK_RATIO = 0.15
@@ -144,12 +147,13 @@ class CompactionPipeline:
                 for part in content:
                     if isinstance(part, dict) and "text" in part:
                         total_chars += len(part["text"])
-            
-            # Include serialized tool-call payloads in the estimate.
-            tool_calls = msg.get("tool_calls", [])
+
+            # Include serialized tool-call payloads in the estimate. The key
+            # may exist with a None value, which must count as "no calls".
+            tool_calls = msg.get("tool_calls") or []
             for tc in tool_calls:
                 total_chars += len(str(tc))
-        
+
         return total_chars // 4
     
     def _resolve_context_window(self, context_window_override: Optional[int] = None) -> int:
@@ -191,10 +195,18 @@ class CompactionPipeline:
         )
 
         keep_count = self.config.keep_recent_turns * 2
-        recent_messages = messages[-keep_count:] if keep_count > 0 else []
-
         start_idx = 1 if system_prompt else 0
         end_idx = len(messages) - keep_count if keep_count > 0 else len(messages)
+        # The retained (recent) side must stay a valid transcript: it may not
+        # begin with a tool result whose assistant tool_calls partner was cut
+        # into the summarized side. Walk the boundary back past the whole
+        # tool-result block so tool_calls / tool_result stay on one side.
+        while (
+            start_idx < end_idx < len(messages)
+            and str(messages[end_idx].get("role") or "").strip().lower() in TOOL_RESULT_ROLES
+        ):
+            end_idx -= 1
+        recent_messages = messages[end_idx:]
         to_compress = messages[start_idx:end_idx]
         return system_prompt, recent_messages, to_compress
 
@@ -221,21 +233,48 @@ class CompactionPipeline:
         session: Any = None,
     ) -> list[dict]:
         """Compact the transcript and return a rebuilt message list."""
-        if len(messages) <= self.config.keep_recent_turns * 2 + 1:
+        can_compact_by_count = len(messages) > self.config.keep_recent_turns * 2 + 1
+        if not can_compact_by_count and not self.should_compact(messages):
             # Not enough history to compact meaningfully.
             return messages
 
-        # 1. Separate the system prompt from compressible history.
-        system_prompt, recent_messages, to_compress = self._split_for_compaction(messages)
-        
-        if not to_compress:
-            return messages
-        
+        if can_compact_by_count:
+            system_prompt, recent_messages, to_compress = self._split_for_compaction(messages)
+            if not to_compress:
+                return messages
+        else:
+            # Short but huge transcript: the count-based split would find
+            # nothing to compress while the token estimate is over the
+            # threshold. Compaction must still happen — keep only the most
+            # recent exchange verbatim and summarize everything before it.
+            system_prompt = (
+                messages[0]
+                if messages
+                and messages[0].get("role") == "system"
+                and not self._is_compaction_summary_message(messages[0])
+                else None
+            )
+            body = messages[1:] if system_prompt is not None else messages
+            end = len(body) - 2
+            # The retained exchange must not begin with an orphan tool result.
+            while end > 0 and str(body[end].get("role") or "").strip().lower() in TOOL_RESULT_ROLES:
+                end -= 1
+            if end <= 0:
+                return messages
+            to_compress = body[:end]
+            recent_messages = body[end:]
+
         # 2. Generate a summary for the older portion.
         try:
             summary = await self._generate_summary(to_compress)
         except Exception:
-            # Fail-safe: keep original transcript if compaction summarization fails.
+            # Fail-safe: keep original transcript if compaction summarization
+            # fails, but make the silent degradation observable.
+            logger.exception(
+                "[Compaction] Summary generation failed; keeping the original "
+                "transcript (%d messages)",
+                len(messages),
+            )
             return messages
 
         # 3. Rebuild the transcript from the summary and recent turns.
@@ -655,10 +694,10 @@ class CompactionPipeline:
                 result.append(msg)
                 continue
             
-            # Handle tool results
-            if msg.get("role") == "tool":
+            # Handle tool results (match every tool-result role spelling)
+            if str(msg.get("role") or "").strip().lower() in TOOL_RESULT_ROLES:
                 content = msg.get("content", "")
-                
+
                 # Check if content contains images
                 if isinstance(content, list):
                     has_image = any(
@@ -668,14 +707,14 @@ class CompactionPipeline:
                     if has_image:
                         result.append(msg)
                         continue
-                
+
                 # Prune large tool results
                 if isinstance(content, str) and len(content) > self.config.hard_clear_threshold:
                     if mode == "hard":
                         # Hard clear: remove content entirely
                         msg = msg.copy()
                         msg["content"] = "[Tool result cleared to save context space]"
-                    else:
+                    elif self.config.soft_trim_enabled:
                         # Soft trim: keep head and tail
                         msg = msg.copy()
                         head = content[:500]
