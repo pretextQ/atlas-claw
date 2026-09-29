@@ -15,41 +15,16 @@ deep-chat::part(avatar) {
     border-radius: 50%;
 }
 
-/* Markdown Table Styles */
-deep-chat table {
-    border-collapse: collapse;
-    width: 100%;
-    margin: 8px 0;
+/* Deep-chat styling.
+ *
+ * Message markdown (tables, code blocks) renders inside deep-chat's open
+ * shadow root, so descendant selectors like `deep-chat table` never match;
+ * such rules are dead. Deep-chat exposes ::part() hooks and a messageStyles
+ * API instead — configure markdown styling there (see the deep-chat
+ * integration in scripts/chat-ui.js), not here. */
+deep-chat::part(message-bubble) {
     font-size: 14px;
-}
-
-deep-chat th,
-deep-chat td {
-    border: 1px solid #ddd;
-    padding: 8px 12px;
-    text-align: left;
-}
-
-deep-chat th {
-    background-color: #f5f5f5;
-    font-weight: 600;
-}
-
-deep-chat tr:hover {
-    background-color: #f9f9f9;
-}
-
-/* Code Block Styles */
-deep-chat pre {
-    background-color: #f5f5f5;
-    padding: 12px;
-    border-radius: 8px;
-    overflow-x: auto;
-}
-
-deep-chat code {
-    font-family: 'Menlo', 'Monaco', 'Courier New', monospace;
-    font-size: 13px;
+    line-height: 1.55;
 }
 
 /* Status Label Styles */

@@ -616,6 +616,16 @@
   flex-direction: column;
 }
 
+/* The body owns the scrolling: with the modal height capped and overflow
+   hidden, a body that could not scroll clipped its fields on short
+   viewports. */
+.account-provider-token-modal .modal-body,
+.account-password-modal .modal-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+
 .account-provider-token-modal-context {
   display: grid;
   grid-template-columns: max-content minmax(0, 1fr);

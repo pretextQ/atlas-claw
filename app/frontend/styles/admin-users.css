@@ -86,6 +86,12 @@
   outline: none;
 }
 
+/* Outline removal must be paired with a visible focus indicator. */
+.search-input:focus-visible {
+  outline: 2px solid #2563eb;
+  outline-offset: 1px;
+}
+
 .user-toolbar-filters {
   display: flex;
   align-items: center;
@@ -118,6 +124,11 @@
 
 .user-filter-pill select:focus {
   outline: none;
+}
+
+.user-filter-pill select:focus-visible {
+  outline: 2px solid #2563eb;
+  outline-offset: 1px;
 }
 
 .user-filter-reset {

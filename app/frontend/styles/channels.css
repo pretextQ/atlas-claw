@@ -2011,9 +2011,11 @@
         gap: 16px;
     }
     
+    /* Keep the grid: switching to display:block drops the column template
+       and collapses every row into stacked full-width cells. Horizontal
+       scrolling is handled by the table wrapper instead. */
     .ch-table {
-        display: block;
-        overflow-x: auto;
+        grid-template-columns: 1.6fr 1fr 1.2fr 1fr 90px;
     }
     
     .ch-table-header,

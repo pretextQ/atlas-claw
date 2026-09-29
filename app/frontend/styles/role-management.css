@@ -581,7 +581,7 @@
   white-space: nowrap;
 }
 
-.toggle-switch {
+.role-management-page .toggle-switch {
   position: relative;
   display: inline-flex;
   flex-shrink: 0;
@@ -589,23 +589,30 @@
   height: 30px;
 }
 
-.toggle-switch.compact {
+.role-management-page .toggle-switch.compact {
   width: 44px;
   height: 26px;
 }
 
-.toggle-switch input {
+.role-management-page .toggle-switch input {
   position: absolute;
   opacity: 0;
   pointer-events: none;
 }
 
-.toggle-switch input:disabled + span {
+.role-management-page .toggle-switch input:disabled + span {
   cursor: not-allowed;
   opacity: 0.56;
 }
 
-.toggle-switch span {
+/* The input itself is visually hidden, so keyboard focus must be shown on
+   the sibling track (WCAG 2.4.7). */
+.role-management-page .toggle-switch input:focus-visible + span {
+  outline: 2px solid #2563eb;
+  outline-offset: 2px;
+}
+
+.role-management-page .toggle-switch span {
   position: relative;
   display: block;
   width: 100%;
@@ -615,7 +622,7 @@
   transition: background 0.2s ease;
 }
 
-.toggle-switch span::after {
+.role-management-page .toggle-switch span::after {
   content: '';
   position: absolute;
   top: 4px;
@@ -628,26 +635,26 @@
   transition: transform 0.2s ease;
 }
 
-.toggle-switch.compact span::after {
+.role-management-page .toggle-switch.compact span::after {
   top: 3px;
   left: 3px;
   width: 20px;
   height: 20px;
 }
 
-.toggle-switch input:checked + span {
+.role-management-page .toggle-switch input:checked + span {
   background: #4f46e5;
 }
 
-.toggle-switch input:checked + span::after {
+.role-management-page .toggle-switch input:checked + span::after {
   transform: translateX(20px);
 }
 
-.toggle-switch.compact input:checked + span::after {
+.role-management-page .toggle-switch.compact input:checked + span::after {
   transform: translateX(18px);
 }
 
-.toggle-switch-inline {
+.role-management-page .toggle-switch-inline {
   margin-top: 6px;
 }
 
