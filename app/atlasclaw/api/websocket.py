@@ -13,6 +13,7 @@ corresponds to tasks.md 7.1 and 7.3.
 
 import asyncio
 import json
+import logging
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -24,6 +25,8 @@ from fastapi import WebSocket, WebSocketDisconnect
 
 if TYPE_CHECKING:
     from ..auth.models import UserInfo
+
+logger = logging.getLogger(__name__)
 
 
 class FrameType(Enum):
@@ -111,6 +114,7 @@ initialize WebSocket manager
         self._ping_interval = ping_interval
         self._ping_timeout = ping_timeout
         self._auth_handler = auth_handler
+        self._max_protocol_errors = 10
         
         # connection
         self._connections: dict[str, tuple[WebSocket, ConnectionInfo]] = {}
@@ -165,19 +169,28 @@ handle WebSocket connection
                 await websocket.close(code=4001, reason="Invalid connect frame")
                 return
                 
-            # 
+            #
+            # When an auth handler is configured, authentication is mandatory:
+            # a missing/empty token must never bypass it (breaking change: such
+            # clients are now closed with 4401 instead of being admitted).
             user_info = None
-            if self._auth_handler and connect_data.get("auth_token"):
-                user_info = await self._auth_handler(connect_data["auth_token"])
+            if self._auth_handler:
+                auth_token = connect_data.get("auth_token")
+                if not auth_token:
+                    await websocket.close(code=4401, reason="Missing auth token")
+                    return
+                user_info = await self._auth_handler(auth_token)
                 if not user_info:
                     await websocket.close(code=4002, reason="Authentication failed")
                     return
-                    
+
             # createConnection information
+            # The user identity comes from the auth result only; a client-claimed
+            # user_id in the connect frame is never trusted.
             conn_info = ConnectionInfo(
                 connection_id=connection_id,
                 device_id=connect_data.get("device_id", ""),
-                user_id=user_info.user_id if user_info else connect_data.get("user_id", ""),
+                user_id=user_info.user_id if user_info else "",
                 auth_token=connect_data.get("auth_token", ""),
                 user_info=user_info,
             )
@@ -194,17 +207,33 @@ handle WebSocket connection
             
             # heartbeat
             ping_task = asyncio.create_task(self._ping_loop(connection_id))
-            
+
             # message
             try:
                 await self._message_loop(connection_id, websocket, conn_info)
             finally:
                 ping_task.cancel()
-                
+                results = await asyncio.gather(ping_task, return_exceptions=True)
+                for ping_result in results:
+                    if isinstance(ping_result, asyncio.CancelledError):
+                        continue
+                    if isinstance(ping_result, BaseException):
+                        logger.error(
+                            "Ping loop failed for connection %s: %s",
+                            connection_id,
+                            ping_result,
+                        )
+
         except WebSocketDisconnect:
             pass
         except Exception as e:
-            await websocket.close(code=4000, reason=str(e))
+            # The exception detail stays in the server log only; the client
+            # gets a fixed close reason so internals never leak to the peer.
+            logger.exception("WebSocket connection %s failed: %s", connection_id, e)
+            try:
+                await websocket.close(code=4000, reason="Internal error")
+            except Exception:
+                logger.exception("Failed to close WebSocket connection %s", connection_id)
         finally:
             self._cleanup_connection(connection_id)
             
@@ -237,19 +266,29 @@ handle WebSocket connection
         conn_info: ConnectionInfo
     ) -> None:
         """message handling"""
+        protocol_errors = 0
         while True:
             try:
                 data = await websocket.receive_json()
                 await self._handle_frame(connection_id, websocket, conn_info, data)
+                protocol_errors = 0
             except WebSocketDisconnect:
                 raise
-            except Exception as e:
-                # 
+            except Exception:
+                # Repeated malformed frames must terminate the connection instead
+                # of looping forever; the exception itself is never echoed back.
+                protocol_errors += 1
+                logger.exception(
+                    "Failed to handle WebSocket frame on connection %s", connection_id
+                )
                 await self._send_frame(websocket, {
                     "type": "error",
-                    "error": str(e)
+                    "error": "Internal error"
                 })
-                
+                if protocol_errors >= self._max_protocol_errors:
+                    await websocket.close(code=4008, reason="Too many protocol errors")
+                    return
+
     async def _handle_frame(
         self,
         connection_id: str,
@@ -259,12 +298,17 @@ handle WebSocket connection
     ) -> None:
         """handle to"""
         frame_type = data.get("type")
-        
+
         if frame_type == FrameType.PING.value:
             # pong
             conn_info.last_ping = time.time()
             await self._send_frame(websocket, {"type": FrameType.PONG.value})
-            
+
+        elif frame_type == FrameType.PONG.value:
+            # Client answered our ping; refresh liveness so idle-but-healthy
+            # connections are not force-disconnected by the ping timeout.
+            conn_info.last_ping = time.time()
+
         elif frame_type == FrameType.REQUEST.value:
             # Handle a request
             await self._handle_request(websocket, conn_info, data)
@@ -321,12 +365,13 @@ handle WebSocket connection
                 "payload": result
             })
             
-        except Exception as e:
+        except Exception:
+            logger.exception("Request handler %s failed", method)
             await self._send_frame(websocket, {
                 "type": FrameType.RESPONSE.value,
                 "id": request_id,
                 "ok": False,
-                "error": str(e)
+                "error": "Internal error"
             })
             
     async def _ping_loop(self, connection_id: str) -> None:
@@ -362,8 +407,17 @@ handle WebSocket connection
             _, conn_info = conn
             # session
             for session_key in conn_info.session_keys:
-                if session_key in self._session_subscribers:
-                    self._session_subscribers[session_key].discard(connection_id)
+                subscribers = self._session_subscribers.get(session_key)
+                if subscribers is None:
+                    continue
+                subscribers.discard(connection_id)
+                if not subscribers:
+                    del self._session_subscribers[session_key]
+            # Drop this connection's idempotency entries so the cache cannot
+            # grow without bound across reconnects.
+            prefix = f"{connection_id}:"
+            for key in [k for k in self._idempotency_cache if k.startswith(prefix)]:
+                self._idempotency_cache.pop(key, None)
                     
     def _check_idempotency(self, key: str) -> Optional[Any]:
         """check etc."""
