@@ -231,8 +231,15 @@ Constructor: `key: bytes` (32-byte encryption key)
 | `decrypt_json` | `(ciphertext: str) -> dict` | Decrypt to dict |
 
 **Key Management**:
-- Primary key from `ATLASCLAW_ENCRYPTION_KEY` environment variable (base64-encoded 32 bytes)
-- Built-in default key for development (must be overridden in production)
+- Primary key from `ATLASCLAW_ENCRYPTION_KEY` (base64-encoded 32 bytes);
+  envelope mode reads `ATLASCLAW_MASTER_KEY` first
+- Construction raises `MissingKeyError` when no key is configured. The built-in
+  default key is decrypt-only for existing data; encrypting with it requires the
+  explicit `ATLASCLAW_ALLOW_INSECURE_DEFAULT_KEY=1` opt-in (local development)
+- Additional/rotated keys: `ATLASCLAW_ENCRYPTION_KEY_<key_id>` variables or the
+  JSON key store pointed at by `ATLASCLAW_KEY_STORE`
+- Rotation persists through `rotate_key(persist_path=...)`; re-encrypt existing
+  secrets with `scripts/reencrypt_secrets.py`
 - Support for envelope encryption with rotating data keys (optional)
 
 **Usage**:

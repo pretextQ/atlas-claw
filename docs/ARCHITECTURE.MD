@@ -945,8 +945,22 @@ All sensitive data is encrypted at rest using **AES-256-GCM**:
 
 **Encryption Service** (`app/atlasclaw/core/encryption.py`):
 - Algorithm: AES-256-GCM with authenticated encryption
-- Key: 32-byte key (configurable via `ATLASCLAW_ENCRYPTION_KEY` environment variable)
+- Key: 32-byte base64 key from `ATLASCLAW_ENCRYPTION_KEY` (envelope mode reads
+  `ATLASCLAW_MASTER_KEY` first). Startup **fails fast** with `MissingKeyError`
+  when no key is configured: the public built-in default key is never used for
+  new encryption unless `ATLASCLAW_ALLOW_INSECURE_DEFAULT_KEY=1` explicitly
+  opts in for local development
+- Legacy data: ciphertext written with the built-in default key keeps
+  decrypting (that key stays registered decrypt-only), so no migration
+  downtime is required. Re-encrypt stored secrets with
+  `python scripts/reencrypt_secrets.py atlasclaw.json --write`
+- Rotation: `EncryptionService.rotate_key(persist_path=...)` writes a JSON key
+  store (loaded via `ATLASCLAW_KEY_STORE`) so rotated keys survive restarts;
+  key ids embed a random suffix so same-second rotations cannot collide
 - Format: `v1:key_id:base64(nonce+ciphertext+tag)`
+- Decryption failures raise (`MissingKeyError` when the key is unavailable,
+  `InvalidCiphertextError` when the ciphertext is corrupted); a ciphertext is
+  never returned as if it were the plaintext value
 
 **Encrypted Fields**:
 - `TokenModel.api_key` -LLM API keys in database

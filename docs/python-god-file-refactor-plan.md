@@ -4,12 +4,30 @@
 
 ## Current Scan (Tracked `*.py`, >600 lines)
 
-- `837` `app/atlasclaw/main.py`
-- `793` `app/atlasclaw/skills/registry.py`
-- `708` `app/atlasclaw/agent/prompt_builder.py`
-- `698` `app/atlasclaw/models/providers.py`
-- `642` `app/atlasclaw/api/api_routes.py`
-- `616` `tests/atlasclaw/test_md_skills.py`
+Measured after the 2026-09 correctness campaign:
+
+| Lines | File |
+|---|---|
+| 3186 | `app/atlasclaw/agent/runner_tool/runner_execution_prepare.py` |
+| 1733 | `app/atlasclaw/api/api_routes.py` |
+| 1624 | `app/atlasclaw/agent/runner_tool/runner_execution_flow_post.py` |
+| 1525 | `app/atlasclaw/agent/runner_prompt_context.py` |
+| 1341 | `app/atlasclaw/agent/runner_tool/runner_execution_flow_stream.py` |
+| 1324 | app/atlasclaw/skills/registry.py |
+| 1027 | `app/atlasclaw/agent/runner_tool/runner_tool_gate_model.py` |
+| 1005 | `app/atlasclaw/main.py` |
+
+Frontend (not covered by the Python guard):
+
+| Lines | File |
+|---|---|
+| 4039 | `app/frontend/scripts/chat-ui.js` |
+| 3075 | `app/frontend/scripts/pages/channels.js` |
+
+Note: the previous version of this document listed much smaller numbers
+because it counted a stale checkout. Line counts drift with every change —
+run `python scripts/check_python_file_lengths.py` for the current state; the
+`--max-lines` argument defines the threshold (default 600).
 
 ## Refactor Strategy by File
 

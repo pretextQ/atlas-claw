@@ -1660,7 +1660,11 @@ default daily logrotate cadence.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `ATLASCLAW_ENCRYPTION_KEY` | Encryption key for sensitive data | Required in Docker |
+| `ATLASCLAW_ENCRYPTION_KEY` | Encryption key for sensitive data (base64, 32 bytes). Startup fails without it | Required |
+| `ATLASCLAW_MASTER_KEY` | Envelope-encryption master key (falls back to `ATLASCLAW_ENCRYPTION_KEY`) | Optional |
+| `ATLASCLAW_KEY_STORE` | JSON key store written by `rotate_key(persist_path=...)` and reloaded at startup | Optional |
+| `ATLASCLAW_ALLOW_INSECURE_DEFAULT_KEY` | `1` opts in to encrypting with the public built-in default key (local development only) | Unset |
+| `ATLASCLAW_ALLOW_INVALID_CONFIG` | `1` starts on defaults when the config file is malformed or fails validation (not recommended) | Unset |
 | `DB_HOST` | Database host | `mysql` |
 | `DB_PORT` | Database port | `3306` |
 | `DB_NAME` | Database name | `atlasclaw` |

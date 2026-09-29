@@ -1063,6 +1063,5 @@ Response Stream (SSE)
 | [DEPLOYMENT.MD](./DEPLOYMENT.MD) | Production deployment, Docker, systemd, Nginx |
 | [SKILL-GUIDE.MD](./SKILL-GUIDE.MD) | Complete Skill development reference |
 | [PROVIDER-GUIDE.MD](./PROVIDER-GUIDE.MD) | Provider development and deployment |
-| [FILE-STRUCTURE.MD](./FILE-STRUCTURE.MD) | Detailed module map and import patterns |
 | [DEVELOPMENT-SPEC.MD](./DEVELOPMENT-SPEC.MD) | Python style guide and testing standards |
 | [PROJECT_OVERVIEW.MD](./PROJECT_OVERVIEW.MD) | Architecture deep-dive and design decisions |
