@@ -460,10 +460,26 @@ convert Skills register PydanticAI Agent tool
         """
         if name not in self._skills:
             return json.dumps({"error": f"Skill '{name}' not found"})
-        
+
         meta, handler = self._skills[name]
-        args = json.loads(args_json) if args_json else {}
-        
+
+        try:
+            if isinstance(args_json, dict):
+                args = args_json
+            else:
+                args = json.loads(args_json) if args_json else {}
+            if not isinstance(args, dict):
+                return json.dumps({
+                    "error": (
+                        f"Skill '{name}' arguments must be a JSON object, got "
+                        f"{type(args).__name__}"
+                    )
+                })
+        except (TypeError, ValueError) as e:
+            # Malformed JSON is a caller error, not a crash: return a
+            # structured result instead of raising out of execute().
+            return json.dumps({"error": f"Invalid arguments JSON for skill '{name}': {e}"})
+
         try:
             # check handler Run-Context parameter
             sig = inspect.signature(handler)
@@ -822,9 +838,12 @@ single MD Skill.
         # nameparse:Frontmatter name > / stem
         if is_directory_skill:
             parent_dir_name = file_path.parent.name
-            name = fm.metadata.get("name", parent_dir_name)
+            raw_name = fm.metadata.get("name", parent_dir_name)
         else:
-            name = fm.metadata.get("name", file_path.stem)
+            raw_name = fm.metadata.get("name", file_path.stem)
+        # A non-string name (e.g. `name: null` or a YAML list) is rejected
+        # explicitly instead of crashing the loader.
+        name = raw_name if isinstance(raw_name, str) else ""
 
         # name
         parent_check = file_path.parent.name if is_directory_skill else None
@@ -834,9 +853,12 @@ single MD Skill.
             return False
 
         # description
-        description = fm.metadata.get("description", "").strip()
+        raw_description = fm.metadata.get("description", "")
+        description = raw_description.strip() if isinstance(raw_description, str) else ""
         if not description:
-            logger.warning("Skipping %s: missing or empty description", file_path)
+            logger.warning(
+                "Skipping %s: missing, empty, or non-string description", file_path
+            )
             return False
 
         if len(description) > _MAX_DESCRIPTION_LENGTH:
