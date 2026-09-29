@@ -86,6 +86,10 @@ initializeConfiguration manager
         self._runtime_overrides: dict[str, Any] = {}
         self._loaded = False
         self._resolved_config_path: Optional[Path] = None
+        # Config paths whose value came from an *unset* ${VAR} placeholder;
+        # used to tell "optional value not configured" apart from a real
+        # configuration mistake when validation fails.
+        self._unset_placeholder_paths: set[tuple[str, ...]] = set()
     
     @property
     def config(self) -> AtlasClawConfig:
@@ -152,6 +156,24 @@ initializeConfiguration manager
             ]
             if embed_errors:
                 raise ValueError(f"Embed integration configuration is invalid: {e}") from e
+            if self._prune_unset_placeholder_values(config_dict, e):
+                # Every value that failed validation came from an unset ${VAR}
+                # placeholder: drop just those so the schema default (or the
+                # field being absent) applies, keeping the rest of the config.
+                logger.warning(
+                    "[ConfigManager] Ignoring %d configuration value(s) whose "
+                    "${VAR} placeholder is not set; schema defaults apply. Set "
+                    "the environment variables to configure them.",
+                    len(self._unset_placeholder_paths),
+                )
+                try:
+                    self._config = AtlasClawConfig(**config_dict)
+                except ValidationError as retry_error:
+                    e = retry_error
+                else:
+                    self._loaded = True
+                    return self._config
+
             if self._lenient_config_enabled():
                 logger.error(
                     "[ConfigManager] Config validation failed; continuing with "
@@ -172,12 +194,67 @@ initializeConfiguration manager
         self._loaded = True
         return self._config
 
+    def _prune_unset_placeholder_values(
+        self,
+        config_dict: dict[str, Any],
+        error: ValidationError,
+    ) -> bool:
+        """Drop values that failed validation only because their ${VAR} is unset.
+
+        Args:
+            config_dict: Expanded configuration mapping (modified in place).
+            error: The validation error raised for ``config_dict``.
+
+        Returns:
+            True when every reported error points at a value produced by an
+            unset placeholder (those values were removed), False otherwise.
+        """
+        if not self._unset_placeholder_paths:
+            return False
+
+        def _is_placeholder_path(loc: tuple[Any, ...]) -> bool:
+            normalized = tuple(str(part) for part in loc)
+            return any(
+                normalized[: len(path)] == path
+                for path in self._unset_placeholder_paths
+            )
+
+        locations = [
+            tuple(err.get("loc") or ())
+            for err in error.errors()
+            if err.get("loc")
+        ]
+        if not locations or not all(_is_placeholder_path(loc) for loc in locations):
+            return False
+
+        for loc in locations:
+            container: Any = config_dict
+            for part in loc[:-1]:
+                if isinstance(container, dict):
+                    container = container.get(part)
+                elif isinstance(container, list) and str(part).isdigit():
+                    index = int(part)
+                    container = container[index] if index < len(container) else None
+                else:
+                    container = None
+                    break
+            if container is None:
+                continue
+            last = loc[-1]
+            if isinstance(container, dict):
+                container.pop(str(last), None)
+            elif isinstance(container, list) and str(last).isdigit():
+                index = int(last)
+                if index < len(container):
+                    container.pop(index)
+        return True
+
     @staticmethod
     def _lenient_config_enabled() -> bool:
         """Return whether the explicit lenient-config opt-in is set."""
         return os.environ.get(LENIENT_CONFIG_ENV) == "1"
 
-    def _expand_env_vars(self, obj: Any) -> Any:
+    def _expand_env_vars(self, obj: Any, _path: tuple[str, ...] = ()) -> Any:
         """Recursively expand environment variable placeholders and decrypt encrypted values in config.
 
         Placeholders in format ${VAR_NAME} are replaced with environment variable values.
@@ -227,20 +304,31 @@ initializeConfiguration manager
                 var_name = obj[2:-1]
                 if var_name not in os.environ:
                     # Empty string keeps optional string fields valid; warn so
-                    # a missing variable is not silently invisible.
+                    # a missing variable is not silently invisible, and record
+                    # the path so validation failures caused only by unset
+                    # placeholders drop those values instead of refusing to
+                    # start on an otherwise usable configuration.
                     logger.warning(
                         "[ConfigManager] Environment variable '%s' referenced by "
                         "the configuration is not set; the value resolves to an "
                         "empty string",
                         var_name,
                     )
+                    if _path:
+                        self._unset_placeholder_paths.add(_path)
                     return ""
                 return os.environ[var_name]
             return obj
         elif isinstance(obj, dict):
-            return {k: self._expand_env_vars(v) for k, v in obj.items()}
+            return {
+                k: self._expand_env_vars(v, _path + (str(k),))
+                for k, v in obj.items()
+            }
         elif isinstance(obj, list):
-            return [self._expand_env_vars(item) for item in obj]
+            return [
+                self._expand_env_vars(item, _path + (str(index),))
+                for index, item in enumerate(obj)
+            ]
         return obj
     
     def _load_workspace_config(self) -> Optional[dict]:

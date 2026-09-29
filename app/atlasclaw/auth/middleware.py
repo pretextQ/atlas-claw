@@ -61,11 +61,13 @@ class AuthMiddleware(BaseHTTPMiddleware):
         anonymous_fallback: bool = False,
         oidc_redirect_uri: str = "",
     ) -> None:
+        # ``oidc_redirect_uri`` is part of the middleware registration
+        # contract (callers pass it); the middleware itself derives the
+        # redirect target from the auth config.
         super().__init__(app)
         self._strategy = strategy
         self._auth_config = auth_config or AuthConfig(enabled=False)
         self._anonymous_fallback = anonymous_fallback
-        self._oidc_redirect_uri = oidc_redirect_uri
 
         jwt_cfg = self._auth_config.jwt.expanded()
         oidc_cfg = self._auth_config.oidc.expanded()

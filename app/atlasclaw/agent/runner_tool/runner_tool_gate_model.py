@@ -38,52 +38,6 @@ from app.atlasclaw.core.deps import SkillDeps
 
 logger = logging.getLogger(__name__)
 
-class _ModelToolGateClassifier:
-    """Model-backed classifier used by the runtime when a direct model call is available."""
-
-    def __init__(
-        self,
-        *,
-        runner: "AgentRunner",
-        deps: SkillDeps,
-        available_tools: list[dict[str, Any]],
-        agent: Optional[Any] = None,
-        agent_resolver: Optional[Any] = None,
-    ) -> None:
-        self._runner = runner
-        self._agent = agent
-        self._agent_resolver = agent_resolver
-        self._deps = deps
-        self._available_tools = available_tools
-
-    async def _resolve_agent(self) -> Optional[Any]:
-        if self._agent is not None:
-            return self._agent
-        if self._agent_resolver is None:
-            return None
-        resolved = self._agent_resolver()
-        if inspect.isawaitable(resolved):
-            resolved = await resolved
-        self._agent = resolved
-        return resolved
-
-    async def classify(
-        self,
-        user_message: str,
-        recent_history: list[dict[str, Any]],
-    ) -> Optional[ToolGateDecision]:
-        """Run the tool-gate classifier with the lazily resolved model agent."""
-        classifier_agent = await self._resolve_agent()
-        if classifier_agent is None:
-            return None
-        return await self._runner._classify_tool_gate_with_model(
-            agent=classifier_agent,
-            deps=self._deps,
-            user_message=user_message,
-            recent_history=recent_history,
-            available_tools=self._available_tools,
-        )
-
 class RunnerToolGateModelMixin:
     """Resolve model-assisted capability routing and tool-intent decisions."""
 

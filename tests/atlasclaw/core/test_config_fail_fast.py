@@ -171,3 +171,72 @@ class TestUnsetEnvPlaceholder:
             "ATLASCLAW_UNSET_PLACEHOLDER_XYZ" in record.getMessage()
             for record in caplog.records
         )
+
+
+class TestUnsetPlaceholderValues:
+    """A value that is only unset because its ${VAR} is missing must not make
+    an otherwise valid configuration unusable (the shipped atlasclaw.json
+    fills required token fields from env vars)."""
+
+    def test_typed_field_from_unset_placeholder_uses_its_default(self, tmp_path, monkeypatch, caplog):
+        monkeypatch.delenv("ATLASCLAW_TEST_TEMPERATURE", raising=False)
+        config_path = tmp_path / "atlasclaw.json"
+        config_path.write_text(
+            json.dumps({"model": {"temperature": "${ATLASCLAW_TEST_TEMPERATURE}"}}),
+            encoding="utf-8",
+        )
+
+        with caplog.at_level(logging.WARNING, logger="app.atlasclaw.core.config"):
+            config = ConfigManager(config_path=str(config_path)).load()
+
+        assert config.model.temperature == 0.7
+        assert any(
+            "placeholder is not set" in record.getMessage()
+            for record in caplog.records
+        )
+
+    def test_real_invalid_value_still_fails_fast(self, tmp_path):
+        """A written-out bad value is not excused by the pruning path."""
+        config_path = tmp_path / "atlasclaw.json"
+        config_path.write_text(
+            json.dumps({"model": {"temperature": "not-a-number"}}),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ConfigError):
+            ConfigManager(config_path=str(config_path)).load()
+
+    def test_unset_placeholder_in_string_field_keeps_the_entry_readable(self, tmp_path, monkeypatch, caplog):
+        monkeypatch.delenv("ATLASCLAW_TEST_TOKEN_PROVIDER", raising=False)
+        config_path = tmp_path / "atlasclaw.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "model": {
+                        "tokens": [
+                            {
+                                "id": "t1",
+                                "provider": "${ATLASCLAW_TEST_TOKEN_PROVIDER}",
+                                "model": "m",
+                                "base_url": "https://example.invalid",
+                                "api_key": "k",
+                            }
+                        ]
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with caplog.at_level(logging.WARNING, logger="app.atlasclaw.core.config"):
+            config = ConfigManager(config_path=str(config_path)).load()
+
+        # An empty string is a valid string, so the entry still loads (the
+        # legacy behaviour) and the unset variable is reported loudly instead
+        # of silently disabling the whole configuration.
+        assert len(config.model.tokens) == 1
+        assert config.model.tokens[0].provider == ""
+        assert any(
+            "ATLASCLAW_TEST_TOKEN_PROVIDER" in record.getMessage()
+            for record in caplog.records
+        )

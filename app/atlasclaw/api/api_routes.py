@@ -1230,13 +1230,9 @@ async def update_role(
             detail="Role identifiers cannot be changed after creation",
         )
 
-    if role_data.identifier:
-        existing_identifier = await RoleService.get_by_identifier(session, role_data.identifier)
-        if existing_identifier and existing_identifier.id != role_id:
-            raise HTTPException(
-                status_code=409,
-                detail=f"Role identifier '{role_data.identifier}' already exists",
-            )
+    # No identifier-uniqueness check here: the guard above rejects any
+    # identifier change, so by this point the identifier still equals the
+    # stored one and an "already exists" branch could never fire.
 
     old_value = _serialize_role_for_audit(old_role)
     role = await RoleService.update(session, role_id, role_data)

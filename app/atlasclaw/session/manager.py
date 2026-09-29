@@ -200,7 +200,6 @@ manager = SessionManager(agents_dir="/path/to/legacy-agents")
                 if attempt + 1 >= max_attempts:
                     raise
                 await asyncio.sleep(self._io_retry_backoff_seconds * (attempt + 1))
-        return ""
 
     async def _read_transcript_entries_with_retry(self, transcript_path: Path) -> list[TranscriptEntry]:
         """Read transcript JSONL content with retry and parse into entries.

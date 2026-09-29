@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 from datetime import datetime
 import logging
@@ -39,7 +38,6 @@ from app.atlasclaw.agent.runner_tool.runner_tool_projection import (
     turn_action_requires_tool_execution,
 )
 from app.atlasclaw.agent.stream import StreamEvent
-from app.atlasclaw.agent.thinking_stream import ThinkingStreamEmitter
 from app.atlasclaw.agent.tool_gate import CapabilityMatcher
 from app.atlasclaw.agent.tool_gate_models import (
     CapabilitySelectorOutcome,
