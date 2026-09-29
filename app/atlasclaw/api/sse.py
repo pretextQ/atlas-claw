@@ -54,17 +54,18 @@ SSE event
     def to_sse_format(self) -> dict[str, Any]:
         """SSE for mat"""
         def safe_serialize(obj: Any) -> Any:
-            if hasattr(obj, '__dict__'):
-                return str(obj)
-            return obj
-        
+            # Only called by json.dumps for objects it cannot serialize
+            # (datetime, set, Decimal, ...). Returning them unchanged makes
+            # json.dumps raise; stringifying keeps the event stream alive.
+            return str(obj)
+
         result: dict[str, Any] = {
             "event": self.event_type.value,
             "data": json.dumps(self.data, ensure_ascii=False, default=safe_serialize)
         }
         if self.event_id:
             result["id"] = self.event_id
-        if self.retry:
+        if self.retry is not None:
             result["retry"] = self.retry
         return result
 
@@ -84,16 +85,18 @@ Stream state
     started_at: float = field(default_factory=time.time)
     events: list[SSEEvent] = field(default_factory=list)
     closed: bool = False
+    max_events: int = 100
 
     def add_event(self, event: SSEEvent) -> None:
         """"""
         self.event_count += 1
         event.event_id = f"{self.run_id}-{self.event_count}"
         self.last_event_id = event.event_id
-        # 100 used for resume-from-breakpoint
+        # Bounded ring for resume-from-breakpoint replay; the limit comes
+        # from the manager's max_events_buffer configuration.
         self.events.append(event)
-        if len(self.events) > 100:
-            self.events = self.events[-100:]
+        if len(self.events) > self.max_events:
+            self.events = self.events[-self.max_events:]
 
 
 class _StreamOverflow:
@@ -154,13 +157,6 @@ class _SubscriberQueue:
     async def get(self, timeout: float):
         """Await the next item from the queue with a timeout."""
         return await asyncio.wait_for(self._queue.get(), timeout=timeout)
-
-    def remove_self_from(self, subscribers: list) -> None:
-        """Detach this subscriber from the run's subscriber list."""
-        try:
-            subscribers.remove(self)
-        except ValueError:
-            pass
 
 
 class SSEManager:
@@ -238,7 +234,7 @@ create
         
 """
         if run_id not in self._streams:
-            self._streams[run_id] = StreamState(run_id=run_id)
+            self._streams[run_id] = StreamState(run_id=run_id, max_events=self._max_events_buffer)
             self._subscribers[run_id] = []
         return self._streams[run_id]
         
@@ -386,7 +382,29 @@ create SSE
         sent_terminal_lifecycle = acknowledged_terminal_lifecycle
 
         try:
-            replay_events = self._get_missed_events(stream, last_event_id)
+            replay_events, resume_reset = self._get_missed_events(stream, last_event_id)
+            if resume_reset:
+                # The requested Last-Event-ID is no longer in the buffer
+                # (evicted or forged). Never answer with a silent empty
+                # replay: tell the client the resume point is gone, then
+                # replay the full buffer (breaking change: the client now
+                # receives an explicit stream_reset error event and must
+                # treat its local state as stale).
+                yield SSEEvent(
+                    event_type=SSEEventType.ERROR,
+                    data={
+                        "code": "stream_reset",
+                        "message": (
+                            "The requested Last-Event-ID is no longer in the "
+                            "replay buffer; the full buffered stream follows "
+                            "and earlier events are no longer available."
+                        ),
+                        "last_event_id": last_event_id,
+                        "buffer_start_event_id": (
+                            stream.events[0].event_id if stream.events else None
+                        ),
+                    },
+                ).to_sse_format()
             for event in replay_events:
                 yield event.to_sse_format()
                 sent_terminal_lifecycle = (
@@ -471,21 +489,32 @@ create SSE
         self,
         stream: StreamState,
         last_event_id: str
-    ) -> list[SSEEvent]:
-        """get(used for resume-from-breakpoint)"""
+    ) -> tuple[list[SSEEvent], bool]:
+        """Return the events after last_event_id for resume-from-breakpoint.
+
+        Returns:
+            A tuple of (events to replay, reset flag). The reset flag is True
+            when the client's last_event_id is no longer present in the
+            buffer (evicted or forged) — the caller must signal an explicit
+            reset instead of silently returning an empty replay.
+        """
         if not last_event_id:
-            return list(stream.events)
+            return list(stream.events), False
 
         missed = []
         found = False
-        
+
         for event in stream.events:
             if found:
                 missed.append(event)
             elif event.event_id == last_event_id:
                 found = True
-                
-        return missed
+
+        if not found:
+            # Resume point evicted or forged: replay the full buffer.
+            return list(stream.events), True
+
+        return missed, False
         
     # ----- -----
     
