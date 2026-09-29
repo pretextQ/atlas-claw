@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import json
+import logging
 from pathlib import Path
 from typing import Optional, Any
 from pydantic import ValidationError
@@ -19,6 +20,20 @@ from dotenv import load_dotenv
 
 from app.atlasclaw.core.config_schema import AtlasClawConfig
 from app.atlasclaw.core.user_paths import user_runtime_dir
+
+logger = logging.getLogger(__name__)
+
+# Explicit, documented opt-in for legacy deployments that would rather start
+# on defaults than fail when the config file is invalid.
+LENIENT_CONFIG_ENV = "ATLASCLAW_ALLOW_INVALID_CONFIG"
+
+
+class ConfigError(Exception):
+    """Raised when the configuration file cannot be used as configured.
+
+    Loading is fail-fast: an unreadable, malformed, or undecryptable
+    configuration must not silently start the service on defaults.
+    """
 
 
 class ConfigManager:
@@ -137,13 +152,31 @@ initializeConfiguration manager
             ]
             if embed_errors:
                 raise ValueError(f"Embed integration configuration is invalid: {e}") from e
-            # Config validation failed, use defaults
-            print(f"[ConfigManager] Config validation failed, using defaults: {e}")
-            self._config = AtlasClawConfig()
-        
+            if self._lenient_config_enabled():
+                logger.error(
+                    "[ConfigManager] Config validation failed; continuing with "
+                    "defaults because %s=1: %s",
+                    LENIENT_CONFIG_ENV,
+                    e,
+                )
+                self._config = AtlasClawConfig()
+            else:
+                # Silently running on defaults hid misconfiguration; refuse to
+                # start with a config that does not validate.
+                raise ConfigError(
+                    f"Configuration validation failed: {e}. Fix the configuration "
+                    f"file, or set {LENIENT_CONFIG_ENV}=1 to start with defaults "
+                    f"anyway (not recommended)."
+                ) from e
+
         self._loaded = True
         return self._config
-    
+
+    @staticmethod
+    def _lenient_config_enabled() -> bool:
+        """Return whether the explicit lenient-config opt-in is set."""
+        return os.environ.get(LENIENT_CONFIG_ENV) == "1"
+
     def _expand_env_vars(self, obj: Any) -> Any:
         """Recursively expand environment variable placeholders and decrypt encrypted values in config.
 
@@ -151,24 +184,58 @@ initializeConfiguration manager
         Encrypted values in format enc:v1:... are decrypted using the encryption service.
         If the env var is not set, returns empty string for string fields (allows Pydantic
         validation to pass) or None for other types.
+
+        Raises:
+            ConfigError: If an ``enc:`` value cannot be decrypted. The ciphertext
+                is never returned as if it were the plaintext value.
         """
-        from app.atlasclaw.core.encryption import decrypt, FORMAT_PREFIX
+        from app.atlasclaw.core.encryption import (
+            FORMAT_PREFIX,
+            InvalidCiphertextError,
+            MissingKeyError,
+            decrypt,
+        )
 
         if isinstance(obj, str):
             # Check for encrypted value format: enc:v1:base64payload
             if obj.startswith("enc:") and FORMAT_PREFIX in obj:
+                encrypted_payload = obj[4:]  # Remove 'enc:' prefix
                 try:
-                    encrypted_payload = obj[4:]  # Remove 'enc:' prefix
                     return decrypt(encrypted_payload)
-                except Exception as e:
-                    print(f"[ConfigManager] Failed to decrypt encrypted value: {e}")
-                    return obj  # Return original if decryption fails
+                except MissingKeyError as e:
+                    # Key unavailable and ciphertext corruption are distinct
+                    # operational problems and must not be conflated.
+                    raise ConfigError(
+                        f"Cannot decrypt an encrypted configuration value: the "
+                        f"key it was encrypted with is not available ({e}). Set "
+                        f"the matching ATLASCLAW_ENCRYPTION_KEY(_<key_id>) "
+                        f"environment variable."
+                    ) from e
+                except InvalidCiphertextError as e:
+                    raise ConfigError(
+                        f"Cannot decrypt an encrypted configuration value: the "
+                        f"ciphertext is corrupted or was encrypted with a "
+                        f"different key ({e})."
+                    ) from e
+                except Exception as e:  # pragma: no cover - unexpected crypto error
+                    raise ConfigError(
+                        f"Failed to decrypt an encrypted configuration value: {e}"
+                    ) from e
 
             # Check for environment variable placeholder
             if obj.startswith("${") and obj.endswith("}"):
                 var_name = obj[2:-1]
-                # Return env var value or empty string if not set
-                return os.environ.get(var_name, "")
+                if var_name not in os.environ:
+                    # Empty string keeps optional string fields valid; warn so
+                    # a missing variable is not silently invisible.
+                    logger.warning(
+                        "[ConfigManager] Environment variable '%s' referenced by "
+                        "the configuration is not set; the value resolves to an "
+                        "empty string",
+                        var_name,
+                    )
+                    return ""
+                return os.environ[var_name]
             return obj
         elif isinstance(obj, dict):
             return {k: self._expand_env_vars(v) for k, v in obj.items()}
@@ -281,17 +348,23 @@ get configuration
             return default
     
     def _load_from_file(self) -> Optional[dict]:
-        """from configuration"""
+        """Load the configuration file.
+
+        Raises:
+            ConfigError: If a candidate config file exists but cannot be read
+                or parsed. Silently continuing on defaults hid typos and
+                partial writes behind a service that looked healthy.
+        """
         paths = [self._config_path] if self._config_path else self.DEFAULT_CONFIG_PATHS
-        
+
         for path_str in paths:
             if not path_str:
                 continue
             path = Path(path_str).expanduser()
             if path.exists():
+                self._resolved_config_path = path.resolve()
+                self._load_sidecar_dotenv(self._resolved_config_path)
                 try:
-                    self._resolved_config_path = path.resolve()
-                    self._load_sidecar_dotenv(self._resolved_config_path)
                     with open(path, "r", encoding="utf-8") as f:
                         if path.suffix == ".json":
                             return json.load(f)
@@ -303,9 +376,37 @@ get configuration
                             except ImportError:
                                 print("[ConfigManager] YAML support requires PyYAML installation")
                                 continue
+                except (OSError, json.JSONDecodeError) as e:
+                    if self._lenient_config_enabled():
+                        logger.error(
+                            "[ConfigManager] Failed to read config file %s (%s); "
+                            "continuing with defaults because %s=1",
+                            path,
+                            e,
+                            LENIENT_CONFIG_ENV,
+                        )
+                        continue
+                    raise ConfigError(
+                        f"Failed to read config file {path}: {e}. Fix the file, or "
+                        f"set {LENIENT_CONFIG_ENV}=1 to start with defaults anyway "
+                        f"(not recommended)."
+                    ) from e
                 except Exception as e:
-                    print(f"[ConfigManager] Failed to read config file {path}: {e}")
-                    continue
+                    # e.g. a YAML parse error from PyYAML
+                    if self._lenient_config_enabled():
+                        logger.error(
+                            "[ConfigManager] Failed to parse config file %s (%s); "
+                            "continuing with defaults because %s=1",
+                            path,
+                            e,
+                            LENIENT_CONFIG_ENV,
+                        )
+                        continue
+                    raise ConfigError(
+                        f"Failed to parse config file {path}: {e}. Fix the file, or "
+                        f"set {LENIENT_CONFIG_ENV}=1 to start with defaults anyway "
+                        f"(not recommended)."
+                    ) from e
         return None
 
     @staticmethod
