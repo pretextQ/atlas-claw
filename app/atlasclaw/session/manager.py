@@ -122,6 +122,10 @@ manager = SessionManager(agents_dir="/path/to/legacy-agents")
         self._metadata_cache: dict[str, SessionMetadata] = {}
         self._transcript_cache: dict[str, TranscriptCacheEntry] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+        # Serializes index snapshot+write+replace: per-session locks alone
+        # would let two sessions' full-cache saves interleave and the older
+        # snapshot clobber the newer one on disk (lost update).
+        self._metadata_save_lock = asyncio.Lock()
         self._io_retry_attempts = 3
         self._io_retry_backoff_seconds = 0.05
         self._archive_budget_bytes = 200 * 1024 * 1024
@@ -323,15 +327,19 @@ manager = SessionManager(agents_dir="/path/to/legacy-agents")
                 self.sessions_dir / self.METADATA_FILE,
             )
             return
-        await self._ensure_dir()
-        metadata_path = self.sessions_dir / self.METADATA_FILE
-        tmp_path = self._build_metadata_tmp_path(metadata_path)
-        
-        data = {key: meta.to_dict() for key, meta in self._metadata_cache.items()}
+        # One manager-wide lock around snapshot+write+replace: the file holds
+        # the FULL cache, so concurrent saves must not interleave or the last
+        # replace would resurrect a stale snapshot (lost update).
+        async with self._metadata_save_lock:
+            await self._ensure_dir()
+            metadata_path = self.sessions_dir / self.METADATA_FILE
+            tmp_path = self._build_metadata_tmp_path(metadata_path)
 
-        async with aiofiles.open(tmp_path, "w", encoding="utf-8") as f:
-            await f.write(json.dumps(data, ensure_ascii=False, indent=2))
-        await self._replace_file_with_retry(tmp_path, metadata_path)
+            data = {key: meta.to_dict() for key, meta in self._metadata_cache.items()}
+
+            async with aiofiles.open(tmp_path, "w", encoding="utf-8") as f:
+                await f.write(json.dumps(data, ensure_ascii=False, indent=2))
+            await self._replace_file_with_retry(tmp_path, metadata_path)
 
     @staticmethod
     def _build_metadata_tmp_path(metadata_path: Path) -> Path:
@@ -403,24 +411,28 @@ manager = SessionManager(agents_dir="/path/to/legacy-agents")
         """
         await self._load_metadata()
         lock = await self._get_lock(session_key)
-        
+
         async with lock:
-            if session_key in self._metadata_cache:
-                session = self._metadata_cache[session_key]
-                
-                # Replace the session when the reset policy requires it.
-                if self._should_reset(session):
-                    await self._archive_session(session)
-                    session = self._create_new_session(session_key)
-                else:
-                    # Touch the session on access.
-                    session.updated_at = datetime.now()
-            else:
+            return await self._get_or_create_locked(session_key)
+
+    async def _get_or_create_locked(self, session_key: str) -> SessionMetadata:
+        """get_or_create body; the caller must hold the per-session lock."""
+        if session_key in self._metadata_cache:
+            session = self._metadata_cache[session_key]
+
+            # Replace the session when the reset policy requires it.
+            if self._should_reset(session):
+                await self._archive_session(session)
                 session = self._create_new_session(session_key)
-            
-            self._metadata_cache[session_key] = session
-            await self._save_metadata()
-            return session
+            else:
+                # Touch the session on access.
+                session.updated_at = datetime.now()
+        else:
+            session = self._create_new_session(session_key)
+
+        self._metadata_cache[session_key] = session
+        await self._save_metadata()
+        return session
     
     def _create_new_session(self, session_key: str) -> SessionMetadata:
         """Create a new session"""
@@ -492,43 +504,54 @@ manager = SessionManager(agents_dir="/path/to/legacy-agents")
     ) -> None:
         """Append a single transcript entry to the session transcript.
 
+        The per-session lock is held across the whole operation: an append
+        running outside it could race reset_session's archive (rename) or
+        persist_transcript's atomic replace and silently land on a replaced
+        inode.
+
         Args:
             session_key: Serialized session key.
             entry: Transcript entry to append.
         """
-        session = await self.get_or_create(session_key)
-        transcript_path = self._get_transcript_path(session)
-        
-        content = entry.content
-        metadata = dict(entry.metadata)
-        if str(entry.role).lower() == "user":
-            content, encoded = encode_if_untrusted(content)
-            if encoded:
-                metadata["encoded_input"] = True
-        sanitized = TranscriptEntry(
-            timestamp=entry.timestamp,
-            role=entry.role,
-            content=content,
-            tool_name=getattr(entry, "tool_name", ""),
-            tool_call_id=getattr(entry, "tool_call_id", ""),
-            tool_calls=entry.tool_calls,
-            tool_results=entry.tool_results,
-            metadata=metadata,
-        )
-        async with aiofiles.open(transcript_path, "a", encoding="utf-8") as f:
-            await f.write(json.dumps(sanitized.to_dict(), ensure_ascii=False) + "\n")
-        self._invalidate_transcript_cache(session_key)
-        
-        # Update the session timestamp after appending.
-        session.updated_at = datetime.now()
-        await self._save_metadata()
-    
+        await self._load_metadata()
+        lock = await self._get_lock(session_key)
+        async with lock:
+            session = await self._get_or_create_locked(session_key)
+            transcript_path = self._get_transcript_path(session)
+
+            content = entry.content
+            metadata = dict(entry.metadata)
+            if str(entry.role).lower() == "user":
+                content, encoded = encode_if_untrusted(content)
+                if encoded:
+                    metadata["encoded_input"] = True
+            sanitized = TranscriptEntry(
+                timestamp=entry.timestamp,
+                role=entry.role,
+                content=content,
+                tool_name=getattr(entry, "tool_name", ""),
+                tool_call_id=getattr(entry, "tool_call_id", ""),
+                tool_calls=entry.tool_calls,
+                tool_results=entry.tool_results,
+                metadata=metadata,
+            )
+            async with aiofiles.open(transcript_path, "a", encoding="utf-8") as f:
+                await f.write(json.dumps(sanitized.to_dict(), ensure_ascii=False) + "\n")
+            self._invalidate_transcript_cache(session_key)
+
+            # Update the session timestamp after appending.
+            session.updated_at = datetime.now()
+            await self._save_metadata()
+
     async def persist_transcript(
         self,
         session_key: str,
         messages: list[dict],
     ) -> None:
         """Rewrite the transcript from a normalized message list.
+
+        The per-session lock is held across the rewrite so a concurrent
+        append or archive cannot interleave with the atomic replace.
 
         This is primarily used by workflows that replace the full transcript,
         such as compaction or queue-based persistence.
@@ -537,33 +560,36 @@ manager = SessionManager(agents_dir="/path/to/legacy-agents")
             session_key: Serialized session key.
             messages: Normalized message dictionaries.
         """
-        session = await self.get_or_create(session_key)
-        transcript_path = self._get_transcript_path(session)
+        await self._load_metadata()
+        lock = await self._get_lock(session_key)
+        async with lock:
+            session = await self._get_or_create_locked(session_key)
+            transcript_path = self._get_transcript_path(session)
 
-        # Write through a temp file and atomically replace so a crash or
-        # cancellation mid-rewrite cannot truncate the existing transcript.
-        tmp_path = self._build_metadata_tmp_path(transcript_path)
-        async with aiofiles.open(tmp_path, "w", encoding="utf-8") as f:
-            for msg in messages:
-                entry = TranscriptEntry(
-                    role=msg.get("role", "user"),
-                    content=msg.get("content", ""),
-                    tool_name=msg.get("tool_name", msg.get("name", "")),
-                    tool_call_id=msg.get("tool_call_id", msg.get("id", "")),
-                    tool_calls=msg.get("tool_calls", []),
-                    tool_results=msg.get("tool_results", []),
-                    metadata=msg.get("metadata", {}) if isinstance(msg.get("metadata", {}), dict) else {},
-                )
-                if str(entry.role).lower() == "user":
-                    entry.content, encoded = encode_if_untrusted(entry.content)
-                    if encoded:
-                        entry.metadata["encoded_input"] = True
-                await f.write(json.dumps(entry.to_dict(), ensure_ascii=False) + "\n")
-        await self._replace_file_with_retry(tmp_path, transcript_path)
-        self._invalidate_transcript_cache(session_key)
-        
-        session.updated_at = datetime.now()
-        await self._save_metadata()
+            # Write through a temp file and atomically replace so a crash or
+            # cancellation mid-rewrite cannot truncate the existing transcript.
+            tmp_path = self._build_metadata_tmp_path(transcript_path)
+            async with aiofiles.open(tmp_path, "w", encoding="utf-8") as f:
+                for msg in messages:
+                    entry = TranscriptEntry(
+                        role=msg.get("role", "user"),
+                        content=msg.get("content", ""),
+                        tool_name=msg.get("tool_name", msg.get("name", "")),
+                        tool_call_id=msg.get("tool_call_id", msg.get("id", "")),
+                        tool_calls=msg.get("tool_calls", []),
+                        tool_results=msg.get("tool_results", []),
+                        metadata=msg.get("metadata", {}) if isinstance(msg.get("metadata", {}), dict) else {},
+                    )
+                    if str(entry.role).lower() == "user":
+                        entry.content, encoded = encode_if_untrusted(entry.content)
+                        if encoded:
+                            entry.metadata["encoded_input"] = True
+                    await f.write(json.dumps(entry.to_dict(), ensure_ascii=False) + "\n")
+            await self._replace_file_with_retry(tmp_path, transcript_path)
+            self._invalidate_transcript_cache(session_key)
+
+            session.updated_at = datetime.now()
+            await self._save_metadata()
     
     async def reset_session(
         self,

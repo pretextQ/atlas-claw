@@ -96,13 +96,21 @@ class SessionQueue:
             cap: Maximum queued message count per session.
             mode: Default queue mode.
             drop: Overflow strategy when the queue reaches `cap`.
+
+        Raises:
+            ValueError: If max_concurrent or cap is below 1; a zero cap would
+                otherwise surface later as IndexError on the overflow path.
         """
+        if max_concurrent < 1:
+            raise ValueError(f"max_concurrent must be >= 1, got {max_concurrent}")
+        if cap < 1:
+            raise ValueError(f"cap must be >= 1, got {cap}")
         self.max_concurrent = max_concurrent
         self.debounce_ms = debounce_ms
         self.cap = cap
         self.mode = mode
         self.drop = drop
-        
+
         # Per-session serialization locks.
         self._locks: dict[str, asyncio.Semaphore] = defaultdict(lambda: asyncio.Semaphore(1))
         # Global concurrency limit across sessions.
@@ -117,7 +125,30 @@ class SessionQueue:
         self._session_modes: dict[str, QueueMode] = {}
         # Optional mode overrides scoped to channels.
         self._channel_modes: dict[str, QueueMode] = {}
-    
+        # Holders + waiters per session semaphore; lets cleanup drop state for
+        # sessions nobody is using without racing a live run.
+        self._session_refs: dict[str, int] = defaultdict(int)
+        # Upper bound for tracked session state; idle sessions are reclaimed
+        # beyond this so long-running processes do not grow without bound.
+        self._max_tracked_sessions = 4096
+
+    def _evict_idle_sessions(self) -> None:
+        """Drop per-session state for sessions with no holder/waiter and no
+        queued messages. Runs synchronously on the event loop, so the
+        ref-count check and the pops cannot interleave with acquire/release.
+        """
+        if len(self._locks) <= self._max_tracked_sessions:
+            return
+        for key in [k for k, refs in self._session_refs.items() if refs == 0]:
+            if self._queued.get(key):
+                continue
+            self._locks.pop(key, None)
+            self._queued.pop(key, None)
+            self._last_message_time.pop(key, None)
+            self._session_modes.pop(key, None)
+            self._active.pop(key, None)
+            self._session_refs.pop(key, None)
+
     async def acquire(self, session_key: str) -> bool:
         """Acquire execution slots for a session run.
 
@@ -132,13 +163,18 @@ class SessionQueue:
         Returns:
             True once both slots are held.
         """
-        await self._locks[session_key].acquire()
+        self._session_refs[session_key] += 1
         try:
-            await self._global_semaphore.acquire()
+            await self._locks[session_key].acquire()
+            try:
+                await self._global_semaphore.acquire()
+            except BaseException:
+                # Cancellation while waiting for the global permit must not leak
+                # the session slot.
+                self._locks[session_key].release()
+                raise
         except BaseException:
-            # Cancellation while waiting for the global permit must not leak
-            # the session slot.
-            self._locks[session_key].release()
+            self._session_refs[session_key] -= 1
             raise
         self._active[session_key] = True
         return True
@@ -154,6 +190,8 @@ class SessionQueue:
             return
         self._locks[session_key].release()
         self._global_semaphore.release()
+        self._session_refs[session_key] -= 1
+        self._evict_idle_sessions()
     
     def is_active(self, session_key: str) -> bool:
         """Return whether a session currently has an active run."""
