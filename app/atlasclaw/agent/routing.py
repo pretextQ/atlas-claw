@@ -262,8 +262,20 @@ agent
             del self._agents[agent_id]
             # 
             self._bindings = [b for b in self._bindings if b.agent_id != agent_id]
+            # Recomputed after every removal: with the default agent gone the
+            # single-agent shortcut would index a missing entry, and with a
+            # single agent left it must stay on the shortcut path.
+            self._recompute_single_agent_mode()
             return True
         return False
+
+    def _recompute_single_agent_mode(self) -> None:
+        """Keep single-agent mode consistent with the registered agents."""
+        self._single_agent_mode = len(self._agents) <= 1
+        if self._single_agent_mode and self._agents and self._default_agent_id not in self._agents:
+            # The default agent was removed while one agent remains: adopt the
+            # surviving agent so the shortcut cannot index a missing entry.
+            self._default_agent_id = next(iter(self._agents.keys()))
     
     def get_agent(self, agent_id: str) -> Optional[AgentConfig]:
         """
@@ -321,7 +333,12 @@ to agent
 """
         # agentmode return
         if self._single_agent_mode:
-            return self._agents[self._default_agent_id]
+            agent = self._agents.get(self._default_agent_id)
+            if agent is not None:
+                return agent
+            # Defensive: never index a removed default agent.
+            if self._agents:
+                return next(iter(self._agents.values()))
         
         # Binding rule
         for rule in self._bindings:

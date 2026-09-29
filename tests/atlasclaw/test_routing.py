@@ -339,3 +339,54 @@ class TestAgentRouterFactory:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestSingleAgentModeRecomputation:
+    """WP-18/F-0015: removing agents must keep single-agent mode consistent."""
+
+    def test_removing_default_agent_in_single_agent_mode_does_not_raise(self):
+        """The documented repro: single-agent mode kept pointing at the id."""
+        router = AgentRouter(single_agent_mode=True)  # default agent "main"
+        assert router.unregister_agent("main")
+
+        ctx = RoutingContext(peer_id="u1", channel="api")
+        agent = router.route(ctx)  # used to raise KeyError("main")
+        assert agent is not None
+
+    def test_removing_default_agent_does_not_raise(self):
+        router = AgentRouter(single_agent_mode=False)
+        router.register_agent(AgentConfig(id="primary"))
+        router.register_agent(AgentConfig(id="secondary"))
+
+        assert router.unregister_agent("primary")
+
+        ctx = RoutingContext(peer_id="u1", channel="api")
+        agent = router.route(ctx)  # used to raise KeyError on the removed id
+        assert agent.id == "secondary"
+
+    def test_removing_down_to_one_agent_keeps_routing_working(self):
+        router = AgentRouter(single_agent_mode=False)
+        router.register_agent(AgentConfig(id="solo"))
+
+        assert router.unregister_agent("solo")
+        agent = router.route(RoutingContext(peer_id="u1", channel="api"))
+        # No agents left: the documented default configuration is returned.
+        assert agent is not None
+
+    def test_removing_non_default_agent_keeps_default_routing(self):
+        router = AgentRouter(single_agent_mode=False)
+        router.register_agent(AgentConfig(id="keep"))
+        router.register_agent(AgentConfig(id="drop"))
+
+        assert router.unregister_agent("drop")
+        agent = router.route(RoutingContext(peer_id="u1", channel="api"))
+        assert agent.id == "keep"
+
+    def test_single_agent_mode_flag_tracks_remaining_agents(self):
+        router = AgentRouter(single_agent_mode=False)
+        router.register_agent(AgentConfig(id="a"))
+        router.register_agent(AgentConfig(id="b"))
+        assert router.single_agent_mode is False
+
+        router.unregister_agent("b")
+        assert router.single_agent_mode is True
