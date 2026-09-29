@@ -69,12 +69,27 @@ def normalize_memory_section(section: Any) -> str:
 # Per-file write locks shared by every manager instance. A lock owned by one
 # instance cannot serialize concurrent requests, because per-request managers
 # are created through ``MemoryManager.for_user``.
+# Markdown heading marker: '#'..'######' followed by whitespace. Distinguishes
+# real headings from content lines that merely start with '#'.
+_HEADING_PATTERN = re.compile(r"^#{1,6}\s")
+
 _path_write_locks: dict[str, asyncio.Lock] = {}
 
 
 def _write_lock_for(path: Path) -> asyncio.Lock:
-    """Return the process-wide write lock guarding one memory file."""
-    key = str(path)
+    """Return the process-wide write lock guarding one memory file.
+
+    The registry is keyed on the resolved, case-normalized absolute path: two
+    spellings of the same file (relative vs absolute, different drive-letter
+    case on Windows) must share one lock, otherwise concurrent writers are
+    not actually serialized.
+    """
+    try:
+        key = str(Path(path).expanduser().resolve())
+    except OSError:
+        key = str(path)
+    if os.name == "nt":
+        key = key.lower()
     lock = _path_write_locks.get(key)
     if lock is None:
         lock = asyncio.Lock()
@@ -469,7 +484,13 @@ class MemoryManager:
                 heading = stripped[3:].strip().lower()
                 in_requested_section = heading == normalized_section
                 continue
-            if stripped.startswith("#") or stripped.startswith("*"):
+            # Only genuine structure is skipped: Markdown headings (a '#'
+            # followed by whitespace) and emphasis decorations wrapped in
+            # asterisks. A memory entry that merely begins with '#' or '*'
+            # (e.g. "#tag entry") is content and must be readable back.
+            if _HEADING_PATTERN.match(stripped):
+                continue
+            if stripped.startswith("*") and stripped.endswith("*") and len(stripped) > 1:
                 continue
             if in_requested_section:
                 candidates.append((line_number, stripped))
