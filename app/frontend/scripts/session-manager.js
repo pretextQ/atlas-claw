@@ -68,16 +68,36 @@ export async function initializeIntegrationChatSession(surface) {
         nonce: surface.nonce,
         candidateSessionKey: null
     };
-    const profile = await bootstrapEmbedIntegration(request);
+    // A rejected or empty bootstrap must not leave the module in a
+    // half-initialized state (generation bumped, validated keys cleared).
+    let profile = null;
+    try {
+        profile = await bootstrapEmbedIntegration(request);
+    } catch (error) {
+        console.warn('[Session] Chat Active Session bootstrap failed:', error);
+    }
+    if (!profile || typeof profile !== 'object') {
+        integrationChatSession = null;
+        currentSessionKey = null;
+        currentSessionHasMessages = null;
+        return null;
+    }
     const storageKey = buildScopedChatSessionKey(profile.agent_id, profile.session_scope);
     const candidate = localStorage.getItem(storageKey);
     let validatedProfile = profile;
 
     if (candidate) {
-        validatedProfile = await bootstrapEmbedIntegration({
-            ...request,
-            candidateSessionKey: candidate
-        });
+        try {
+            const nextProfile = await bootstrapEmbedIntegration({
+                ...request,
+                candidateSessionKey: candidate
+            });
+            if (nextProfile && typeof nextProfile === 'object') {
+                validatedProfile = nextProfile;
+            }
+        } catch (error) {
+            console.warn('[Session] Chat Active Session re-validation failed:', error);
+        }
         if (validatedProfile.active_session_key !== candidate) {
             localStorage.removeItem(storageKey);
         }

@@ -56,7 +56,9 @@ export function installAuthFetchInterceptor() {
       url = rewriteManagedAppUrl(input)
       input = url
     } else if (input && typeof input.url === 'string') {
-      url = input.url
+      // Request objects take the same managed-URL rewriting as string inputs,
+      // otherwise rewrite-dependent API detection silently diverges.
+      url = rewriteManagedAppUrl(input.url)
     }
 
     // Only same-origin API requests may carry the bearer token and

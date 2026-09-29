@@ -13,9 +13,11 @@ export function restoreInputFocus(root, selector, selectionStart, selectionEnd) 
   }
 
   if (typeof input.setSelectionRange !== 'function') return
-  const fallbackPosition = input.value.length
-  const start = Number.isInteger(selectionStart) ? selectionStart : fallbackPosition
-  const end = Number.isInteger(selectionEnd) ? selectionEnd : start
+  const maxPosition = input.value.length
+  const fallbackPosition = maxPosition
+  const clamp = value => Math.min(Math.max(value, 0), maxPosition)
+  const start = clamp(Number.isInteger(selectionStart) ? selectionStart : fallbackPosition)
+  const end = clamp(Number.isInteger(selectionEnd) ? selectionEnd : start)
   try {
     input.setSelectionRange(start, end)
   } catch (_error) {

@@ -36,6 +36,9 @@ const handleExternalChatSessionChange = (event) => {
     return
   }
   currentSessionKey = null
+  // Persist the clear: every other clearing path calls setSessionKey(null),
+  // otherwise a reload restores the session that was just cleared.
+  setSessionKey(null)
   embedContextController?.resetActionInteraction()
   void activateSession(null)
 }

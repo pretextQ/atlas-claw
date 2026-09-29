@@ -111,7 +111,13 @@ export async function loadLocale(locale) {
             throw new Error(`HTTP ${response.status}`);
         }
         
-        translations = await response.json();
+        const payload = await response.json();
+        if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+            // A shape mismatch (null/array/HTML) would make every
+            // Object.keys(translations) call below throw.
+            throw new Error('locale payload is not an object');
+        }
+        translations = payload;
         currentLocale = locale;
         localeLoaded = true;
         
@@ -200,7 +206,9 @@ export async function setLocale(locale) {
     }
     
     await loadLocale(locale);
-    saveLocale(locale);
+    // Persist the locale that actually loaded: persisting the requested value
+    // would restore a locale that is not active (e.g. an unsupported one).
+    saveLocale(currentLocale || DEFAULT_LOCALE);
     
     // Update all elements with data-i18n attribute
     updatePageTranslations();

@@ -236,13 +236,17 @@ class SlashCapabilityPicker {
       try {
         this.capabilities = await sharedLoadPromise
         this.lastLoadedAt = sharedLoadedAt
-      } finally {
         this.loading = false
         if (!silent || !this.popup.hidden) {
           this.updateFilter()
         }
+        return
+      } catch (error) {
+        // The shared load rejected: log it and fall through to a fresh load
+        // instead of letting the rejection escape as an unhandled promise.
+        console.warn('[SlashPicker] Shared capability load failed:', error)
+        this.loading = false
       }
-      return
     }
 
     this.loading = !silent && !this.capabilities.length

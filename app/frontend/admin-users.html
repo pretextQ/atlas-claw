@@ -7,12 +7,22 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>User Management - AtlasClaw</title>
-  <meta http-equiv="refresh" content="0; url=/admin/users">
   <script>
-    window.location.replace('/admin/users')
+    // Base-path aware redirect: the absolute '/admin/users' 404s behind a
+    // reverse-proxy sub-path. __ATLASCLAW_BASE_PATH_JSON__ is substituted by
+    // the server the same way index.html/login.html are rendered.
+    (() => {
+      const basePath = String(__ATLASCLAW_BASE_PATH_JSON__ || '').replace(/\/$/, '')
+      const target = `${basePath}/admin/users`
+      window.location.replace(target)
+      document.addEventListener('DOMContentLoaded', () => {
+        const link = document.getElementById('redirect-link')
+        if (link) link.setAttribute('href', target)
+      })
+    })()
   </script>
 </head>
 <body>
-  <p>Redirecting to <a href="/admin/users">/admin/users</a>...</p>
+  <p>Redirecting to <a id="redirect-link" href="/admin/users">/admin/users</a>...</p>
 </body>
 </html>

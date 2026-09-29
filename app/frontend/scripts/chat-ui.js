@@ -1478,7 +1478,10 @@ function buildRuntimePanel(
   const chips = chipEntries.map((entry, index) => {
     const label = getRuntimeStateLabel(entry.state)
     const activeClass = !hasTerminalState && index === chipEntries.length - 1 ? ' active' : ''
-    return `<span class="runtime-chip ${entry.state || ''}${activeClass}">${escapeHtml(label)}</span>`
+    // The state token is server-derived: restrict it to the class-name
+    // charset instead of interpolating it verbatim into the attribute.
+    const stateClass = String(entry.state || '').toLowerCase().replace(/[^a-z0-9_-]/g, '')
+    return `<span class="runtime-chip ${stateClass}${activeClass}">${escapeHtml(label)}</span>`
   }).join('')
   const logs = displayEntries.map((entry, index) => {
     const label = getRuntimeStateLabel(entry.state)

@@ -1539,6 +1539,11 @@ async function saveRole() {
 
   try {
     const savedRole = await fetchJson(endpoint, requestOptions)
+    if (!savedRole || typeof savedRole !== 'object' || !savedRole.id) {
+      // fetchJson returns null for 204/empty bodies: dereferencing it would
+      // throw after a successful-but-empty save.
+      throw new Error('Role save returned no role payload')
+    }
     showToast(translateOrFallback(draftRoleState.isNew ? 'roles.createSuccess' : 'roles.saveSuccess', draftRoleState.isNew ? 'Role created successfully' : 'Role saved successfully'), 'success')
     selectedRoleId = savedRole.id
     await loadRoles(savedRole.id)
@@ -1718,7 +1723,12 @@ function setupEventListeners() {
 export async function mount(containerEl) {
   container = containerEl
   document.body.classList.add('role-management-active')
-  const user = getAuthInfo() || await checkAuth({ redirect: true })
+  let user = getAuthInfo()
+  try {
+    user = user || await checkAuth({ redirect: true })
+  } catch (error) {
+    console.warn('[Auth] checkAuth failed:', error)
+  }
   if (!user) {
     document.body.classList.remove('role-management-active')
     return

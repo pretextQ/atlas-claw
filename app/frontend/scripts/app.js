@@ -136,7 +136,14 @@ export async function initApp() {
     installAuthFetchInterceptor()
 
     // 2. Check auth (redirect to login.html if not authenticated)
-    const authInfo = await checkAuth({ redirect: true })
+    // A failed auth check must not abort module evaluation: the page would
+    // render without any of the handlers below ever being registered.
+    let authInfo = null
+    try {
+        authInfo = await checkAuth({ redirect: true })
+    } catch (error) {
+        console.warn('[App] Auth check failed:', error)
+    }
     if (!authInfo) {
       return
     }
@@ -252,19 +259,24 @@ function setupLinkInterception() {
 
     // Skip navigation for:
     // - Empty or no href
-    // - External links (http://, https://, //)
+    // - Any non-app scheme (http:, https:, mailto:, tel:, javascript:, ...)
+    // - Protocol-relative and external links
     // - New tab links (target="_blank")
     // - API endpoints
     // - Hash links
-    // - Login page links
+    // - The login page itself (exact route, not a substring match: a route
+    //   such as /account/login-history must stay navigable)
     // - Download links
+    const loginRoutes = ['/login', '/login.html']
+    const hasNonAppScheme = /^[a-z][a-z0-9+.-]*:/i.test(href) && !/^https?:/i.test(href)
     if (!href ||
+        hasNonAppScheme ||
         href.startsWith('http') ||
         href.startsWith('//') ||
         link.target === '_blank' ||
         href.startsWith('/api/') ||
         href.startsWith('#') ||
-        href.includes('login') ||
+        loginRoutes.includes(href.split(/[?#]/, 1)[0]) ||
         link.hasAttribute('download')) {
       return
     }

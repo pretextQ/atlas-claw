@@ -488,6 +488,9 @@ function enterProfileEditMode() {
 }
 
 function populateProfile(profile) {
+  // The page may have been unmounted while fetchProfile() was in flight;
+  // touching containerRef then throws and mutates state after teardown.
+  if (!containerRef) return
   currentProfile = profile
   notifyProfileUpdated(profile)
 
@@ -601,6 +604,7 @@ async function loadProfile() {
 }
 
 function syncProfileDraft() {
+  if (!containerRef) return
   const draftName = containerRef.querySelector('#accountDisplayName').value.trim()
   const draftEmail = containerRef.querySelector('#accountEmail').value.trim()
 
@@ -810,7 +814,12 @@ export async function mount(container, { params, route } = {}) {
 
   containerRef = container
 
-  const user = await checkAuth({ redirect: true })
+  let user = null
+  try {
+    user = await checkAuth({ redirect: true })
+  } catch (error) {
+    console.warn('[AccountSettings] Auth check failed:', error)
+  }
   if (!user) {
     return
   }

@@ -155,7 +155,13 @@ export function createStreamHandler(runId, callbacks = {}) {
             return {};
         }
         try {
-            return JSON.parse(data);
+            const parsed = JSON.parse(data);
+            // "null" (and other non-object payloads) would make every
+            // data.<field> access at the call sites throw.
+            if (!parsed || typeof parsed !== 'object') {
+                return {};
+            }
+            return parsed;
         } catch (e) {
             console.warn('[Stream] Failed to parse event data:', data);
             return {};

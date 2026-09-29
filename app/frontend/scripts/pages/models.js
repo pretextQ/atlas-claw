@@ -664,18 +664,21 @@ function updateModelIdOptions(provider, currentValue) {
   select.innerHTML = html
 
   // If currentValue exists but not in the list, select custom and show input
-  if (currentValue && !models.includes(currentValue) && currentValue !== '__custom__') {
+  const showCustomInput = Boolean(
+    currentValue && !models.includes(currentValue) && currentValue !== '__custom__'
+  )
+  if (showCustomInput) {
     select.value = '__custom__'
-    customInput.style.display = 'block'
-    customInput.value = currentValue
   } else if (currentValue && models.includes(currentValue)) {
     select.value = currentValue
-    customInput.style.display = 'none'
-    customInput.value = ''
   } else {
     select.value = ''
-    customInput.style.display = 'none'
-    customInput.value = ''
+  }
+  // The custom input is a separate element and may be absent; guard it like
+  // `select` above instead of throwing on a missing node.
+  if (customInput) {
+    customInput.style.display = showCustomInput ? 'block' : 'none'
+    customInput.value = showCustomInput ? currentValue : ''
   }
 }
 

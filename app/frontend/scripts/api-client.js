@@ -275,7 +275,7 @@ export async function startAgentRun(sessionKey, message) {
  * @returns {Promise<object>} Status info
  */
 export async function getAgentStatus(runId) {
-    const response = await fetch(buildApiUrl(`/api/agent/runs/${runId}`), {
+    const response = await fetch(buildApiUrl(`/api/agent/runs/${encodeURIComponent(runId)}`), {
         credentials: 'include'
     });
     
@@ -292,7 +292,7 @@ export async function getAgentStatus(runId) {
  * @returns {Promise<object>} Result
  */
 export async function abortAgentRun(runId) {
-    const response = await fetch(buildApiUrl(`/api/agent/runs/${runId}/abort`), {
+    const response = await fetch(buildApiUrl(`/api/agent/runs/${encodeURIComponent(runId)}/abort`), {
         method: 'POST',
         credentials: 'include'
     });

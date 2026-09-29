@@ -77,9 +77,12 @@ export function createRouter(routes, options = {}) {
   // Current mounted page module (with unmount method)
   let currentPage = null
   let currentPath = ''
+  // Monotonic navigation token; a stale load bails out after every await.
+  let navigationSequence = 0
 
   function normalizeRoutePath(path) {
-    const strippedPath = stripBasePath(String(path || '/').split(/[?#]/, 1)[0] || '/')
+    const rawPath = typeof path === 'string' ? path : String(path ?? '')
+    const strippedPath = stripBasePath(rawPath.split(/[?#]/, 1)[0] || '/')
     if (!strippedPath || strippedPath === '') {
       return '/'
     }
@@ -119,6 +122,11 @@ export function createRouter(routes, options = {}) {
       return
     }
 
+    // Navigation token: overlapping navigations (fast clicks, popstate during
+    // a pending load) would otherwise let an older load mount over a newer
+    // route or unmount the wrong page.
+    const navigationToken = ++navigationSequence
+
     // Call before route hook
     if (onBeforeRoute) {
       try {
@@ -132,6 +140,7 @@ export function createRouter(routes, options = {}) {
         console.error('[Router] onBeforeRoute error:', err)
         return
       }
+      if (navigationToken !== navigationSequence) return
     }
 
     // Unmount current page if exists
@@ -142,6 +151,8 @@ export function createRouter(routes, options = {}) {
         console.error('[Router] Page unmount error:', err)
       }
     }
+
+    if (navigationToken !== navigationSequence) return
 
     currentPage = null
     currentPath = normalizedPath
@@ -154,6 +165,7 @@ export function createRouter(routes, options = {}) {
     // Load page module via dynamic import
     try {
       const pageModule = await route.loader()
+      if (navigationToken !== navigationSequence) return
 
       // Mount new page
       if (pageModule && typeof pageModule.mount === 'function') {

@@ -1174,7 +1174,9 @@ async function handleFormSubmit(event) {
     isEdit,
     authInfo: currentViewerAuthInfo,
     existingRoles: isEdit
-      ? (currentFetchedUsers.find(user => user.id === editUserId)?.roles || {})
+      // editUserId comes from an <input> (always a string) while user.id may
+      // be a number: a strict comparison silently loses the existing roles.
+      ? (currentFetchedUsers.find(user => String(user.id) === String(editUserId))?.roles || {})
       : null,
     values: {
       username,
@@ -1268,7 +1270,12 @@ export async function mount(containerEl, { params, route } = {}) {
   console.log('[AdminUsersPage] Mounting...')
   container = containerEl
 
-  const user = getAuthInfo() || await checkAuth({ redirect: true })
+  let user = getAuthInfo()
+  try {
+    user = user || await checkAuth({ redirect: true })
+  } catch (error) {
+    console.warn('[Auth] checkAuth failed:', error)
+  }
   if (!user) return
   currentViewerAuthInfo = user
   if (!canAccessUserManagement(user)) {
