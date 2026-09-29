@@ -117,14 +117,20 @@ export function getSidebarContent() {
 
 /**
  * Set sidebar dynamic content
- * @param {string|HTMLElement} content - HTML string or element
+ *
+ * String content is inserted as plain text (textContent), never parsed as
+ * HTML — user-derived or remotely fetched strings must not be able to
+ * inject markup. To render rich content, build an HTMLElement (e.g. with
+ * document.createElement) and pass that instead.
+ *
+ * @param {string|HTMLElement} content - Plain text or a prebuilt element
  */
 export function setSidebarContent(content) {
   const container = getSidebarContent()
   if (!container) return
 
   if (typeof content === 'string') {
-    container.innerHTML = content
+    container.textContent = content
   } else if (content instanceof HTMLElement) {
     container.innerHTML = ''
     container.appendChild(content)

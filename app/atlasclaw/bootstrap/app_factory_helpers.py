@@ -35,6 +35,22 @@ def _resolve_app_base_path(app: FastAPI) -> str:
     return normalize_base_path(getattr(config, "base_path", "")) or _resolve_base_path()
 
 
+def _script_safe_json(value: str) -> str:
+    """JSON-encode a value for safe inlining into an HTML <script> block.
+
+    ``json.dumps`` alone does not escape ``<``/``>``, so a value containing
+    ``</script>`` could terminate the block and inject markup. Escaping
+    ``<``, ``>`` and ``&`` as unicode escapes keeps the JSON value identical
+    once parsed while making HTML breakout impossible.
+    """
+    encoded = json.dumps(value)
+    return (
+        encoded.replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+    )
+
+
 def render_frontend_html(frontend_path: Path) -> HTMLResponse | dict[str, str]:
     if not frontend_path.exists():
         return {"error": "Frontend not found"}
@@ -42,7 +58,7 @@ def render_frontend_html(frontend_path: Path) -> HTMLResponse | dict[str, str]:
     content = frontend_path.read_text(encoding="utf-8")
     base_path = _resolve_base_path()
     content = content.replace(_BASE_PATH_TOKEN, base_path)
-    content = content.replace(_BASE_PATH_JSON_TOKEN, json.dumps(base_path))
+    content = content.replace(_BASE_PATH_JSON_TOKEN, _script_safe_json(base_path))
     return HTMLResponse(content=content)
 
 

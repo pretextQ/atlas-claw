@@ -320,6 +320,19 @@ describe('Permission-aware create flow', () => {
           }
         }
       },
+      // WP-03: role sanitization is fail-closed, so the catalog must be
+      // loaded (as the real page does) for `viewer` to remain assignable.
+      availableRoles: [
+        {
+          identifier: 'viewer',
+          name: 'Viewer',
+          permissions: {
+            skills: { module_permissions: { view: true }, skill_permissions: [] },
+            users: { view: true },
+            roles: { view: true }
+          }
+        }
+      ],
       values: {
         username: 'blocked-admin',
         password: 'password123',

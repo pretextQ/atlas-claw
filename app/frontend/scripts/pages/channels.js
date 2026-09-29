@@ -625,7 +625,7 @@ function renderSelectOptions(options, selectedValue, { includeBlankOption = fals
     const value = String(option?.value || '')
     const label = String(option?.label || value)
     const selected = normalizedSelectedValue === value ? 'selected' : ''
-    return `<option value="${value}" ${selected}>${label}</option>`
+    return `<option value="${escapeHtml(value)}" ${selected}>${escapeHtml(label)}</option>`
   })
 
   if (!includeBlankOption) {
@@ -1942,13 +1942,13 @@ function renderConnectionRow(conn) {
   const deleteTitle = t('channel.delete')
 
   return `
-    <div class="ch-table-row" data-conn-id="${conn.id}">
+    <div class="ch-table-row" data-conn-id="${escapeHtml(conn.id)}">
       <div class="ch-cell-name">
         <span class="ch-status-dot ${statusMeta.className}"></span>
         <div class="ch-cell-name-content">
           <span class="ch-cell-name-text">${escapeHtml(connectionName)}</span>
         </div>
-        <span class="ch-id-badge">${idLabel}:${idShort}</span>
+        <span class="ch-id-badge">${escapeHtml(idLabel)}:${escapeHtml(idShort)}</span>
       </div>
       <div class="ch-cell-type">
         ${CHANNEL_ICONS[conn.channel_type] || CHANNEL_ICONS.default}
@@ -1958,12 +1958,12 @@ function renderConnectionRow(conn) {
         <span class="ch-status-badge ${statusMeta.className}">${statusMeta.text}</span>
       </div>
       <div class="ch-cell-settings">
-        <button type="button" class="ch-toggle ${conn.enabled ? 'checked' : ''}" data-conn-id="${conn.id}" data-action="toggle"></button>
+        <button type="button" class="ch-toggle ${conn.enabled ? 'checked' : ''}" data-conn-id="${escapeHtml(conn.id)}" data-action="toggle"></button>
         <span class="ch-toggle-label">${toggleLabel}</span>
       </div>
       <div class="ch-cell-actions">
-        <button class="ch-action-btn" data-conn-id="${conn.id}" data-action="edit" title="${editTitle}" aria-label="${editTitle}">${ACTION_ICONS.edit}</button>
-        <button class="ch-action-btn delete" data-conn-id="${conn.id}" data-action="delete" title="${deleteTitle}" aria-label="${deleteTitle}">${ACTION_ICONS.delete}</button>
+        <button class="ch-action-btn" data-conn-id="${escapeHtml(conn.id)}" data-action="edit" title="${escapeHtml(editTitle)}" aria-label="${escapeHtml(editTitle)}">${ACTION_ICONS.edit}</button>
+        <button class="ch-action-btn delete" data-conn-id="${escapeHtml(conn.id)}" data-action="delete" title="${escapeHtml(deleteTitle)}" aria-label="${escapeHtml(deleteTitle)}">${ACTION_ICONS.delete}</button>
       </div>
     </div>
   `
@@ -2329,7 +2329,7 @@ async function renderEditView(type, editId) {
         <h1 data-i18n="channel.channelConnection">Channel Connection</h1>
         <p data-i18n="channel.channelConnectionDesc">Configure how your AI agents communicate with external platforms. Ensure credentials match your provider's developer console.</p>
       </div>
-      <div class="ch-connection-status ${statusMeta.className}" id="editConnectionStatus" data-conn-id="${connectionData.id || ''}">
+      <div class="ch-connection-status ${statusMeta.className}" id="editConnectionStatus" data-conn-id="${escapeHtml(connectionData.id || '')}">
         ${statusMeta.currentText}
       </div>
     </div>
@@ -2551,31 +2551,31 @@ function renderConfigForm(schema, values = {}) {
           html += `
             <div class="ch-form-row" ${showWhenAttr} style="${shouldShow ? '' : 'display: none;'}">
               <div class="ch-form-group">
-                <label class="ch-form-label">${title.toUpperCase()} ${isRequired ? '<span class="required">*</span>' : ''}</label>
-                <select name="${key}" class="ch-form-select" data-mode-selector="${key === 'connection_mode'}">
+                <label class="ch-form-label">${escapeHtml(title).toUpperCase()} ${isRequired ? '<span class="required">*</span>' : ''}</label>
+                <select name="${escapeHtml(key)}" class="ch-form-select" data-mode-selector="${key === 'connection_mode'}">
                   ${prop.enum.map(opt => {
                     const label = getFieldText(`${key}.${opt}`, 'label', enumLabels[opt] || opt)
                     const selected = value === opt ? 'selected' : ''
-                    return `<option value="${opt}" ${selected}>${label}</option>`
+                    return `<option value="${escapeHtml(opt)}" ${selected}>${escapeHtml(label)}</option>`
                   }).join('')}
                 </select>
-                ${description ? `<span class="ch-form-hint">${description}</span>` : ''}
+                ${description ? `<span class="ch-form-hint">${escapeHtml(description)}</span>` : ''}
               </div>
               <div class="ch-form-group">
-                <label class="ch-form-label">${secondTitle.toUpperCase()} ${secondIsRequired ? '<span class="required">*</span>' : ''}</label>
+                <label class="ch-form-label">${escapeHtml(secondTitle).toUpperCase()} ${secondIsRequired ? '<span class="required">*</span>' : ''}</label>
                 ${secondIsPassword ? `
                   <div class="ch-password-wrapper">
-                    <input type="password" class="ch-form-input" name="${secondKey}" value="${secondValue}" 
-                           placeholder="${secondPlaceholder}" ${secondIsRequired ? 'data-conditional-required="true"' : ''}>
-                    <button type="button" class="ch-password-toggle" data-target="${secondKey}">
+                    <input type="password" class="ch-form-input" name="${escapeHtml(secondKey)}" value="${escapeHtml(secondValue)}" 
+                           placeholder="${escapeHtml(secondPlaceholder)}" ${secondIsRequired ? 'data-conditional-required="true"' : ''}>
+                    <button type="button" class="ch-password-toggle" data-target="${escapeHtml(secondKey)}">
                       ${ACTION_ICONS.eye}
                     </button>
                   </div>
                 ` : `
-                  <input type="text" class="ch-form-input" name="${secondKey}" value="${secondValue}" 
-                         placeholder="${secondPlaceholder}" ${secondIsRequired ? 'data-conditional-required="true"' : ''}>
+                  <input type="text" class="ch-form-input" name="${escapeHtml(secondKey)}" value="${escapeHtml(secondValue)}" 
+                         placeholder="${escapeHtml(secondPlaceholder)}" ${secondIsRequired ? 'data-conditional-required="true"' : ''}>
                 `}
-                ${secondDescription ? `<span class="ch-form-hint">${secondDescription}</span>` : ''}
+                ${secondDescription ? `<span class="ch-form-hint">${escapeHtml(secondDescription)}</span>` : ''}
               </div>
             </div>
           `
@@ -2587,36 +2587,36 @@ function renderConfigForm(schema, values = {}) {
           html += `
             <div class="ch-form-row" ${showWhenAttr} style="${shouldShow ? '' : 'display: none;'}">
               <div class="ch-form-group">
-                <label class="ch-form-label">${title.toUpperCase()} ${isRequired ? '<span class="required">*</span>' : ''}</label>
+                <label class="ch-form-label">${escapeHtml(title).toUpperCase()} ${isRequired ? '<span class="required">*</span>' : ''}</label>
                 ${isPassword ? `
                   <div class="ch-password-wrapper">
-                    <input type="password" class="ch-form-input" name="${key}" value="${value}" 
-                           placeholder="${placeholder}" ${isRequired ? 'data-conditional-required="true"' : ''}>
-                    <button type="button" class="ch-password-toggle" data-target="${key}">
+                    <input type="password" class="ch-form-input" name="${escapeHtml(key)}" value="${escapeHtml(value)}" 
+                           placeholder="${escapeHtml(placeholder)}" ${isRequired ? 'data-conditional-required="true"' : ''}>
+                    <button type="button" class="ch-password-toggle" data-target="${escapeHtml(key)}">
                       ${ACTION_ICONS.eye}
                     </button>
                   </div>
                 ` : `
-                  <input type="text" class="ch-form-input" name="${key}" value="${value}" 
-                         placeholder="${placeholder}" ${isRequired ? 'data-conditional-required="true"' : ''}>
+                  <input type="text" class="ch-form-input" name="${escapeHtml(key)}" value="${escapeHtml(value)}" 
+                         placeholder="${escapeHtml(placeholder)}" ${isRequired ? 'data-conditional-required="true"' : ''}>
                 `}
-                ${description ? `<span class="ch-form-hint">${description}</span>` : ''}
+                ${description ? `<span class="ch-form-hint">${escapeHtml(description)}</span>` : ''}
               </div>
               <div class="ch-form-group">
-                <label class="ch-form-label">${secondTitle.toUpperCase()} ${secondIsRequired ? '<span class="required">*</span>' : ''}</label>
+                <label class="ch-form-label">${escapeHtml(secondTitle).toUpperCase()} ${secondIsRequired ? '<span class="required">*</span>' : ''}</label>
                 ${secondIsPassword ? `
                   <div class="ch-password-wrapper">
-                    <input type="password" class="ch-form-input" name="${secondKey}" value="${secondValue}" 
-                           placeholder="${secondPlaceholder}" ${secondIsRequired ? 'data-conditional-required="true"' : ''}>
-                    <button type="button" class="ch-password-toggle" data-target="${secondKey}">
+                    <input type="password" class="ch-form-input" name="${escapeHtml(secondKey)}" value="${escapeHtml(secondValue)}" 
+                           placeholder="${escapeHtml(secondPlaceholder)}" ${secondIsRequired ? 'data-conditional-required="true"' : ''}>
+                    <button type="button" class="ch-password-toggle" data-target="${escapeHtml(secondKey)}">
                       ${ACTION_ICONS.eye}
                     </button>
                   </div>
                 ` : `
-                  <input type="text" class="ch-form-input" name="${secondKey}" value="${secondValue}" 
-                         placeholder="${secondPlaceholder}" ${secondIsRequired ? 'data-conditional-required="true"' : ''}>
+                  <input type="text" class="ch-form-input" name="${escapeHtml(secondKey)}" value="${escapeHtml(secondValue)}" 
+                         placeholder="${escapeHtml(secondPlaceholder)}" ${secondIsRequired ? 'data-conditional-required="true"' : ''}>
                 `}
-                ${secondDescription ? `<span class="ch-form-hint">${secondDescription}</span>` : ''}
+                ${secondDescription ? `<span class="ch-form-hint">${escapeHtml(secondDescription)}</span>` : ''}
               </div>
             </div>
           `
@@ -2649,11 +2649,11 @@ function renderConfigForm(schema, values = {}) {
 
       html += `
         <div class="${getFieldGroupClassName(key)}" ${showWhenAttr} style="${shouldShow ? '' : 'display: none;'}">
-          <label class="ch-form-label">${title.toUpperCase()} ${isRequired ? '<span class="required">*</span>' : ''}</label>
-          <select name="${key}" class="ch-form-select" ${selectAttributes.join(' ')}>
+          <label class="ch-form-label">${escapeHtml(title).toUpperCase()} ${isRequired ? '<span class="required">*</span>' : ''}</label>
+          <select name="${escapeHtml(key)}" class="ch-form-select" ${selectAttributes.join(' ')}>
             ${optionMarkup}
           </select>
-          ${description ? `<span class="ch-form-hint">${description}</span>` : ''}
+          ${description ? `<span class="ch-form-hint">${escapeHtml(description)}</span>` : ''}
         </div>
       `
       continue
@@ -2666,20 +2666,20 @@ function renderConfigForm(schema, values = {}) {
 
     html += `
       <div class="${getFieldGroupClassName(key)}" ${showWhenAttr} style="${shouldShow ? '' : 'display: none;'}">
-        <label class="ch-form-label">${title.toUpperCase()} ${isRequired ? '<span class="required">*</span>' : ''}</label>
+        <label class="ch-form-label">${escapeHtml(title).toUpperCase()} ${isRequired ? '<span class="required">*</span>' : ''}</label>
         ${isPassword ? `
           <div class="ch-password-wrapper">
-            <input type="${inputType}" class="ch-form-input" name="${key}" value="${value}" 
-                   placeholder="${placeholder}" ${isRequired ? 'data-conditional-required="true"' : ''}>
-            <button type="button" class="ch-password-toggle" data-target="${key}">
+            <input type="${inputType}" class="ch-form-input" name="${escapeHtml(key)}" value="${escapeHtml(value)}" 
+                   placeholder="${escapeHtml(placeholder)}" ${isRequired ? 'data-conditional-required="true"' : ''}>
+            <button type="button" class="ch-password-toggle" data-target="${escapeHtml(key)}">
               ${ACTION_ICONS.eye}
             </button>
           </div>
         ` : `
-          <input type="${inputType}" class="ch-form-input" name="${key}" value="${value}" 
-                 placeholder="${placeholder}" ${isRequired ? 'data-conditional-required="true"' : ''}>
+          <input type="${inputType}" class="ch-form-input" name="${escapeHtml(key)}" value="${escapeHtml(value)}" 
+                 placeholder="${escapeHtml(placeholder)}" ${isRequired ? 'data-conditional-required="true"' : ''}>
         `}
-        ${description ? `<span class="ch-form-hint">${description}</span>` : ''}
+        ${description ? `<span class="ch-form-hint">${escapeHtml(description)}</span>` : ''}
       </div>
     `
   }

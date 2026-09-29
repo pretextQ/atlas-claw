@@ -656,7 +656,9 @@ function updateModelIdOptions(provider, currentValue) {
   // Build options
   let html = `<option value="" disabled>${t('model.modelIdPlaceholder')}</option>`
   models.forEach(m => {
-    html += `<option value="${m}"${m === currentValue ? ' selected' : ''}>${m}</option>`
+    // Model names come from the server API and localStorage, so both the
+    // attribute value and the text must be escaped before innerHTML.
+    html += `<option value="${escapeHtml(m)}"${m === currentValue ? ' selected' : ''}>${escapeHtml(m)}</option>`
   })
   html += `<option value="__custom__">${t('model.customModelId')}</option>`
   select.innerHTML = html

@@ -5,10 +5,24 @@
 
 from __future__ import annotations
 
+# RFC 3986 pchar subset allowed in a base path. Anything else (angle
+# brackets, quotes, backslashes, control characters, ...) is dropped so the
+# value can never break out of a URL path, an HTML attribute, or an inline
+# <script> block when the frontend renders it.
+_SAFE_BASE_PATH_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    "-._~!$&'()*+,;=:@%/"
+)
+
 
 def normalize_base_path(base_path: str | None) -> str:
-    """Normalize a configured base path to '' or '/segment[/child]'."""
+    """Normalize a configured base path to '' or '/segment[/child]'.
+
+    Characters outside the safe URL-path set are stripped before
+    normalization, so a hostile configuration value cannot inject markup.
+    """
     raw = str(base_path or "").strip()
+    raw = "".join(ch for ch in raw if ch in _SAFE_BASE_PATH_CHARS)
     if not raw or raw == "/":
         return ""
     if not raw.startswith("/"):

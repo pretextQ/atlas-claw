@@ -48,7 +48,7 @@ export function installAuthFetchInterceptor() {
   const rawFetch = window.fetch.bind(window)
   window.fetch = (input, init = {}) => {
     const nextInit = { ...init }
-    const headers = new Headers(nextInit.headers || {})
+    const headers = new Headers(nextInit.headers || (input && typeof input === 'object' && input.headers) || {})
     const token = getAuthToken()
 
     let url = ''
@@ -59,14 +59,26 @@ export function installAuthFetchInterceptor() {
       url = input.url
     }
 
-    const isApiRequest = url.includes('/api/')
-    const isLocalLogin = url.includes('/api/auth/local/login')
-    if (isApiRequest && !isLocalLogin && token && !headers.has(AUTH_HEADER_NAME)) {
+    // Only same-origin API requests may carry the bearer token and
+    // credentials; a URL that merely contains "/api/" (e.g. a cross-origin
+    // "https://evil.com/api/collect") must never receive them.
+    let isSameOriginApi = false
+    try {
+      const resolved = new URL(url, window.location.origin)
+      isSameOriginApi = resolved.origin === window.location.origin
+        && resolved.pathname.includes('/api/')
+    } catch (error) {
+      isSameOriginApi = false
+    }
+    const isLocalLogin = isSameOriginApi && url.includes('/api/auth/local/login')
+    if (isSameOriginApi && !isLocalLogin && token && !headers.has(AUTH_HEADER_NAME)) {
       headers.set(AUTH_HEADER_NAME, token)
     }
 
     nextInit.headers = headers
-    nextInit.credentials = nextInit.credentials || 'include'
+    if (isSameOriginApi) {
+      nextInit.credentials = nextInit.credentials || 'include'
+    }
     return rawFetch(input, nextInit)
   }
 

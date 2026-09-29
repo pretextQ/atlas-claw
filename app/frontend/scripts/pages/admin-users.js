@@ -753,12 +753,15 @@ export function canAssignRolesForUserForm(authInfo) {
 
 function canAssignProtectedRole(authInfo, roleIdentifier, roleCatalog = availableRoles) {
   const normalizedIdentifier = String(roleIdentifier || '').trim().toLowerCase()
-  if (!normalizedIdentifier) return true
+  // Fail closed: an empty or unknown identifier is never assignable. The
+  // client-side catalog is only a partial view (page_size=100, fallback
+  // list), so "not in the catalog" must not mean "safe to assign".
+  if (!normalizedIdentifier) return false
   if (authInfo?.is_admin === true) return true
   if (normalizedIdentifier === 'admin') return false
 
   const role = (Array.isArray(roleCatalog) ? roleCatalog : []).find(entry => entry.identifier === normalizedIdentifier)
-  if (!role) return true
+  if (!role) return false
   return isNonAdminAssignableRole(role)
 }
 
@@ -956,13 +959,13 @@ function renderUserList(users) {
       <td>${renderStatusBadge(user.is_active)}</td>
       <td>
         <div class="user-row-actions">
-          <button class="user-icon-btn btn-toggle-status" title="${user.is_active ? translateOrFallback('admin.disable', 'Disable') : translateOrFallback('admin.enable', 'Enable')}" data-user='${JSON.stringify(user).replace(/'/g, '&#39;')}' ${canToggleUserStates() ? '' : 'disabled'}>
+          <button class="user-icon-btn btn-toggle-status" title="${user.is_active ? translateOrFallback('admin.disable', 'Disable') : translateOrFallback('admin.enable', 'Enable')}" data-user="${escapeHtml(JSON.stringify(user))}" ${canToggleUserStates() ? '' : 'disabled'}>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <path d="M12 2v10"></path>
               <path d="M18.36 6.64a9 9 0 1 1-12.73 0"></path>
             </svg>
           </button>
-          <button class="user-icon-btn btn-edit" title="${translateOrFallback('admin.edit', 'Edit')}" data-user='${JSON.stringify(user).replace(/'/g, '&#39;')}' ${canEditUsers() ? '' : 'disabled'}>
+          <button class="user-icon-btn btn-edit" title="${translateOrFallback('admin.edit', 'Edit')}" data-user="${escapeHtml(JSON.stringify(user))}" ${canEditUsers() ? '' : 'disabled'}>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path>
               <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path>

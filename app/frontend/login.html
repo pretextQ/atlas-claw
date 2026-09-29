@@ -12,14 +12,19 @@
     window.__atlasclawBasePath = __ATLASCLAW_BASE_PATH_JSON__
     window.__atlasclawBuildUrl = function (path) {
       const basePath = String(window.__atlasclawBasePath || '').replace(/\/$/, '')
-      const cleanPath = String(path || '/')
+      // Normalize away backslashes: browsers treat "/\host" as "//host"
+      // (protocol-relative), and a leading "//" must never be produced here.
+      const cleanPath = String(path || '/').replace(/\\/g, '/')
       if (!cleanPath || cleanPath === '/') {
         return basePath ? `${basePath}/` : '/'
       }
-      if (cleanPath.startsWith('http://') || cleanPath.startsWith('https://') || cleanPath.startsWith('//')) {
+      if (cleanPath.startsWith('http://') || cleanPath.startsWith('https://')) {
         return cleanPath
       }
-      const normalized = cleanPath.startsWith('/') ? cleanPath : `/${cleanPath}`
+      let normalized = cleanPath.startsWith('/') ? cleanPath : `/${cleanPath}`
+      while (normalized.startsWith('//')) {
+        normalized = normalized.slice(1)
+      }
       return `${basePath}${normalized}` || normalized
     }
   </script>
@@ -165,6 +170,11 @@
       const value = String(target || '').trim()
       const basePath = String(window.__atlasclawBasePath || '').replace(/\/$/, '')
       if (!value) {
+        return fallbackRedirect
+      }
+      // Reject backslash forms first: browsers normalize "/\evil.com" to
+      // "//evil.com", which would make this an open redirect.
+      if (value.includes('\\')) {
         return fallbackRedirect
       }
       if (value.startsWith('http://') || value.startsWith('https://') || value.startsWith('//')) {

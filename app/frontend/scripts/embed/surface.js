@@ -7,10 +7,17 @@
  * Host page state is deliberately excluded: v1 receives only normalized paths
  * through the validated postMessage bridge.
  *
+ * The floating-surface ``host_origin`` query parameter is accepted only when
+ * it matches a trusted runtime source (the real iframe parent origin, the
+ * loading referrer, or an explicit deployment allowlist) — a well-formed but
+ * attacker-chosen origin is rejected (null), which disables the bridge.
+ *
  * @param {Location|URL|string} locationLike - Browser location or test URL.
+ * @param {Window|object} [runtime] - Window providing trusted origin sources
+ *   (defaults to the global window; tests may pass a stub).
  * @returns {{embedded: boolean, surface: string|null, hostOrigin: string|null, nonce: string|null, integrationMode: boolean}}
  */
-export function parseEmbedSurface(locationLike = window.location) {
+export function parseEmbedSurface(locationLike = window.location, runtime = window) {
   const url = toUrl(locationLike)
   const params = url.searchParams
   const embedded = parseBooleanParam(
@@ -24,7 +31,7 @@ export function parseEmbedSurface(locationLike = window.location) {
     embedded,
     surface: integrationMode ? surface : null,
     hostOrigin: integrationMode && surface === 'floating'
-      ? normalizeOrigin(params.get('host_origin'))
+      ? resolveTrustedHostOrigin(normalizeOrigin(params.get('host_origin')), runtime)
       : null,
     nonce: integrationMode && surface === 'floating'
       ? normalizeNonce(params.get('nonce'))
@@ -63,6 +70,49 @@ function normalizeOrigin(value) {
   } catch (_) {
     return null
   }
+}
+
+/**
+ * Accept the claimed host origin only when a trusted runtime source
+ * confirms it. Trusted sources are:
+ * - ``window.location.ancestorOrigins`` — the real iframe ancestor chain
+ *   (Chromium/Safari; absent elsewhere),
+ * - ``document.referrer`` — the parent document that loaded this iframe
+ *   (empty under a strict referrer policy),
+ * - ``window.__ATLASCLAW_EMBED_ALLOWED_HOST_ORIGINS__`` — explicit
+ *   deployment allowlist for hosts that hide both of the above.
+ * With no confirmation the claim is rejected (null) and the bridge stays
+ * disabled — failing closed instead of trusting the URL parameter.
+ */
+function resolveTrustedHostOrigin(claimedOrigin, runtime) {
+  if (!claimedOrigin) return null
+  const trusted = collectTrustedHostOrigins(runtime)
+  return trusted.includes(claimedOrigin) ? claimedOrigin : null
+}
+
+function collectTrustedHostOrigins(runtime) {
+  const origins = new Set()
+
+  const ancestorOrigins = runtime?.location?.ancestorOrigins
+  if (ancestorOrigins) {
+    for (const entry of Array.from(ancestorOrigins)) {
+      const normalized = normalizeOrigin(entry)
+      if (normalized) origins.add(normalized)
+    }
+  }
+
+  const referrerOrigin = normalizeOrigin(runtime?.document?.referrer || '')
+  if (referrerOrigin) origins.add(referrerOrigin)
+
+  const allowlist = runtime?.__ATLASCLAW_EMBED_ALLOWED_HOST_ORIGINS__
+  if (Array.isArray(allowlist)) {
+    for (const entry of allowlist) {
+      const normalized = normalizeOrigin(entry)
+      if (normalized) origins.add(normalized)
+    }
+  }
+
+  return Array.from(origins)
 }
 
 function normalizeNonce(value) {

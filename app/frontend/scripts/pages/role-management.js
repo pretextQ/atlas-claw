@@ -238,10 +238,16 @@ function cloneData(value) {
 }
 
 function escapeHtml(str) {
-  if (!str) return ''
-  const div = document.createElement('div')
-  div.textContent = str
-  return div.innerHTML
+  // Escape quotes as well: the result is used inside double-quoted HTML
+  // attributes (value="...", data-*="..."), where textContent→innerHTML
+  // only escapes & < > and a raw '"' would break out of the attribute.
+  return String(str ?? '').replace(/[&<>"']/g, char => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;'
+  })[char])
 }
 
 function slugifyIdentifier(value) {

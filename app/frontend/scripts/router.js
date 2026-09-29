@@ -127,7 +127,10 @@ export function createRouter(routes, options = {}) {
           return
         }
       } catch (err) {
+        // Fail closed: an onBeforeRoute failure (e.g. an async auth check
+        // rejecting) must cancel navigation, not wave it through.
         console.error('[Router] onBeforeRoute error:', err)
+        return
       }
     }
 
