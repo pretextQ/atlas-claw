@@ -1170,3 +1170,134 @@ class TestFederatedSessionProfileGuard:
             assert not user.avatar_url
         finally:
             _cleanup_manager(manager)
+
+
+class TestCorruptUserSettingDocument:
+    """WP-06/F-0024: a corrupted settings document must fail closed.
+
+    Swallowing JSONDecodeError/OSError into {} used to let the next PUT
+    overwrite the file with a default document, permanently destroying the
+    user's stored settings.
+    """
+
+    CORRUPT_JSON = '{"providers": {"smartcmp": {"KEEP-SECRET": true}},,,}'
+
+    def _setup(self, tmp_path):
+        manager = _init_database_sync(tmp_path)
+        _grant_provider_access_sync(manager, provider_type="smartcmp", instance_name="default")
+        client = _build_client(tmp_path, _get_auth_config())
+        token = _login_as(client, "testuser", "testpass123")
+        workspace_path = tmp_path / "workspace"
+        workspace_path.mkdir(parents=True, exist_ok=True)
+        settings_path = workspace_path / "users" / "testuser" / "user_setting.json"
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        settings_path.write_text(self.CORRUPT_JSON, encoding="utf-8")
+        original_bytes = settings_path.read_bytes()
+        runtime = _patch_runtime_config(
+            workspace_path,
+            service_providers={
+                "smartcmp": {
+                    "default": {
+                        "base_url": "https://console.smartcmp.cloud",
+                        "auth_type": "user_token",
+                    }
+                }
+            },
+        )
+        return manager, client, token, settings_path, original_bytes, runtime
+
+    def test_put_provider_settings_refuses_to_overwrite_corrupt_file(self, tmp_path):
+        manager, client, token, settings_path, original_bytes, runtime = self._setup(tmp_path)
+        try:
+            with runtime:
+                resp = client.put(
+                    "/api/users/me/provider-settings",
+                    json={
+                        "provider_type": "smartcmp",
+                        "instance_name": "default",
+                        "config": {"auth_type": "user_token", "user_token": "secret-token"},
+                    },
+                    headers={"AtlasClaw-Authenticate": token},
+                )
+
+            assert resp.status_code == 500, resp.json()
+            assert "not valid JSON" in resp.json()["detail"]
+            # The corrupted file is preserved byte-for-byte, not replaced
+            # with a default document.
+            assert settings_path.read_bytes() == original_bytes
+        finally:
+            _cleanup_manager(manager)
+
+    def test_get_provider_settings_reports_corrupt_file(self, tmp_path):
+        manager, client, token, settings_path, original_bytes, runtime = self._setup(tmp_path)
+        try:
+            with runtime:
+                resp = client.get(
+                    "/api/users/me/provider-settings",
+                    headers={"AtlasClaw-Authenticate": token},
+                )
+
+            assert resp.status_code == 500, resp.json()
+            assert settings_path.read_bytes() == original_bytes
+        finally:
+            _cleanup_manager(manager)
+
+    def test_put_provider_settings_overwrites_non_object_document(self, tmp_path):
+        """Valid JSON that is not an object is also treated as corruption."""
+        manager, client, token, settings_path, original_bytes, runtime = self._setup(tmp_path)
+        settings_path.write_text('["not", "an", "object"]', encoding="utf-8")
+        original_bytes = settings_path.read_bytes()
+        try:
+            with runtime:
+                resp = client.put(
+                    "/api/users/me/provider-settings",
+                    json={
+                        "provider_type": "smartcmp",
+                        "instance_name": "default",
+                        "config": {"auth_type": "user_token", "user_token": "secret-token"},
+                    },
+                    headers={"AtlasClaw-Authenticate": token},
+                )
+            assert resp.status_code == 500, resp.json()
+            assert settings_path.read_bytes() == original_bytes
+        finally:
+            _cleanup_manager(manager)
+
+    def test_missing_file_still_initializes_default_document(self, tmp_path):
+        """A missing file is still initialized with defaults and saves fine."""
+        manager = _init_database_sync(tmp_path)
+        _grant_provider_access_sync(manager, provider_type="smartcmp", instance_name="default")
+        client = _build_client(tmp_path, _get_auth_config())
+        token = _login_as(client, "testuser", "testpass123")
+        workspace_path = tmp_path / "workspace"
+        workspace_path.mkdir(parents=True, exist_ok=True)
+        settings_path = workspace_path / "users" / "testuser" / "user_setting.json"
+        try:
+            with _patch_runtime_config(
+                workspace_path,
+                service_providers={
+                    "smartcmp": {
+                        "default": {
+                            "base_url": "https://console.smartcmp.cloud",
+                            "auth_type": "user_token",
+                        }
+                    }
+                },
+            ):
+                resp = client.put(
+                    "/api/users/me/provider-settings",
+                    json={
+                        "provider_type": "smartcmp",
+                        "instance_name": "default",
+                        "config": {"auth_type": "user_token", "user_token": "secret-token"},
+                    },
+                    headers={"AtlasClaw-Authenticate": token},
+                )
+
+            assert resp.status_code == 200, resp.json()
+            saved = json.loads(settings_path.read_text(encoding="utf-8"))
+            assert saved["providers"]["smartcmp"]["default"]["config"]["user_token"] == "secret-token"
+            # Atomic replace leaves no temp file behind.
+            assert not settings_path.with_suffix(settings_path.suffix + ".tmp").exists()
+        finally:
+            _cleanup_manager(manager)

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from datetime import datetime
 from pathlib import Path
@@ -418,8 +419,22 @@ def _get_user_setting_path(workspace_path: str, user_id: str) -> Path:
     return user_runtime_dir(workspace_path, user_id) / "user_setting.json"
 
 
+class UserSettingDocumentError(Exception):
+    """Raised when an existing user settings document cannot be read.
+
+    The document must never be treated as empty in this case: the next save
+    would overwrite the user's stored settings with defaults (F-0024).
+    """
+
+
 def _load_user_setting_document(workspace_path: str, user_id: str) -> dict[str, object]:
-    """Load the user's settings document, creating a default one when absent."""
+    """Load the user's settings document, creating a default one when absent.
+
+    Raises:
+        UserSettingDocumentError: If the file exists but cannot be read or
+            parsed. Callers must fail closed instead of saving a default
+            document over the corrupted file.
+    """
     config_path = _get_user_setting_path(workspace_path, user_id)
     if not config_path.exists():
         config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -431,27 +446,44 @@ def _load_user_setting_document(workspace_path: str, user_id: str) -> dict[str, 
         return document
 
     try:
-        raw_document = json.loads(config_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        raw_document = {}
+        raw_text = config_path.read_text(encoding="utf-8")
+    except OSError as e:
+        raise UserSettingDocumentError(
+            f"Failed to read user settings file {config_path}: {e}"
+        ) from e
+
+    try:
+        raw_document = json.loads(raw_text)
+    except json.JSONDecodeError as e:
+        raise UserSettingDocumentError(
+            f"User settings file {config_path} is not valid JSON; "
+            f"refusing to overwrite it: {e}"
+        ) from e
+
+    if not isinstance(raw_document, dict):
+        raise UserSettingDocumentError(
+            f"User settings file {config_path} does not contain a JSON object; "
+            f"refusing to overwrite it"
+        )
 
     document = _default_user_setting_document()
-    if isinstance(raw_document, dict):
-        for section_name in document.keys():
-            section_value = raw_document.get(section_name)
-            if isinstance(section_value, dict):
-                document[section_name] = section_value
+    for section_name in document.keys():
+        section_value = raw_document.get(section_name)
+        if isinstance(section_value, dict):
+            document[section_name] = section_value
     return document
 
 
 def _save_user_setting_document(workspace_path: str, user_id: str, document: dict[str, object]) -> None:
-    """Persist the user's settings document."""
+    """Persist the user's settings document via atomic replace."""
     config_path = _get_user_setting_path(workspace_path, user_id)
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text(
+    tmp_path = config_path.with_suffix(config_path.suffix + ".tmp")
+    tmp_path.write_text(
         json.dumps(document, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
+    os.replace(tmp_path, config_path)
 
 
 def _get_provider_template_config(
@@ -1172,9 +1204,13 @@ async def update_role(
             user_managed_modules = {"skills", "providers", "channels"}
             # Force-restore locked modules and omitted user-managed modules on
             # partial permission updates for system roles.
-            for module_id in list(new_perms.keys()):
+            # Iterate the union of old and new keys: a module present in the
+            # stored permissions but omitted from the request must be restored
+            # from old_perms, otherwise a providers-only update would silently
+            # drop skills/channels (F-0025).
+            for module_id in set(old_perms) | set(new_perms):
                 if module_id not in user_managed_modules or module_id not in requested_modules:
-                    new_perms[module_id] = old_perms.get(module_id, new_perms[module_id])
+                    new_perms[module_id] = old_perms.get(module_id, new_perms.get(module_id))
             role_data.permissions = new_perms
         ensure_can_manage_permission_modules(
             authz,
@@ -1403,7 +1439,10 @@ async def get_my_provider_settings(
 ) -> UserProviderSettingsResponse:
     """Get the authenticated user's provider credentials bound to system templates."""
     workspace_path = str(Path(get_config().workspace.path).resolve())
-    document = _load_user_setting_document(workspace_path, current_user.user_id)
+    try:
+        document = _load_user_setting_document(workspace_path, current_user.user_id)
+    except UserSettingDocumentError as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
     providers = document.get("providers", {})
     redacted_providers = _redact_user_provider_settings(providers)
     return UserProviderSettingsResponse(
@@ -1425,7 +1464,10 @@ async def update_my_provider_settings(
         provider_data.instance_name,
     )
     workspace_path = str(Path(get_config().workspace.path).resolve())
-    document = _load_user_setting_document(workspace_path, current_user.user_id)
+    try:
+        document = _load_user_setting_document(workspace_path, current_user.user_id)
+    except UserSettingDocumentError as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
     providers = document.setdefault("providers", {})
     if not isinstance(providers, dict):
         providers = {}
