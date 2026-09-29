@@ -915,7 +915,6 @@
   "model": {
     "title": "Model Configs",
     "pageTitle": "Model Management",
-    "subtitle": "Orchestrate your model ecosystem, monitor real-time performance, and configure intelligent routing policies across distributed endpoints.",
     "pageDescription": "Manage your AI model configurations",
     "newButton": "+ New Model Config",
     "loading": "Loading...",
@@ -978,7 +977,6 @@
     "noModelsFound": "No models found",
     "primaryModel": "Primary",
     "testConnection": "Test Connection",
-    "saveConfig": "Save Config",
     "basicInfo": "Basic Information",
     "modelParams": "Model Parameters",
     "otherSettings": "Other Settings",

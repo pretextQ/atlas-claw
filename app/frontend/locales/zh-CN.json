@@ -915,7 +915,6 @@
   "model": {
     "title": "模型配置",
     "pageTitle": "模型配置管理",
-    "subtitle": "编排您的模型生态系统，监控实时性能，配置智能路由策略",
     "pageDescription": "管理您的 AI 模型配置",
     "newButton": "+ 新建模型配置",
     "loading": "加载中...",
@@ -978,7 +977,6 @@
     "noModelsFound": "未获取到可用模型",
     "primaryModel": "主模型",
     "testConnection": "测试连接",
-    "saveConfig": "保存配置",
     "basicInfo": "基础信息",
     "modelParams": "模型参数",
     "otherSettings": "其他设置",
