@@ -34,6 +34,13 @@ from app.atlasclaw.skills.registry import SkillRegistry
 from tests.atlasclaw.provider_schema_fixtures import managed_provider_definition
 
 
+def _instance_key(user_id: str, channel_type: str, connection_id: str) -> str:
+    """Build the manager's unambiguous instance key for a connection."""
+    from app.atlasclaw.channels.manager import ChannelManager
+
+    return ChannelManager._instance_key(user_id, channel_type, connection_id)
+
+
 class TestChannelManager:
     """Test ChannelManager functionality."""
 
@@ -84,7 +91,7 @@ class TestChannelManager:
 
             assert result is True
             assert self.manager.get_connection_runtime_status("conn-123") == "connected"
-            assert "user-123:websocket:conn-123" in self.manager._active_connections
+            assert _instance_key("user-123", "websocket", "conn-123") in self.manager._active_connections
 
     @pytest.mark.asyncio
     async def test_initialize_connection_not_found(self):
@@ -105,8 +112,8 @@ class TestChannelManager:
         """Test stopping a connection."""
         # Manually add a handler to test stop_connection
         handler = StubChannelHandler({})
-        instance_key = "user-123:websocket:conn-123"
-        self.manager._active_connections[instance_key] = handler
+        instance_key = _instance_key("user-123", "websocket", "conn-123")
+        self.manager._register_active_handler("user-123", "websocket", "conn-123", handler)
         
         # Stop connection
         result = await self.manager.stop_connection("user-123", "websocket", "conn-123")
@@ -128,9 +135,9 @@ class TestChannelManager:
         """Test routing inbound message."""
         # Manually create and register handler
         handler = StubChannelHandler({})
-        instance_key = "user-123:websocket:conn-123"
+        instance_key = _instance_key("user-123", "websocket", "conn-123")
         ChannelRegistry.create_instance(instance_key, "websocket", {})
-        self.manager._active_connections[instance_key] = handler
+        self.manager._register_active_handler("user-123", "websocket", "conn-123", handler)
 
         # Route message
         request = {
@@ -169,7 +176,7 @@ class TestChannelManager:
         manager.set_session_manager_router(ctx.session_manager_router)
         handler = StubChannelHandler({})
         handler.send_message = AsyncMock(return_value=SendResult(success=True))
-        manager._active_connections["user-123:websocket:conn-123"] = handler
+        manager._register_active_handler("user-123", "websocket", "conn-123", handler)
 
         class DummyAgentRunner:
             async def run(self, **kwargs):
@@ -202,8 +209,8 @@ class TestChannelManager:
         """Test getting user connections (sync version)."""
         # Manually add handlers to active connections
         handler = StubChannelHandler({})
-        self.manager._active_connections["user-123:websocket:conn-1"] = handler
-        self.manager._active_connections["user-123:websocket:conn-2"] = handler
+        self.manager._register_active_handler("user-123", "websocket", "conn-1", handler)
+        self.manager._register_active_handler("user-123", "websocket", "conn-2", handler)
         
         # Get connections
         connections = self.manager.get_user_connections("user-123")
@@ -213,7 +220,7 @@ class TestChannelManager:
     def test_get_user_connections_with_filter(self):
         """Test getting user connections with channel type filter."""
         handler = StubChannelHandler({})
-        self.manager._active_connections["user-123:websocket:conn-1"] = handler
+        self.manager._register_active_handler("user-123", "websocket", "conn-1", handler)
         
         connections = self.manager.get_user_connections("user-123", "websocket")
         
@@ -225,8 +232,8 @@ class TestChannelManager:
         handler = StubChannelHandler({})
         handler._status = ConnectionStatus.CONNECTED
         handler.health_check = AsyncMock(return_value=True)
-        instance_key = "user-123:websocket:conn-123"
-        self.manager._active_connections[instance_key] = handler
+        instance_key = _instance_key("user-123", "websocket", "conn-123")
+        self.manager._register_active_handler("user-123", "websocket", "conn-123", handler)
 
         result = await self.manager.probe_connection("user-123", "websocket", "conn-123")
 
@@ -238,8 +245,8 @@ class TestChannelManager:
         handler = StubChannelHandler({})
         handler._status = ConnectionStatus.ERROR
         handler.reconnect = AsyncMock(return_value=True)
-        instance_key = "user-123:websocket:conn-123"
-        self.manager._active_connections[instance_key] = handler
+        instance_key = _instance_key("user-123", "websocket", "conn-123")
+        self.manager._register_active_handler("user-123", "websocket", "conn-123", handler)
 
         result = await self.manager.reconnect_connection("user-123", "websocket", "conn-123")
 
@@ -265,8 +272,8 @@ class TestChannelManager:
 
     def test_list_active_connection_descriptors(self):
         handler = StubChannelHandler({})
-        self.manager._active_connections["user-123:websocket:conn-1"] = handler
-        self.manager._active_connections["user-123:websocket:conn-2"] = handler
+        self.manager._register_active_handler("user-123", "websocket", "conn-1", handler)
+        self.manager._register_active_handler("user-123", "websocket", "conn-2", handler)
 
         items = self.manager.list_active_connection_descriptors()
 
@@ -324,8 +331,8 @@ class TestChannelManager:
         """Test disabling a connection."""
         # Manually add handler since initialize_connection fails
         handler = StubChannelHandler({})
-        instance_key = "user-123:websocket:conn-123"
-        self.manager._active_connections[instance_key] = handler
+        instance_key = _instance_key("user-123", "websocket", "conn-123")
+        self.manager._register_active_handler("user-123", "websocket", "conn-123", handler)
         
         mock_channel = MagicMock()
         
@@ -453,7 +460,7 @@ class TestChannelManager:
             manager.set_session_manager_router(ctx.session_manager_router)
             handler = StubChannelHandler({})
             handler.send_message = AsyncMock(return_value=SendResult(success=True))
-            manager._active_connections["user-123:websocket:conn-123"] = handler
+            manager._register_active_handler("user-123", "websocket", "conn-123", handler)
 
             captured = {}
 
@@ -509,7 +516,7 @@ class TestChannelManager:
         manager.set_session_manager_router(ctx.session_manager_router)
         handler = StubChannelHandler({"provider_binding": "smartcmp/default"})
         handler.send_message = AsyncMock(return_value=SendResult(success=True))
-        manager._active_connections["user-123:websocket:conn-123"] = handler
+        manager._register_active_handler("user-123", "websocket", "conn-123", handler)
 
         captured = {}
 
@@ -560,7 +567,7 @@ class TestChannelManager:
 
         handler.acknowledge_message = AsyncMock(side_effect=_acknowledge)
         handler.send_message = AsyncMock(return_value=SendResult(success=True))
-        manager._active_connections["user-123:websocket:conn-123"] = handler
+        manager._register_active_handler("user-123", "websocket", "conn-123", handler)
 
         class DummyAgentRunner:
             async def run(self, **kwargs):
@@ -600,7 +607,7 @@ class TestChannelManager:
         handler = StubChannelHandler({})
         handler.acknowledge_message = AsyncMock(side_effect=RuntimeError("ack failed"))
         handler.send_message = AsyncMock(return_value=SendResult(success=True))
-        manager._active_connections["user-123:websocket:conn-123"] = handler
+        manager._register_active_handler("user-123", "websocket", "conn-123", handler)
 
         class DummyAgentRunner:
             async def run(self, **kwargs):
@@ -647,7 +654,7 @@ class TestChannelManager:
             return_value=MessageAcknowledgementResult(supported=True, success=True)
         )
         handler.send_message = AsyncMock(return_value=SendResult(success=True))
-        manager._active_connections["user-123:websocket:conn-123"] = handler
+        manager._register_active_handler("user-123", "websocket", "conn-123", handler)
 
         class DummyAgentRunner:
             async def run(self, **kwargs):
@@ -793,8 +800,8 @@ class TestChannelManagerInitialization:
         ChannelRegistry.register("tracking", _TrackingHandler)
         old_handler = _TrackingHandler({})
         old_handler._status = ConnectionStatus.CONNECTED
-        instance_key = "user-1:tracking:conn-1"
-        self.manager._active_connections[instance_key] = old_handler
+        instance_key = _instance_key("user-1", "tracking", "conn-1")
+        self.manager._register_active_handler("user-1", "tracking", "conn-1", old_handler)
         ChannelRegistry._instances[instance_key] = old_handler
 
         mock_channel = MagicMock()
@@ -868,7 +875,7 @@ async def test_stop_all_stops_every_active_connection():
             return True
 
     for index in (1, 2):
-        manager._active_connections[f"user-1:websocket:conn-{index}"] = _StoppableHandler({})
+        manager._register_active_handler("user-1", "websocket", f"conn-{index}", _StoppableHandler({}))
 
     await manager.stop_all()
 

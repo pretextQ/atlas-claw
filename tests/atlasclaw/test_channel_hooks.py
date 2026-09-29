@@ -53,7 +53,7 @@ def channel_env():
     manager.set_agent_runner(runner)
     handler = StubChannelHandler({})
     handler.send_message = AsyncMock(return_value=SendResult(success=True))
-    manager._active_connections["user-1:websocket:conn-123"] = handler
+    manager._register_active_handler("user-1", "websocket", "conn-123", handler)
 
     ctx = APIContext(
         session_manager=SessionManager(workspace),

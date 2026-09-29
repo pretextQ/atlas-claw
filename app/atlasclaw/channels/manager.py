@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
@@ -50,6 +51,12 @@ class ChannelManager:
         # In-flight connection initializations keyed by instance key; shared so
         # concurrent enable/create requests cannot start two handlers.
         self._initializing: Dict[str, asyncio.Task] = {}
+        # Connections with a pending stop request: an initialization that
+        # completes after the stop must not leave a live handler behind.
+        self._stop_intents: set[str] = set()
+        # instance key -> (user_id, channel_type, connection_id), so shutdown
+        # can act on connections without parsing the opaque key.
+        self._active_connection_coordinates: Dict[str, tuple[str, str, str]] = {}
 
     def _set_connection_runtime_status(
         self,
@@ -111,7 +118,7 @@ class ChannelManager:
         Returns:
             True if initialized successfully
         """
-        instance_key = f"{user_id}:{channel_type}:{connection_id}"
+        instance_key = self._instance_key(user_id, channel_type, connection_id)
 
         in_flight = self._initializing.get(instance_key)
         if in_flight is not None and not in_flight.done():
@@ -136,6 +143,52 @@ class ChannelManager:
             logger.exception("Connection initialization task failed")
             return False
 
+    def _register_active_handler(
+        self,
+        user_id: str,
+        channel_type: str,
+        connection_id: str,
+        handler: ChannelHandler,
+    ) -> str:
+        """Record a live handler for a connection and return its instance key.
+
+        Registers the handler together with its coordinates so every lookup
+        (status, probe, shutdown) works without parsing the opaque key.
+        """
+        instance_key = self._instance_key(user_id, channel_type, connection_id)
+        self._active_connections[instance_key] = handler
+        self._active_connection_coordinates[instance_key] = (
+            user_id,
+            channel_type,
+            connection_id,
+        )
+        return instance_key
+
+    def _find_active_handler(self, connection_id: str) -> Optional[ChannelHandler]:
+        """Return the active handler for a connection id, if any."""
+        for key, coordinates in self._active_connection_coordinates.items():
+            if coordinates[2] != connection_id:
+                continue
+            handler = self._active_connections.get(key)
+            if handler is not None:
+                return handler
+        return None
+
+    @staticmethod
+    def _instance_key(user_id: str, channel_type: str, connection_id: str) -> str:
+        """Return an unambiguous registry/instance key for a connection.
+
+        Plain ":"-joining let ids that contain ":" collide (e.g. a connection
+        id "b:c" with channel "a" vs channel "b" with id "c"), which would make
+        one connection's handler serve another. A JSON array encoding keeps the
+        fields distinct.
+        """
+        return json.dumps(
+            [str(user_id or ""), str(channel_type or ""), str(connection_id or "")],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
     async def _stop_existing_handler(self, instance_key: str) -> None:
         """Stop and unregister any handler already serving a connection."""
         handler = self._active_connections.pop(instance_key, None)
@@ -151,7 +204,22 @@ class ChannelManager:
                 logger.warning(f"Failed to stop previous handler: {instance_key}", exc_info=True)
             logger.info(f"Stopped previous handler before re-initialization: {instance_key}")
 
+        self._active_connection_coordinates.pop(instance_key, None)
         ChannelRegistry.remove_instance(instance_key)
+        self._stop_intents.discard(instance_key)
+
+    def _release_handler_instance(self, instance_key: str, *, reason: str) -> None:
+        """Drop a partially started handler from the registry and active map.
+
+        Every failure path after create_instance must release the registry
+        entry: otherwise the channel type stays marked as instantiated and the
+        half-configured handler keeps its SDK subprocess alive.
+        """
+        handler = self._active_connections.pop(instance_key, None)
+        self._active_connection_coordinates.pop(instance_key, None)
+        ChannelRegistry.remove_instance(instance_key)
+        logger.info(f"Released handler instance after {reason}: {instance_key}")
+        return handler
 
     async def _initialize_connection_impl(
         self,
@@ -161,6 +229,8 @@ class ChannelManager:
     ) -> bool:
         """Start a channel connection (single attempt; see initialize_connection)."""
         self._set_connection_runtime_status(connection_id, ConnectionStatus.CONNECTING)
+        instance_key = self._instance_key(user_id, channel_type, connection_id)
+        handler_created = False
 
         try:
             from app.atlasclaw.db import get_db_manager
@@ -183,7 +253,7 @@ class ChannelManager:
                 return False
 
             # Create instance
-            instance_key = f"{user_id}:{channel_type}:{connection_id}"
+            instance_key = self._instance_key(user_id, channel_type, connection_id)
 
             # A previous handler for this connection must be torn down before
             # its replacement starts, otherwise the old SDK subprocess keeps
@@ -195,6 +265,7 @@ class ChannelManager:
                 channel_type,
                 connection_config["config"]
             )
+            handler_created = handler is not None
 
             if not handler:
                 logger.error(f"Failed to create handler instance: {instance_key}")
@@ -204,6 +275,7 @@ class ChannelManager:
             # Setup handler
             if not await handler.setup(connection_config["config"]):
                 logger.error(f"Handler setup failed: {instance_key}")
+                self._release_handler_instance(instance_key, reason="setup failure")
                 self._set_connection_runtime_status(connection_id, ConnectionStatus.ERROR)
                 return False
 
@@ -216,6 +288,7 @@ class ChannelManager:
             # Start handler (for long-connection, this establishes the connection)
             if not await handler.start(None):  # TODO: pass proper context
                 logger.error(f"Handler start failed: {instance_key}")
+                self._release_handler_instance(instance_key, reason="start failure")
                 failure_status = handler.get_status()
                 if failure_status == ConnectionStatus.DISCONNECTED:
                     failure_status = ConnectionStatus.ERROR
@@ -227,6 +300,7 @@ class ChannelManager:
                 if not await handler.connect():
                     logger.error(f"Long connection failed: {instance_key}")
                     await handler.stop()
+                    self._release_handler_instance(instance_key, reason="connect failure")
                     failure_status = handler.get_status()
                     if failure_status == ConnectionStatus.DISCONNECTED:
                         failure_status = ConnectionStatus.ERROR
@@ -235,7 +309,24 @@ class ChannelManager:
                 logger.info(f"Long connection established: {instance_key}")
 
             # Register as active connection
-            self._active_connections[instance_key] = handler
+            if instance_key in self._stop_intents:
+                # A stop arrived while this initialization was in flight: never
+                # publish the fresh handler, tear it down instead.
+                logger.info(f"Stop requested during initialization; discarding handler: {instance_key}")
+                try:
+                    if getattr(handler, "supports_long_connection", False):
+                        await handler.disconnect()
+                except Exception:
+                    logger.warning(f"Failed to disconnect handler after late stop: {instance_key}", exc_info=True)
+                try:
+                    await handler.stop()
+                except Exception:
+                    logger.warning(f"Failed to stop handler after late stop: {instance_key}", exc_info=True)
+                self._release_handler_instance(instance_key, reason="stop requested during initialization")
+                self._set_connection_runtime_status(connection_id, ConnectionStatus.DISCONNECTED)
+                return False
+
+            self._register_active_handler(user_id, channel_type, connection_id, handler)
             ChannelRegistry.register_connection(ChannelConnection(
                 id=channel.id,
                 name=channel.name,
@@ -251,6 +342,8 @@ class ChannelManager:
 
         except Exception as e:
             logger.error(f"Failed to initialize connection: {e}")
+            if handler_created:
+                self._release_handler_instance(instance_key, reason="initialization exception")
             self._set_connection_runtime_status(connection_id, ConnectionStatus.ERROR)
             return False
 
@@ -299,7 +392,7 @@ class ChannelManager:
             logger.info(f"[ChannelManager] Processing message: {message.content[:50]}...")
             
             # Get handler for sending reply
-            instance_key = f"{user_id}:{channel_type}:{connection_id}"
+            instance_key = self._instance_key(user_id, channel_type, connection_id)
             handler = self._active_connections.get(instance_key)
             
             if not handler:
@@ -495,17 +588,35 @@ class ChannelManager:
         """Stop every active channel connection.
 
         Used at application shutdown so SDK subprocesses and WebSockets do not
-        outlive the process.
+        outlive the process. Connection coordinates are read from the recorded
+        map instead of parsing the instance key, which is opaque by design.
         """
-        for instance_key in list(self._active_connections.keys()):
-            parts = instance_key.split(":")
-            if len(parts) != 3:
+        for instance_key, coordinates in list(self._active_connection_coordinates.items()):
+            if instance_key not in self._active_connections:
                 continue
-            user_id, channel_type, connection_id = parts
+            user_id, channel_type, connection_id = coordinates
             try:
                 await self.stop_connection(user_id, channel_type, connection_id)
             except Exception:
                 logger.warning("Failed to stop channel connection: %s", instance_key, exc_info=True)
+        # Anything registered without coordinates is torn down by key so
+        # shutdown never leaves a live handler behind.
+        for instance_key in list(self._active_connections.keys()):
+            handler = self._active_connections.pop(instance_key, None)
+            if handler is None:
+                continue
+            self._stop_intents.add(instance_key)
+            try:
+                if getattr(handler, "supports_long_connection", False):
+                    await handler.disconnect()
+            except Exception:
+                logger.warning("Failed to disconnect channel handler: %s", instance_key, exc_info=True)
+            try:
+                await handler.stop()
+            except Exception:
+                logger.warning("Failed to stop channel handler: %s", instance_key, exc_info=True)
+            ChannelRegistry.remove_instance(instance_key)
+            self._active_connection_coordinates.pop(instance_key, None)
 
     async def stop_connection(
         self,
@@ -525,8 +636,12 @@ class ChannelManager:
         Returns:
             True if stopped successfully
         """
+        instance_key = self._instance_key(user_id, channel_type, connection_id)
+        # Record the intent first: an initialization still in flight must see
+        # it and tear its own handler down when it finishes, instead of
+        # reporting "stopped" while a fresh handler keeps running.
+        self._stop_intents.add(instance_key)
         try:
-            instance_key = f"{user_id}:{channel_type}:{connection_id}"
             handler = self._active_connections.get(instance_key)
 
             if not handler:
@@ -540,14 +655,18 @@ class ChannelManager:
                 logger.info(f"Long connection disconnected: {instance_key}")
 
             await handler.stop()
-            del self._active_connections[instance_key]
+            self._active_connections.pop(instance_key, None)
+            self._active_connection_coordinates.pop(instance_key, None)
+            ChannelRegistry.remove_instance(instance_key)
             self._set_connection_runtime_status(connection_id, ConnectionStatus.DISCONNECTED)
+            self._stop_intents.discard(instance_key)
 
             logger.info(f"Channel connection stopped: {instance_key}")
             return True
 
         except Exception as e:
             logger.error(f"Failed to stop connection: {e}")
+            # Keep the intent: the in-flight initialization will clean up.
             self._set_connection_runtime_status(connection_id, ConnectionStatus.ERROR)
             return False
 
@@ -566,10 +685,14 @@ class ChannelManager:
             Tuple of (owner_user_id, handler) or None when the connection
             has no active handler.
         """
-        suffix = f":{channel_type}:{connection_id}"
-        for key, handler in self._active_connections.items():
-            if key.endswith(suffix):
-                return key[: -len(suffix)], handler
+        # Coordinates are matched exactly: suffix matching on the opaque key
+        # could match a different connection whose ids happen to line up.
+        for key, coordinates in self._active_connection_coordinates.items():
+            if coordinates[1] != channel_type or coordinates[2] != connection_id:
+                continue
+            handler = self._active_connections.get(key)
+            if handler is not None:
+                return coordinates[0], handler
         return None
 
     def schedule_inbound_processing(
@@ -654,17 +777,18 @@ class ChannelManager:
         # Return cached active connections for sync access
         # For full data, use get_user_connections_async
         result = []
-        for key, handler in self._active_connections.items():
-            parts = key.split(":")
-            if len(parts) == 3:
-                conn_user_id, conn_type, conn_id = parts
-                if conn_user_id == user_id:
-                    if channel_type is None or conn_type == channel_type:
-                        result.append({
-                            "id": conn_id,
-                            "channel_type": conn_type,
-                            "enabled": True,  # Active connections are enabled
-                        })
+        for key in self._active_connections:
+            coordinates = self._active_connection_coordinates.get(key)
+            if coordinates is None:
+                continue
+            conn_user_id, conn_type, conn_id = coordinates
+            if conn_user_id == user_id:
+                if channel_type is None or conn_type == channel_type:
+                    result.append({
+                        "id": conn_id,
+                        "channel_type": conn_type,
+                        "enabled": True,  # Active connections are enabled
+                    })
         return result
 
     async def get_user_connections_async(
@@ -840,8 +964,9 @@ class ChannelManager:
     ) -> str:
         """Get runtime connection status for a specific connection.
         
-        Searches _active_connections by connection_id suffix,
-        since connection_id is globally unique (UUID).
+        The instance key is opaque, so the handler is located through the
+        recorded connection coordinates instead of string suffix matching
+        (which could match a different connection's key).
         
         Args:
             connection_id: Connection identifier (UUID)
@@ -849,12 +974,7 @@ class ChannelManager:
         Returns:
             Runtime status string: "connected", "disconnected", "connecting", or "error"
         """
-        # Search for handler by connection_id (last part of instance_key)
-        handler = None
-        for key, h in self._active_connections.items():
-            if key.endswith(f":{connection_id}"):
-                handler = h
-                break
+        handler = self._find_active_handler(connection_id)
 
         if not handler:
             cached_status = self._runtime_status_by_connection_id.get(
@@ -878,10 +998,10 @@ class ChannelManager:
         """Return lightweight descriptors for all active connections."""
         items: list[dict[str, Any]] = []
         for key, handler in sorted(self._active_connections.items()):
-            parts = key.split(":")
-            if len(parts) != 3:
+            coordinates = self._active_connection_coordinates.get(key)
+            if coordinates is None:
                 continue
-            user_id, channel_type, connection_id = parts
+            user_id, channel_type, connection_id = coordinates
             items.append(
                 {
                     "user_id": user_id,
@@ -900,7 +1020,7 @@ class ChannelManager:
         connection_id: str,
     ) -> dict[str, Any]:
         """Run a narrow health probe for an active connection."""
-        instance_key = f"{user_id}:{channel_type}:{connection_id}"
+        instance_key = self._instance_key(user_id, channel_type, connection_id)
         handler = self._active_connections.get(instance_key)
         if handler is None:
             return {"healthy": False, "status": "disconnected", "reconnected": False}
@@ -919,7 +1039,7 @@ class ChannelManager:
         connection_id: str,
     ) -> bool:
         """Attempt a best-effort reconnect for an active long connection."""
-        instance_key = f"{user_id}:{channel_type}:{connection_id}"
+        instance_key = self._instance_key(user_id, channel_type, connection_id)
         handler = self._active_connections.get(instance_key)
         if handler is None:
             return False
