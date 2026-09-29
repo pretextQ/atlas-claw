@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager, nullcontext
+import logging
 from typing import Any, AsyncIterator, Optional
 
 from app.atlasclaw.agent.context_window_guard import ContextWindowInfo, resolve_context_window_info
@@ -13,6 +14,8 @@ from app.atlasclaw.agent.runner_tool.runner_agent_override import (
 )
 from app.atlasclaw.core.deps import SkillDeps
 from app.atlasclaw.core.trace import bind_trace_context, resolve_trace_context
+
+logger = logging.getLogger(__name__)
 
 
 class RuntimeAgentSlot:
@@ -214,6 +217,7 @@ class RunnerExecutionRuntimeMixin:
             agent=agent,
             allowed_tool_names=override_tool_names,
         )
+        override_applied = False
         if callable(override_factory) and system_prompt:
             override_cm = nullcontext()
             override_candidates = []
@@ -226,16 +230,27 @@ class RunnerExecutionRuntimeMixin:
             for override_kwargs in override_candidates:
                 try:
                     override_cm = override_factory(**override_kwargs)
+                    override_applied = True
                     break
                 except TypeError:
                     continue
         elif callable(override_factory) and override_tools is not None:
             try:
                 override_cm = override_factory(tools=override_tools)
+                override_applied = True
             except TypeError:
                 override_cm = nullcontext()
         else:
             override_cm = nullcontext()
+
+        if not override_applied:
+            # Falling back to the default agent configuration silently hides a
+            # broken override (e.g. a changed override signature).
+            logger.warning(
+                "Agent override was not applied for the streaming run; using the "
+                "agent's default configuration (tools_specified=%s)",
+                override_tools is not None,
+            )
 
         if hasattr(override_cm, "__aenter__"):
             with bind_trace_context(trace_context):

@@ -139,9 +139,14 @@ def tool_output_satisfies_artifact_goal(
     ]
 
     if extensions:
-        for candidate in path_candidates:
-            if any(candidate.lower().endswith(extension) for extension in extensions):
-                return True
+        # An explicit extension list is a requirement, not a hint: when no
+        # candidate matches, the goal is not satisfied. Falling through to
+        # `return bool(path_candidates)` made the filter ineffective.
+        return any(
+            candidate.lower().endswith(extension)
+            for candidate in path_candidates
+            for extension in extensions
+        )
 
     return bool(path_candidates)
 

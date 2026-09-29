@@ -1182,7 +1182,10 @@ class RunnerToolGateModelMixin:
             agent=agent,
             allowed_tool_names=allowed_tool_names,
         )
+        override_applied = False
+        override_attempted = False
         if callable(override_factory) and system_prompt:
+            override_attempted = True
             override_cm = nullcontext()
             override_candidates = []
             if override_tools is not None:
@@ -1194,16 +1197,37 @@ class RunnerToolGateModelMixin:
             for override_kwargs in override_candidates:
                 try:
                     override_cm = override_factory(**override_kwargs)
+                    override_applied = True
                     break
                 except TypeError:
                     continue
         elif callable(override_factory) and override_tools is not None:
+            override_attempted = True
             try:
                 override_cm = override_factory(tools=override_tools)
+                override_applied = True
             except TypeError:
                 override_cm = nullcontext()
         else:
             override_cm = nullcontext()
+
+        if override_tools is not None and not override_applied:
+            if override_attempted:
+                # A classifier pass must run without tools; silently falling
+                # back to the agent's default toolset would let it call tools
+                # and produce an ungrounded verdict. Abort the pass instead.
+                logger.warning(
+                    "%s could not apply the tool override (tool set must be %s); "
+                    "skipping this pass instead of running with the default tools",
+                    str(purpose or "tool_gate_model_pass"),
+                    "empty" if not override_tools else "restricted",
+                )
+                return ""
+            logger.warning(
+                "%s runs with the agent's own tools: the agent does not support "
+                "tool overrides",
+                str(purpose or "tool_gate_model_pass"),
+            )
 
         async def _execute() -> str:
             if hasattr(override_cm, "__aenter__"):

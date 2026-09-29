@@ -207,33 +207,49 @@ class RunnerExecutionFlowErrorMixin:
             )
 
         state["run_failed"] = True
-        await self.runtime_events.trigger_llm_failed(
-            session_key=state.get("session_key"),
-            run_id=state.get("run_id"),
-            error=error_text,
-        )
-        await self.runtime_events.trigger_run_failed(
-            session_key=state.get("session_key"),
-            run_id=state.get("run_id"),
-            error=error_text,
-        )
-        await self.runtime_events.trigger_run_context_ready(
-            session_key=state.get("session_key"),
-            run_id=state.get("run_id"),
-            user_message=state.get("user_message"),
-            system_prompt=state.get("system_prompt"),
-            message_history=state.get("context_history_for_hooks") or [],
-            assistant_message=state.get("final_assistant") or "",
-            tool_calls=state.get("tool_call_summaries") or [],
-            run_status="failed",
-            error=error_text,
-            session_title=state.get("session_title"),
-        )
 
+        # Close the thinking stream before awaiting lifecycle hooks, matching
+        # the other terminal paths: a hook failure must not leave the emitter
+        # open or suppress the terminal error events below.
         thinking_emitter = state.get("thinking_emitter")
         if thinking_emitter is not None:
             async for event in thinking_emitter.close_if_active():
                 yield event
+
+        # Every hook in this terminal path is best-effort: an exception here
+        # would otherwise prevent the client from ever receiving the failure
+        # events (the tool-only fallback branch already guards each call).
+        try:
+            await self.runtime_events.trigger_llm_failed(
+                session_key=state.get("session_key"),
+                run_id=state.get("run_id"),
+                error=error_text,
+            )
+        except Exception:
+            logger.exception("trigger_llm_failed failed on terminal error path")
+        try:
+            await self.runtime_events.trigger_run_failed(
+                session_key=state.get("session_key"),
+                run_id=state.get("run_id"),
+                error=error_text,
+            )
+        except Exception:
+            logger.exception("trigger_run_failed failed on terminal error path")
+        try:
+            await self.runtime_events.trigger_run_context_ready(
+                session_key=state.get("session_key"),
+                run_id=state.get("run_id"),
+                user_message=state.get("user_message"),
+                system_prompt=state.get("system_prompt"),
+                message_history=state.get("context_history_for_hooks") or [],
+                assistant_message=state.get("final_assistant") or "",
+                tool_calls=state.get("tool_call_summaries") or [],
+                run_status="failed",
+                error=error_text,
+                session_title=state.get("session_title"),
+            )
+        except Exception:
+            logger.exception("trigger_run_context_ready failed on terminal error path")
 
         yield StreamEvent.runtime_update(
             "failed",

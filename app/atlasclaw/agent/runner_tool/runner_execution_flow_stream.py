@@ -1267,7 +1267,17 @@ class RunnerExecutionFlowStreamMixin:
                     return normalized[:240]
                 return RunnerExecutionFlowStreamMixin._extract_tool_error_signature(parsed)
             lowered = normalized.lower()
-            if lowered.startswith("[error]") or "missing required" in lowered or "error" in lowered:
+            # Match structured error markers only. A bare "error" substring
+            # also matches success text ("No errors found.", "0 errors"), and
+            # two identical successful results would then be reported as a
+            # repeated tool failure.
+            if (
+                lowered.startswith("[error]")
+                or lowered.startswith("error:")
+                or lowered.startswith("error -")
+                or "missing required" in lowered
+                or lowered.startswith("traceback (most recent call last)")
+            ):
                 return normalized[:240]
             return ""
         if isinstance(payload, dict):

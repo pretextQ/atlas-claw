@@ -1774,6 +1774,11 @@ class RunnerExecutionPreparePhaseMixin:
         buffered_assistant_events = state.get("buffered_assistant_events")
         assistant_output_streamed = state.get("assistant_output_streamed")
         tool_request_message = state.get("tool_request_message")
+        # Initialize every local the finally block publishes: the early-exit
+        # paths (context guard, empty toolset) reach the finally before these
+        # are assigned, and an unbound local there raised NameError and masked
+        # the real failure.
+        model_user_message = state.get("model_user_message") or user_message
         tool_intent_plan = state.get("tool_intent_plan")
         tool_gate_decision = state.get("tool_gate_decision")
         tool_match_result = state.get("tool_match_result")
@@ -2931,6 +2936,7 @@ class RunnerExecutionPreparePhaseMixin:
                     metadata={"phase": "gate", "elapsed": round(time.monotonic() - start_time, 1)},
                 )
                 yield StreamEvent.error_event(failure_message)
+                run_failed = True
                 state["run_failed"] = True
                 state["should_stop"] = True
                 return
@@ -3114,7 +3120,10 @@ class RunnerExecutionPreparePhaseMixin:
                 "extra": extra,
                 "run_id": run_id,
                 "tool_execution_retry_count": tool_execution_retry_count,
-                "run_failed": run_failed,
+                # Any failure marker set during the run (including by this
+                # phase writing state directly) must survive the write-back;
+                # a stale local used to overwrite it and lose the failure.
+                "run_failed": bool(run_failed) or bool(state.get("run_failed")),
                 "message_history": message_history,
                 "runtime_message_history": resolved_runtime_message_history,
                 "session_message_history": resolved_session_message_history,

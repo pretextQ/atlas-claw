@@ -629,19 +629,29 @@ class RunnerToolGatePolicyMixin:
         if isinstance(payload, dict):
             if bool(payload.get("is_error")):
                 return False
+            if "returncode" in payload:
+                # Subprocess-style payloads: a non-zero exit code is a failure
+                # and must not fall through to `return bool(payload)`, which
+                # reported any non-empty dict as success. An empty `output`
+                # alongside exit code 0 is not evidence of anything either.
+                returncode = payload.get("returncode")
+                if returncode not in (0, None):
+                    return False
+                if returncode == 0 and "output" in payload:
+                    output_value = payload.get("output")
+                    if isinstance(output_value, str):
+                        return bool(output_value.strip())
+                    return output_value not in (None, "", [], {})
             if payload.get("success") is True:
-                output_value = payload.get("output")
-                if isinstance(output_value, str) and output_value.strip():
-                    return True
-                if output_value not in (None, "", [], {}):
-                    return True
+                # An explicit "output" field decides this branch; without one
+                # the remaining content checks below still apply.
+                if "output" in payload:
+                    output_value = payload.get("output")
+                    if isinstance(output_value, str):
+                        return bool(output_value.strip())
+                    if output_value in (None, "", [], {}):
+                        return False
                 return True
-            if "returncode" in payload and payload.get("returncode") == 0:
-                output_value = payload.get("output")
-                if isinstance(output_value, str):
-                    return bool(output_value.strip())
-                if output_value not in (None, "", [], {}):
-                    return True
             error_value = payload.get("error")
             if isinstance(error_value, str) and error_value.strip():
                 return False

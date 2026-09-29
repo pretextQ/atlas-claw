@@ -6,10 +6,13 @@ from __future__ import annotations
 from contextlib import nullcontext
 import hashlib
 import json
+import logging
 from typing import Any, Optional
 
 from app.atlasclaw.agent.runner_tool.runner_agent_override import resolve_override_tools
 from app.atlasclaw.core.deps import SkillDeps
+
+logger = logging.getLogger(__name__)
 
 
 def _provider_auth_diagnostic_message(diagnostic: dict[str, Any] | None) -> str:
@@ -759,6 +762,7 @@ class RunnerExecutionPayloadMixin:
             return "[Error: no runtime agent available]"
         override_factory = getattr(runtime_agent, "override", None)
         override_cm = nullcontext()
+        override_applied = False
         override_tools = resolve_override_tools(
             agent=runtime_agent,
             allowed_tool_names=allowed_tool_names,
@@ -774,14 +778,24 @@ class RunnerExecutionPayloadMixin:
             for override_kwargs in override_candidates:
                 try:
                     override_cm = override_factory(**override_kwargs)
+                    override_applied = True
                     break
                 except TypeError:
                     continue
         elif callable(override_factory) and override_tools is not None:
             try:
                 override_cm = override_factory(tools=override_tools)
+                override_applied = True
             except TypeError:
                 override_cm = nullcontext()
+        if not override_applied:
+            # Falling back to the default agent configuration silently hides a
+            # broken override (e.g. a changed override signature).
+            logger.warning(
+                "Agent override was not applied for run_single; running with the "
+                "agent's default configuration (tools_specified=%s)",
+                override_tools is not None,
+            )
         try:
             if hasattr(override_cm, "__aenter__"):
                 async with override_cm:
