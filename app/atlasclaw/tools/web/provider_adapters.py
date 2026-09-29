@@ -105,11 +105,22 @@ class BaseSearchProviderAdapter:
         self.trust_env = trust_env
 
     def _build_client_kwargs(self) -> dict[str, object]:
-        return {
+        kwargs: dict[str, object] = {
             "follow_redirects": True,
             "timeout": float(self.timeout_seconds),
             "trust_env": self.trust_env,
         }
+        # Forward the configured proxies to httpx instead of dropping them.
+        if self.proxy_url:
+            kwargs["proxy"] = self.proxy_url
+        elif self.http_proxy or self.https_proxy:
+            mounts: dict[str, object] = {}
+            if self.http_proxy:
+                mounts["http://"] = self.http_proxy
+            if self.https_proxy:
+                mounts["https://"] = self.https_proxy
+            kwargs["mounts"] = mounts
+        return kwargs
 
     def _build_direct_client_kwargs(self) -> dict[str, object]:
         return {
@@ -119,8 +130,8 @@ class BaseSearchProviderAdapter:
         }
 
     def _proxy_configured(self) -> bool:
-        _ = (self.proxy_url, self.http_proxy, self.https_proxy)
-        return False
+        """Return whether an explicit proxy is configured for this adapter."""
+        return bool(self.proxy_url or self.http_proxy or self.https_proxy)
 
     @staticmethod
     def _has_env_proxy() -> bool:
@@ -261,6 +272,11 @@ class OpenRouterGroundingProvider(BaseSearchProviderAdapter):
         parsed = _parse_grounding_json(content)
 
         citations = parsed.get("citations", [])
+        if not isinstance(citations, list):
+            # A non-list citations value (string, dict, ...) is not usable:
+            # treating it as a sequence would iterate characters/keys.
+            citations = []
+        citations = [item for item in citations if isinstance(item, dict)]
         if not citations:
             citations = _extract_citations_from_response(response_json, content)
         summary = str(parsed.get("summary", "")).strip() or content.strip()
@@ -989,7 +1005,14 @@ def _classify_bing_html(
     signals = _collect_bing_page_signals(html, url, headers=headers)
     reasons: list[str] = []
 
-    if signals.has_challenge_words:
+    # A well-formed result page wins over challenge words: a normal SERP may
+    # legitimately contain the word "challenge" in a result snippet.
+    looks_like_result_page = (
+        signals.has_b_algo
+        or (signals.has_b_results and signals.external_anchor_count >= 1)
+        or (signals.h2_link_count >= 2 and signals.external_anchor_count >= 2)
+    )
+    if signals.has_challenge_words and not looks_like_result_page:
         reasons.append("challenge-words")
         return BingPageInspection(
             page_type=BingPageType.CHALLENGE,

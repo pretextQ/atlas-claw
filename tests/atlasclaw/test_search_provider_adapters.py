@@ -475,3 +475,57 @@ async def test_openrouter_grounding_adapter_parses_summary_and_citations(monkeyp
     assert grounded.summary.startswith('明天上海')
     assert grounded.citations[0].url == 'https://www.weather.com.cn/weather/101020100.shtml'
     assert grounded.results[0].title == '上海天气预报'
+
+
+class TestProxyForwarding:
+    """WP-15/F-0052: configured proxies must reach httpx."""
+
+    def test_explicit_proxy_url_is_forwarded(self):
+        provider = BingHtmlFallbackProvider(proxy_url="http://proxy.example:8080")
+        kwargs = provider._build_client_kwargs()
+        assert kwargs["proxy"] == "http://proxy.example:8080"
+        assert provider._proxy_configured() is True
+
+    def test_scheme_specific_proxies_are_forwarded_as_mounts(self):
+        provider = BingHtmlFallbackProvider(
+            http_proxy="http://http-proxy.example:8080",
+            https_proxy="http://https-proxy.example:8080",
+        )
+        kwargs = provider._build_client_kwargs()
+        assert kwargs["mounts"] == {
+            "http://": "http://http-proxy.example:8080",
+            "https://": "http://https-proxy.example:8080",
+        }
+        assert provider._proxy_configured() is True
+
+    def test_no_proxy_configured_reports_false(self):
+        provider = BingHtmlFallbackProvider()
+        assert provider._proxy_configured() is False
+        assert "proxy" not in provider._build_client_kwargs()
+        assert "mounts" not in provider._build_client_kwargs()
+
+
+class TestChallengeWordOrdering:
+    """WP-15/F-0052: a real result page wins over a stray challenge word."""
+
+    def test_result_page_with_challenge_word_is_still_a_serp(self):
+        html = (
+            '<html><body><ol id="b_results">'
+            '<li class="b_algo"><h2><a href="https://example.com/a">Challenge accepted</a></h2>'
+            '<p>How to solve this challenge in code</p></li>'
+            '<li class="b_algo"><h2><a href="https://example.com/b">Another result</a></h2></li>'
+            '</ol></body></html>'
+        )
+        inspection = _classify_bing_html(html, "https://www.bing.com/search?q=challenge")
+        assert inspection.usable is True
+        assert inspection.page_type != BingPageType.CHALLENGE
+
+    def test_challenge_page_without_results_is_still_detected(self):
+        html = (
+            '<html><body><form action="/search"></form>'
+            '<p>Please complete the captcha challenge to continue</p>'
+            '</body></html>'
+        )
+        inspection = _classify_bing_html(html, "https://www.bing.com/search?q=x")
+        assert inspection.page_type == BingPageType.CHALLENGE
+        assert inspection.usable is False
