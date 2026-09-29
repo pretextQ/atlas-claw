@@ -15,6 +15,7 @@ Usage:
 """
 
 import asyncio
+import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Optional
@@ -27,6 +28,8 @@ load_dotenv(dotenv_path=Path(__file__).parent.parent.parent / ".env", override=F
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+
+logger = logging.getLogger(__name__)
 
 from app.atlasclaw.api.routes import create_router, APIContext, install_request_validation_logging, set_api_context
 from app.atlasclaw.api.webhook_dispatch import WebhookDispatchManager
@@ -135,6 +138,67 @@ _hook_runtime: Optional[HookRuntime] = None
 _heartbeat_runtime: Optional[HeartbeatRuntime] = None
 _heartbeat_store: Optional[HeartbeatStateStore] = None
 _heartbeat_task: Optional[asyncio.Task] = None
+
+# Strong references to fire-and-forget background tasks. asyncio only keeps
+# weak references to tasks, so a bare create_task() result can be garbage
+# collected mid-flight.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _track_background_task(task: asyncio.Task, *, name: str) -> asyncio.Task:
+    """Keep a strong reference to a background task and log its failure.
+
+    Args:
+        task: The task returned by asyncio.create_task.
+        name: Human-readable label used in log messages.
+
+    Returns:
+        The same task, for callers that want to await it.
+    """
+    _background_tasks.add(task)
+
+    def _on_done(finished: asyncio.Task) -> None:
+        _background_tasks.discard(finished)
+        if finished.cancelled():
+            return
+        exc = finished.exception()
+        if exc is not None:
+            logger.error("[AtlasClaw] Background task %s failed: %s", name, exc, exc_info=exc)
+
+    task.add_done_callback(_on_done)
+    return task
+
+
+async def _run_heartbeat_loop(
+    *,
+    tick_seconds: float,
+    heartbeat_runtime: Any,
+    build_agent_jobs: Any,
+    build_channel_jobs: Any,
+) -> None:
+    """Register heartbeat jobs and run one tick per interval.
+
+    A failing tick is logged and the loop continues: the supervisor owns
+    long-lived background work and must not die silently on one bad tick.
+
+    Args:
+        tick_seconds: Delay between ticks.
+        heartbeat_runtime: Runtime exposing ``register_job``/``run_once``.
+        build_agent_jobs: Awaitable factory returning agent heartbeat jobs.
+        build_channel_jobs: Factory returning channel heartbeat jobs.
+    """
+    while True:
+        try:
+            for job in await build_agent_jobs():
+                await heartbeat_runtime.register_job(job)
+            for job in build_channel_jobs():
+                await heartbeat_runtime.register_job(job)
+            await heartbeat_runtime.run_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("[AtlasClaw] Heartbeat tick failed; continuing")
+        await asyncio.sleep(tick_seconds)
 
 
 def _list_workspace_runtime_user_ids(workspace_path: str | Path) -> set[str]:
@@ -747,15 +811,17 @@ async def lifespan(app: FastAPI):
         )
 
         async def _heartbeat_loop() -> None:
-            while True:
-                for job in await _build_agent_heartbeat_jobs():
-                    await _heartbeat_runtime.register_job(job)
-                for job in _build_channel_heartbeat_jobs():
-                    await _heartbeat_runtime.register_job(job)
-                await _heartbeat_runtime.run_once()
-                await asyncio.sleep(config.heartbeat.runtime.tick_seconds)
+            await _run_heartbeat_loop(
+                tick_seconds=config.heartbeat.runtime.tick_seconds,
+                heartbeat_runtime=_heartbeat_runtime,
+                build_agent_jobs=_build_agent_heartbeat_jobs,
+                build_channel_jobs=_build_channel_heartbeat_jobs,
+            )
 
-        _heartbeat_task = asyncio.create_task(_heartbeat_loop())
+        _heartbeat_task = _track_background_task(
+            asyncio.create_task(_heartbeat_loop(), name="heartbeat_loop"),
+            name="heartbeat_loop",
+        )
     
     # Auto-start enabled channel connections for default user
     async def start_enabled_connections(db_ready: bool):
@@ -796,7 +862,13 @@ async def lifespan(app: FastAPI):
             print(f"[AtlasClaw] Error starting channel connections: {e}")
     
     # Schedule connection startup (will run after event loop starts)
-    asyncio.create_task(start_enabled_connections(db_initialized))
+    _track_background_task(
+        asyncio.create_task(
+            start_enabled_connections(db_initialized),
+            name="start_enabled_connections",
+        ),
+        name="start_enabled_connections",
+    )
 
 
     webhook_manager = WebhookDispatchManager(
@@ -888,6 +960,14 @@ async def lifespan(app: FastAPI):
             await _heartbeat_task
         except asyncio.CancelledError:
             pass
+
+    # Cancel any other fire-and-forget tasks (e.g. channel auto-start) so the
+    # loop can close without pending-task warnings.
+    other_tasks = [task for task in list(_background_tasks) if not task.done()]
+    for task in other_tasks:
+        task.cancel()
+    if other_tasks:
+        await asyncio.gather(*other_tasks, return_exceptions=True)
 
     # Stop every channel connection (closes SDK subprocesses and WebSockets).
     if _channel_manager is not None:
