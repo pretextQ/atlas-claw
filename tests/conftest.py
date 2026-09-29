@@ -8,17 +8,24 @@ Pytest 閰嶇疆鏂囦欢
 """
 
 import asyncio
+import base64
+import hashlib
 import os
 import sys
 from pathlib import Path
 
 import pytest
 
-# 娣诲姞椤圭洰鏍圭洰褰曞埌 Python 璺緞
+# 娣诲姞椤圭洰鏍圭洰褰曞埌 Python 璺緞
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 # Default all tests to tests/atlasclaw.test.json unless caller overrides ATLASCLAW_CONFIG
 os.environ.setdefault('ATLASCLAW_CONFIG', str((Path(__file__).parent / 'atlasclaw.test.json').resolve()))
+# The encryption service fails fast without a configured key (WP-02); give the
+# suite a deterministic test key so ORM/DB code paths keep exercising real
+# encryption instead of the legacy default-key opt-in.
+_TEST_ENCRYPTION_KEY = base64.b64encode(hashlib.sha256(b"atlasclaw-test-suite").digest()).decode()
+os.environ.setdefault('ATLASCLAW_ENCRYPTION_KEY', _TEST_ENCRYPTION_KEY)
 
 
 

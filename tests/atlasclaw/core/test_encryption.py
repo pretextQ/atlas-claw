@@ -14,7 +14,12 @@ from unittest.mock import patch
 
 import pytest
 
-from app.atlasclaw.core.encryption import EncryptionService, EncryptionError
+from app.atlasclaw.core.encryption import (
+    EncryptionService,
+    EncryptionError,
+    MissingKeyError,
+    INSECURE_DEFAULT_KEY_ENV,
+)
 
 
 class TestEncryptionService:
@@ -56,14 +61,19 @@ class TestEncryptionService:
         assert decrypted == data
         assert ciphertext.startswith("v1:")
 
-    def test_uses_default_key_when_no_env_var(self) -> None:
-        """Test that hardcoded default key is used when no env var is set."""
-        # Ensure key is not in environment
+    def test_no_env_var_fails_fast_without_key(self) -> None:
+        """WP-02: without a configured key, construction must fail fast."""
         with patch.dict(os.environ, {}, clear=True):
-            # Should succeed with hardcoded default key
+            with pytest.raises(MissingKeyError) as exc_info:
+                EncryptionService()
+            assert "ATLASCLAW_ENCRYPTION_KEY" in str(exc_info.value)
+
+    def test_insecure_opt_in_uses_default_key(self) -> None:
+        """WP-02: the legacy default key only works behind the explicit opt-in."""
+        with patch.dict(os.environ, {INSECURE_DEFAULT_KEY_ENV: "1"}, clear=True):
             service = EncryptionService()
             assert service._current_key_id == "default"
-            
+
             # Verify encryption/decryption works
             plaintext = "test data"
             ciphertext = service.encrypt(plaintext)
