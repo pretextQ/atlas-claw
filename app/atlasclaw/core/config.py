@@ -345,6 +345,12 @@ get configuration
                     return default
             return obj
         except Exception:
+            logger.warning(
+                "[ConfigManager] Failed to read configuration key %r; "
+                "returning the default value",
+                key,
+                exc_info=True,
+            )
             return default
     
     def _load_from_file(self) -> Optional[dict]:

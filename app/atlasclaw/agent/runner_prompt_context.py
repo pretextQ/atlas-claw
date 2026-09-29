@@ -7,7 +7,10 @@ from __future__ import annotations
 
 import inspect
 import json
+import logging
 from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
 
 from app.atlasclaw.agent.runner_tool.runner_tool_result_mode import (
     is_silent_backend_tool,
@@ -71,6 +74,11 @@ def collect_memory_available(deps) -> bool:
     try:
         return memory_available_for_deps(deps)
     except Exception:
+        logger.warning(
+            "Failed to resolve memory availability for the prompt; "
+            "treating memory as unavailable",
+            exc_info=True,
+        )
         return False
 
 
@@ -613,6 +621,10 @@ def collect_provider_contexts(deps) -> dict[str, dict]:
                 result[provider_type] = ctx
         return result
     except Exception:
+        logger.warning(
+            "Failed to build the provider instance map for the prompt",
+            exc_info=True,
+        )
         return {}
 
 
@@ -1476,6 +1488,9 @@ def _normalize_parameters_schema(value: Any) -> dict[str, Any]:
         try:
             value = json.loads(payload)
         except Exception:
+            logger.debug(
+                "Failed to parse a JSON prompt-context payload", exc_info=True
+            )
             return {}
     if not isinstance(value, dict):
         return {}
@@ -1503,5 +1518,8 @@ def _normalize_metadata_object(value: Any) -> dict[str, Any]:
         try:
             value = json.loads(payload)
         except Exception:
+            logger.debug(
+                "Failed to parse a JSON prompt-context payload", exc_info=True
+            )
             return {}
     return dict(value) if isinstance(value, dict) else {}

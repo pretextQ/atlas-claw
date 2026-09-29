@@ -908,6 +908,12 @@ def _load_target_md_skill_full_instructions(
     try:
         text = Path(normalized_path).read_text(encoding="utf-8", errors="replace")
     except Exception:
+        logger.warning(
+            "Failed to read skill instructions from %s; the skill prompt "
+            "section will be empty",
+            normalized_path,
+            exc_info=True,
+        )
         return ""
 
     text = re.sub(r"^---\s.*?---\s*", "", text, count=1, flags=re.DOTALL).strip()

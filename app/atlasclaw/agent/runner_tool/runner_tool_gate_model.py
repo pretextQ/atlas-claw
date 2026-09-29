@@ -205,6 +205,9 @@ class RunnerToolGateModelMixin:
         try:
             payload = json.loads(parsed)
         except Exception:
+            logger.warning(
+                "Failed to parse a tool-gate model response as JSON", exc_info=True
+            )
             return None
         if not isinstance(payload, dict):
             return None
@@ -305,6 +308,9 @@ class RunnerToolGateModelMixin:
         try:
             payload = json.loads(parsed)
         except Exception:
+            logger.warning(
+                "Failed to parse a tool-gate model response as JSON", exc_info=True
+            )
             return None
         if not isinstance(payload, dict):
             return None
@@ -1016,6 +1022,9 @@ class RunnerToolGateModelMixin:
             coerced = self._coerce_tool_gate_payload(payload)
             return ToolGateDecision.model_validate(coerced)
         except Exception:
+            logger.warning(
+                "Failed to validate a tool-gate decision payload", exc_info=True
+            )
             return None
     @staticmethod
     def _coerce_tool_gate_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1044,6 +1053,9 @@ class RunnerToolGateModelMixin:
         try:
             confidence_value = float(confidence)
         except Exception:
+            logger.debug(
+                "Non-numeric gate confidence %r; treating it as 0.0", confidence
+            )
             confidence_value = 0.0
         confidence_value = max(0.0, min(1.0, confidence_value))
 
@@ -1256,6 +1268,10 @@ class RunnerToolGateModelMixin:
         try:
             timeout_seconds = float(raw_value)
         except Exception:
+            logger.warning(
+                "Invalid TOOL_GATE_MODEL_TIMEOUT_SECONDS value %r; using 8.0s",
+                raw_value,
+            )
             timeout_seconds = 8.0
         return max(0.5, timeout_seconds)
     @staticmethod
@@ -1279,6 +1295,10 @@ class RunnerToolGateModelMixin:
             try:
                 parsed = json.loads(raw_args)
             except Exception:
+                logger.debug(
+                    "Failed to parse tool arguments as JSON: %s", raw_args[:200],
+                    exc_info=True,
+                )
                 return {}
             return parsed if isinstance(parsed, dict) else {}
         return {}

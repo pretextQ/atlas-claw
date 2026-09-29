@@ -595,6 +595,10 @@ def _parse_bing_loose_results(html: str, limit: int, *, query: str) -> list[dict
     try:
         from bs4 import BeautifulSoup
     except Exception:
+        LOGGER.debug(
+            "BeautifulSoup is unavailable; the loose Bing parser is skipped",
+            exc_info=True,
+        )
         return []
 
     soup = BeautifulSoup(html or "", "lxml")
@@ -634,6 +638,10 @@ def _parse_bing_script_results(html: str, limit: int) -> list[dict[str, str]]:
     try:
         from bs4 import BeautifulSoup
     except Exception:
+        LOGGER.debug(
+            "BeautifulSoup is unavailable; the script-tag Bing parser is skipped",
+            exc_info=True,
+        )
         return []
 
     soup = BeautifulSoup(html or "", "lxml")
@@ -896,6 +904,7 @@ def _iter_json_payloads(raw_text: str) -> list[object]:
     try:
         parsed = json.loads(text)
     except Exception:
+        LOGGER.debug("Failed to parse a JSON result payload", exc_info=True)
         return []
     if isinstance(parsed, list):
         return parsed
@@ -933,6 +942,7 @@ def _extract_query_echo_from_url(url: str) -> str:
     try:
         parsed = urlsplit(url)
     except Exception:
+        LOGGER.debug("Failed to parse a URL while extracting the query echo: %s", url, exc_info=True)
         return ""
     query_values = parse_qs(parsed.query).get("q", [])
     if not query_values:
@@ -1262,6 +1272,7 @@ def _parse_grounding_json(content: str) -> dict:
         parsed = json.loads(snippet)
         return parsed if isinstance(parsed, dict) else {}
     except Exception:
+        LOGGER.debug("Failed to parse a JSON object from model output", exc_info=True)
         return {}
 
 

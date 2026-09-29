@@ -522,6 +522,11 @@ class CompactionPipeline:
         try:
             serialized = json.dumps(compact, ensure_ascii=False)
         except Exception:
+            logger.debug(
+                "Failed to serialize a tool payload for summarization; "
+                "falling back to str()",
+                exc_info=True,
+            )
             serialized = str(compact)
         if len(serialized) <= MAX_TOOL_SUMMARY_TEXT_CHARS:
             return serialized

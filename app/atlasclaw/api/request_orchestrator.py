@@ -17,12 +17,15 @@ High-level flow:
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Optional
 
 from app.atlasclaw.agent.routing import AgentConfig, AgentRouter, DmScope, RoutingContext
+
+logger = logging.getLogger(__name__)
 from app.atlasclaw.agent.runner import AgentRunner
 from app.atlasclaw.agent.stream import StreamEvent
 from app.atlasclaw.auth.models import ANONYMOUS_USER, UserInfo
@@ -157,7 +160,11 @@ Return JSON format:
                 response = self._llm_caller(prompt)
                 return self._parse_response(response)
             except Exception:
-                pass
+                # Falling back to GENERAL_CHAT hides an unavailable or broken
+                # intent classifier; keep the fallback but log the cause.
+                logger.exception(
+                    "Intent classification failed; falling back to GENERAL_CHAT"
+                )
 
         return IntentResult(intent=IntentType.GENERAL_CHAT, confidence=0.5)
 
@@ -200,6 +207,11 @@ Return JSON format:
                 raw_response=response,
             )
         except Exception:
+            logger.warning(
+                "Failed to parse the intent classification response; "
+                "falling back to GENERAL_CHAT",
+                exc_info=True,
+            )
             return IntentResult(
                 intent=IntentType.GENERAL_CHAT,
                 confidence=0.5,

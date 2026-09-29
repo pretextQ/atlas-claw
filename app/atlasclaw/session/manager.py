@@ -286,6 +286,12 @@ manager = SessionManager(agents_dir="/path/to/legacy-agents")
                 file_path.unlink()
                 total_bytes -= file_size
             except Exception:
+                logger.warning(
+                    "[SessionManager] Failed to prune archived transcript %s; "
+                    "continuing with the remaining files",
+                    file_path,
+                    exc_info=True,
+                )
                 continue
     
     async def _load_metadata(self) -> None:
