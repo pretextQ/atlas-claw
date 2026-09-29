@@ -28,6 +28,9 @@ jobs:
       - name: Lint
         run: ruff check app
 
+      - name: God-file length guard
+        run: python scripts/check_python_file_lengths.py
+
       - name: Test
         run: pytest tests/atlasclaw -q -m "not e2e and not llm"
 

@@ -12,6 +12,9 @@ import pytest
 
 from app.atlasclaw.agent.runner import AgentRunner
 from app.atlasclaw.agent.runner_tool import runner_execution_prepare as prepare_module
+from app.atlasclaw.agent.runner_tool import (
+    runner_prepare_workflow_context as prepare_workflow_module,
+)
 from app.atlasclaw.agent.runner_tool.runner_tool_gate_model import RunnerToolGateModelMixin
 from app.atlasclaw.agent.runner_tool.runner_execution_loop import (
     hydrate_session_provider_instance_selections,
@@ -45,6 +48,16 @@ from app.atlasclaw.agent.tool_gate_models import (
     ToolPolicyMode,
 )
 from app.atlasclaw.core.deps import SkillDeps
+
+def _patch_capability_index(monkeypatch: pytest.MonkeyPatch, value) -> None:
+    """Patch the capability-index collector in every module that calls it.
+
+    After the prepare/md-skill split the collector is invoked from both
+    runner_execution_prepare and runner_prepare_workflow_context, and a patch
+    on one module alone would not reach the other call site.
+    """
+    monkeypatch.setattr(prepare_module, "collect_capability_index_snapshot", value)
+    monkeypatch.setattr(prepare_workflow_module, "collect_capability_index_snapshot", value)
 
 
 class _GateRunner(RunnerToolGateModelMixin, RunnerToolGateRoutingMixin):
@@ -252,11 +265,7 @@ def test_embed_prepare_skips_selectors_and_scopes_page_workflow_context(
         "selected_item_id": "item-1",
     }
     monkeypatch.setattr(prepare_module, "collect_tools_snapshot", lambda **kwargs: list(tools))
-    monkeypatch.setattr(
-        prepare_module,
-        "collect_capability_index_snapshot",
-        lambda **kwargs: [dict(provider_skill_entry)],
-    )
+    _patch_capability_index(monkeypatch, lambda **kwargs: [dict(provider_skill_entry)])
     monkeypatch.setattr(
         prepare_module,
         "_infer_active_provider_skill_from_transcript",
@@ -341,7 +350,7 @@ def test_ordinary_menu_prepare_still_calls_capability_selector_once(
 ) -> None:
     tools = [{"name": "example_update_item", "provider_type": "example"}]
     monkeypatch.setattr(prepare_module, "collect_tools_snapshot", lambda **kwargs: list(tools))
-    monkeypatch.setattr(prepare_module, "collect_capability_index_snapshot", lambda **kwargs: [])
+    _patch_capability_index(monkeypatch, lambda **kwargs: [])
     manager = _PrepareSessionManager()
     runner = _build_prepare_runner(manager)
     selector_calls = 0
@@ -370,7 +379,7 @@ def test_ordinary_conversation_prepare_skips_no_capability_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(prepare_module, "collect_tools_snapshot", lambda **kwargs: [])
-    monkeypatch.setattr(prepare_module, "collect_capability_index_snapshot", lambda **kwargs: [])
+    _patch_capability_index(monkeypatch, lambda **kwargs: [])
     runner = _build_prepare_runner(_PrepareSessionManager())
 
     async def _select_capability(**kwargs):
@@ -397,7 +406,7 @@ def test_invalid_selector_uses_no_capability_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(prepare_module, "collect_tools_snapshot", lambda **kwargs: [])
-    monkeypatch.setattr(prepare_module, "collect_capability_index_snapshot", lambda **kwargs: [])
+    _patch_capability_index(monkeypatch, lambda **kwargs: [])
     runner = _build_prepare_runner(_PrepareSessionManager())
     fallback_calls = 0
 
@@ -426,7 +435,7 @@ def test_invalid_selector_does_not_report_unavailable_when_runtime_tools_exist(
 ) -> None:
     tools = [{"name": "example_update_item", "provider_type": "example"}]
     monkeypatch.setattr(prepare_module, "collect_tools_snapshot", lambda **kwargs: list(tools))
-    monkeypatch.setattr(prepare_module, "collect_capability_index_snapshot", lambda **kwargs: [])
+    _patch_capability_index(monkeypatch, lambda **kwargs: [])
     runner = _build_prepare_runner(_PrepareSessionManager())
 
     async def _invalid_selector(**kwargs):
@@ -480,11 +489,7 @@ def test_authorized_context_prepare_loads_skill_without_exposing_mutating_tools(
         "locator": str(skill_path),
     }
     monkeypatch.setattr(prepare_module, "collect_tools_snapshot", lambda **kwargs: list(tools))
-    monkeypatch.setattr(
-        prepare_module,
-        "collect_capability_index_snapshot",
-        lambda **kwargs: [dict(provider_skill_entry)],
-    )
+    _patch_capability_index(monkeypatch, lambda **kwargs: [dict(provider_skill_entry)])
     runner = _build_prepare_runner(_PrepareSessionManager())
 
     async def _select_context_only(**kwargs):
@@ -530,11 +535,7 @@ def test_authorized_context_does_not_inject_standalone_skill_runtime_tools(
         "metadata": {},
     }
     monkeypatch.setattr(prepare_module, "collect_tools_snapshot", lambda **kwargs: [])
-    monkeypatch.setattr(
-        prepare_module,
-        "collect_capability_index_snapshot",
-        lambda **kwargs: [dict(skill_entry)],
-    )
+    _patch_capability_index(monkeypatch, lambda **kwargs: [dict(skill_entry)],)
     runner = _build_prepare_runner(_PrepareSessionManager())
 
     async def _select_context_only(**kwargs):
@@ -605,14 +606,10 @@ def test_active_transcript_uses_single_selector_to_switch_capability(
         "tool_names": ["example_create_report"],
     }
     monkeypatch.setattr(prepare_module, "collect_tools_snapshot", lambda **kwargs: list(tools))
-    monkeypatch.setattr(
-        prepare_module,
-        "collect_capability_index_snapshot",
-        lambda **kwargs: [
+    _patch_capability_index(monkeypatch, lambda **kwargs: [
             dict(active_provider_skill_entry),
             dict(report_provider_skill_entry),
-        ],
-    )
+        ],)
     monkeypatch.setattr(
         prepare_module,
         "_infer_active_provider_skill_from_transcript",

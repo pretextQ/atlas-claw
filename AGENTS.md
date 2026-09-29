@@ -32,6 +32,9 @@ pytest -m e2e                     # Run end-to-end tests
 
 # Run with coverage
 pytest --cov=app.atlasclaw --cov-report=term-missing
+
+# God-file length guard (also runs in CI; --list reports without failing)
+python scripts/check_python_file_lengths.py
 ```
 
 ### Frontend (JavaScript)
