@@ -242,16 +242,49 @@ class AgentLoader:
         self.workspace_path = Path(workspace_path).resolve()
         self.agents_dir = self.workspace_path / "agents"
     
+    @staticmethod
+    def _validate_agent_id(agent_id: str) -> str:
+        """Return a safe agent identifier or raise ValueError.
+
+        The identifier becomes a directory name under the agents root, so
+        separators, traversal segments, and absolute paths must be rejected
+        before any path is built.
+
+        Raises:
+            ValueError: If the identifier is empty or not a plain name.
+        """
+        normalized = str(agent_id or "").strip()
+        if not normalized:
+            raise ValueError("agent_id must not be empty")
+        if normalized in {".", ".."}:
+            raise ValueError(f"Invalid agent_id: {agent_id!r}")
+        if "/" in normalized or "\\" in normalized:
+            raise ValueError(f"Invalid agent_id (path separators are not allowed): {agent_id!r}")
+        if Path(normalized).is_absolute() or Path(normalized).drive:
+            raise ValueError(f"Invalid agent_id (absolute paths are not allowed): {agent_id!r}")
+        return normalized
+
     def load_agent(self, agent_id: str) -> AgentConfig:
         """Load agent configuration from Markdown files.
         
         Args:
-            agent_id: Agent identifier.
+            agent_id: Agent identifier (a plain directory name under the
+                agents root; separators and traversal are rejected).
             
         Returns:
             AgentConfig object.
+            
+        Raises:
+            ValueError: If agent_id is not a safe directory name, or if it
+                would resolve outside the agents directory.
         """
-        agent_dir = self.agents_dir / agent_id
+        agent_id = self._validate_agent_id(agent_id)
+        agent_dir = (self.agents_dir / agent_id).resolve()
+        agents_root = self.agents_dir.resolve()
+        if agent_dir != agents_root and agents_root not in agent_dir.parents:
+            raise ValueError(
+                f"agent_id {agent_id!r} resolves outside the agents directory"
+            )
         
         # Start with default config
         config = AgentConfig(
@@ -278,9 +311,11 @@ class AgentLoader:
         if not config.system_prompt:
             config.system_prompt = self.DEFAULT_CONFIG.system_prompt
         
-        # If no capabilities loaded, use default
+        # If no capabilities loaded, use default. Copy the list: assigning the
+        # class-level default by reference let every agent share (and mutate)
+        # one list.
         if not config.capabilities:
-            config.capabilities = self.DEFAULT_CONFIG.capabilities
+            config.capabilities = list(self.DEFAULT_CONFIG.capabilities)
         
         return config
     
